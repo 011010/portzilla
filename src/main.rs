@@ -1,11 +1,13 @@
 mod lease;
+mod mcp;
 mod store;
+mod view;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lease::{current_unix_timestamp, Lease, SystemPidChecker};
-use serde::Serialize;
+use lease::{Lease, SystemPidChecker};
 use store::{ClaimOutcome, Store};
+use view::{to_claim_view, to_view, LeaseView};
 
 /// Port/process lease coordinator for parallel AI coding-agent sessions.
 #[derive(Parser)]
@@ -62,6 +64,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run portzilla as a long-lived server process.
+    Serve {
+        /// Run the MCP (Model Context Protocol) server over stdio, exposing
+        /// claim/who/ls/release/prune as MCP tools. Required (rather than a
+        /// default mode) so `serve` can grow other modes later without an
+        /// ambiguous "what did plain `serve` just do" default.
+        #[arg(long)]
+        mcp: bool,
+    },
 }
 
 /// Exit code for "the requested lease does not exist" — distinct from the
@@ -100,9 +111,27 @@ impl From<anyhow::Error> for RunError {
 
 fn run() -> Result<(), RunError> {
     let cli = Cli::parse();
+
+    // `serve` spins up its own async runtime and opens its own `Store`
+    // internally (see `mcp::run_stdio`); handle it before the rest of the
+    // (fully synchronous) commands, which share one `store` below.
+    if let Commands::Serve { mcp } = &cli.command {
+        let mcp = *mcp;
+        if !mcp {
+            return Err(RunError::Other(anyhow::anyhow!(
+                "serve requires a mode flag; currently only --mcp is supported (e.g. `portzilla serve --mcp`)"
+            )));
+        }
+        let runtime = tokio::runtime::Runtime::new()
+            .context("failed to start the async runtime for the MCP server")?;
+        runtime.block_on(mcp::run_stdio())?;
+        return Ok(());
+    }
+
     let store = Store::open(None)?;
 
     match cli.command {
+        Commands::Serve { .. } => unreachable!("handled above"),
         Commands::Claim {
             port,
             tag,
@@ -119,7 +148,7 @@ fn run() -> Result<(), RunError> {
             print_leases(&leases, json);
         }
         Commands::Who { port, json } => match store.get(port)? {
-            Some(lease) => print_lease_view(&to_view(&lease), json),
+            Some(lease) => print_lease_view(&to_view(&lease, &SystemPidChecker), json),
             None => return Err(RunError::NotFound(port)),
         },
         Commands::Release { port, json } => match store.release(port, &SystemPidChecker)? {
@@ -130,7 +159,7 @@ fn run() -> Result<(), RunError> {
                         outcome.lease.port, outcome.lease.pid
                     );
                 }
-                print_lease_view(&to_view(&outcome.lease), json);
+                print_lease_view(&to_view(&outcome.lease, &SystemPidChecker), json);
             }
             None => return Err(RunError::NotFound(port)),
         },
@@ -160,17 +189,6 @@ fn default_pid() -> u32 {
         .unwrap_or_else(std::process::id)
 }
 
-#[derive(Serialize)]
-struct ClaimJson<'a> {
-    port: u16,
-    pid: u32,
-    tag: &'a str,
-    created_at: u64,
-    session: &'a Option<String>,
-    requested_port: u16,
-    reassigned: bool,
-}
-
 /// Replaces control characters (C0 controls including ESC, C1 controls, and
 /// DEL) with a single space before a string is written to human-readable
 /// output. Tags and sessions are arbitrary user-supplied text: left
@@ -184,18 +202,10 @@ fn sanitize_for_display(s: &str) -> String {
 
 fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) {
     if json {
-        let payload = ClaimJson {
-            port: outcome.lease.port,
-            pid: outcome.lease.pid,
-            tag: &outcome.lease.tag,
-            created_at: outcome.lease.created_at,
-            session: &outcome.lease.session,
-            requested_port,
-            reassigned: outcome.reassigned,
-        };
+        let view = to_claim_view(outcome, requested_port);
         println!(
             "{}",
-            serde_json::to_string(&payload).expect("ClaimJson always serializes")
+            serde_json::to_string(&view).expect("ClaimView always serializes")
         );
     } else if outcome.reassigned {
         println!(
@@ -214,32 +224,8 @@ fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) 
     }
 }
 
-#[derive(Serialize)]
-struct LeaseView {
-    port: u16,
-    pid: u32,
-    tag: String,
-    created_at: u64,
-    session: Option<String>,
-    age_secs: u64,
-    alive: bool,
-}
-
-fn to_view(lease: &Lease) -> LeaseView {
-    let now = current_unix_timestamp();
-    LeaseView {
-        port: lease.port,
-        pid: lease.pid,
-        tag: lease.tag.clone(),
-        created_at: lease.created_at,
-        session: lease.session.clone(),
-        age_secs: now.saturating_sub(lease.created_at),
-        alive: lease.is_alive(&SystemPidChecker),
-    }
-}
-
 fn print_leases(leases: &[Lease], json: bool) {
-    let views: Vec<LeaseView> = leases.iter().map(to_view).collect();
+    let views: Vec<LeaseView> = leases.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
     if json {
         println!(
             "{}",
@@ -293,7 +279,7 @@ fn print_lease_view(view: &LeaseView, json: bool) {
 }
 
 fn print_pruned(pruned: &[Lease], json: bool) {
-    let views: Vec<LeaseView> = pruned.iter().map(to_view).collect();
+    let views: Vec<LeaseView> = pruned.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
     if json {
         println!(
             "{}",

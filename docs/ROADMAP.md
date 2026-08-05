@@ -23,11 +23,20 @@ The current release. A daemon-less CLI that tracks port ownership in a locked lo
 
 **Known limitation carried forward**: liveness is a point-in-time PID-table check, not an actively monitored subscription. PID reuse can produce false "alive" reports for a lease whose real owner has already exited. See the [README limitations section](../README.md#limitations). This tradeoff is accepted for v0.1 in exchange for having no daemon; it is revisited in the optional daemon phase below.
 
-## v0.1.x — MCP server — Planned
+## v0.1.x — MCP server — Implemented
 
-Add `portzilla serve --mcp`, exposing `claim`/`ls`/`who`/`release`/`prune` as MCP tools via the `rmcp` SDK.
+`portzilla serve --mcp` runs an MCP server over stdio (built on the `rmcp` SDK), exposing `claim`/`who`/`ls`/`release`/`prune` as MCP tools with the same semantics as their CLI counterparts.
 
-**Rationale**: the CLI's biggest adoption risk is that agents default to shelling out to `lsof`/`kill` because that's what's in their training and prompts, not because `portzilla` is hard to use. An MCP server removes the "shell out to a subprocess and parse text" friction entirely — an agent with MCP tool access calls `portzilla_who` the same way it calls any other structured tool, with typed JSON in and out. This is the first and lowest-effort step toward the core goal: making agents actually query ownership before acting, not just making the capability available to them.
+| Item | Status |
+|------|--------|
+| `serve --mcp` subcommand (stdio transport) | Implemented |
+| `claim`/`who`/`ls`/`release`/`prune` MCP tools, same flat JSON shapes as CLI `--json` | Implemented |
+| Tool descriptions written to steer agent behavior (`claim`: "use this INSTEAD of killing...") | Implemented |
+| `claim`'s `pid` defaults to the server's own PID when omitted, with a `note` field flagging it | Implemented |
+| Missing-lease results as tool-level errors (`isError: true`), not JSON-RPC protocol errors | Implemented |
+| Reads/writes the same locked `leases.json` as the CLI (`PORTZILLA_DATA_DIR` respected) | Implemented |
+
+**Rationale**: the CLI's biggest adoption risk is that agents default to shelling out to `lsof`/`kill` because that's what's in their training and prompts, not because `portzilla` is hard to use. An MCP server removes the "shell out to a subprocess and parse text" friction entirely — an agent with MCP tool access calls `who` the same way it calls any other structured tool, with typed JSON in and out. This is the first and lowest-effort step toward the core goal: making agents actually query ownership before acting, not just making the capability available to them.
 
 ## v0.2 — Claude Code hook integration — Planned
 

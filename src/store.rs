@@ -55,6 +55,14 @@ pub struct ReleaseOutcome {
 }
 
 /// A locked JSON-backed store of leases rooted at a resolved data directory.
+///
+/// `Clone` is cheap and intentional: the store carries no in-memory state of
+/// its own (`data_dir` is the only field) — every read-modify-write goes
+/// through the on-disk lock, so cloning just shares the same path, the same
+/// way opening a second `Store` pointed at the same directory would. This is
+/// what lets the MCP server hand a `Store` to its `Clone`-bound handler type
+/// without wrapping it in an `Arc` for no reason.
+#[derive(Clone)]
 pub struct Store {
     data_dir: PathBuf,
 }

@@ -135,6 +135,28 @@ Used as a single object by `who` and `release`, and as an array of these objects
 
 `requested_port` is the port that was originally asked for; `port` is the port actually leased. `reassigned` is `true` only when `port != requested_port` because of a live conflicting claim.
 
+## MCP server
+
+`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, and `prune` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
+
+Register it with Claude Code:
+
+```console
+$ claude mcp add portzilla -- portzilla serve --mcp
+```
+
+Every tool's description is written to make the intended behavior explicit to the calling agent — the `claim` tool description, for example, says outright to use it *instead of* killing whatever occupies a port. Tool results use the exact same flat JSON shapes documented above for `--json` output (see [JSON output shapes](#json-output-shapes)), so anything already written against the CLI's JSON recognizes MCP results too.
+
+- **`claim(port, tag, pid?, session?)`** — same semantics as `portzilla claim`. `pid` is optional here for a different reason than on the CLI: there is no meaningful "parent process" to default to (the MCP client, not a shell, owns the session), so an omitted `pid` falls back to the portzilla server process's own PID — almost never what you want — and the result carries an extra `note` field saying so. Always pass the PID of the process you started (or are about to start) on that port when you have it.
+- **`who(port)`** — same semantics as `portzilla who`.
+- **`ls()`** — same semantics as `portzilla ls`, no arguments.
+- **`release(port)`** — same semantics as `portzilla release`, including the still-alive warning (surfaced as a `was_alive` field on the result instead of a stderr line).
+- **`prune()`** — same semantics as `portzilla prune`, no arguments.
+
+**Errors**: a missing lease (`who`/`release` on a port with no lease) comes back as a *tool-level* error — the JSON-RPC call still succeeds, but the tool result is flagged `isError: true` with a structured `{"error": "not_found", "port": ..., "message": ...}` body. This mirrors the CLI's exit code `2`: it is an expected, well-formed outcome the calling agent should see and act on, not a protocol failure. Actual portzilla failures (I/O errors, corrupt state, lock failures — the CLI's exit code `1`) come back as real JSON-RPC protocol errors instead, since those mean the server itself couldn't do its job.
+
+The MCP server reads and writes the exact same locked `leases.json` the CLI does (respecting `PORTZILLA_DATA_DIR`) — it is a second front end onto the same on-disk state, not a separate store.
+
 ## Data file location
 
 `portzilla` resolves its data directory in this order:
@@ -155,7 +177,7 @@ Set `PORTZILLA_DATA_DIR` to isolate tests, CI runs, or throwaway experiments fro
 
 ## Roadmap
 
-v0.1 (this release) covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state — no daemon, no network, no agent-specific integration yet. Planned next: an MCP server (`serve --mcp`) so agents can call `portzilla` natively, then a Claude Code hook that intercepts kill/lsof-style patterns and suggests a `portzilla who` check instead. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
+v0.1 covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state. v0.1.x adds the MCP server (`serve --mcp`, documented above) so agents can call `portzilla` natively instead of shelling out. Planned next: a Claude Code hook that intercepts kill/lsof-style patterns and suggests a `portzilla who` check instead. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
 
 ## License
 

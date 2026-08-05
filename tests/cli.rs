@@ -483,3 +483,19 @@ fn prune_with_nothing_to_prune_exits_zero() {
 
     cmd(dir.path()).args(["prune"]).assert().success();
 }
+
+// ---- serve ----
+
+#[test]
+fn serve_without_mcp_flag_fails_with_a_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["serve"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("--mcp").and(predicate::str::contains("serve requires")),
+        );
+}
