@@ -38,11 +38,31 @@ The current release. A daemon-less CLI that tracks port ownership in a locked lo
 
 **Rationale**: the CLI's biggest adoption risk is that agents default to shelling out to `lsof`/`kill` because that's what's in their training and prompts, not because `portzilla` is hard to use. An MCP server removes the "shell out to a subprocess and parse text" friction entirely — an agent with MCP tool access calls `who` the same way it calls any other structured tool, with typed JSON in and out. This is the first and lowest-effort step toward the core goal: making agents actually query ownership before acting, not just making the capability available to them.
 
-## v0.2 — Claude Code hook integration — Planned
+## v0.2 — Kill guard, Claude Code hook — Implemented
 
-A Claude Code hook that intercepts commands matching kill/`lsof`-on-a-port patterns (e.g. `kill $(lsof -ti:3000)`, `kill-port 3000`) before they execute, and suggests running `portzilla who <port>` first.
+A harness-agnostic kill-guard core (`src/guard.rs`) plus a Claude Code adapter (`portzilla hook claude-code`, `portzilla init claude-code`) that intercepts kill-shaped commands before they run and denies the ones that would kill another session's live, leased process.
+
+| Item | Status |
+|------|--------|
+| `src/guard.rs` — harness-agnostic core: command string + lease list in, `Allow`/`Deny`/`Warn` verdict out | Implemented |
+| Pattern detection: `kill`/`kill -9 <pid>`, `pkill`/`killall <name>`, `lsof -ti:<port> \| xargs kill` (+ `-ti :<port>` variant), `fuser -k <port>/tcp`, `npx kill-port <port>`/`kill-port <port>` | Implemented |
+| `Deny` explanation names the port/pid/tag and says what to do instead (`who`, claim elsewhere, ask the human) | Implemented |
+| `Warn` for unresolvable targets (kill-by-process-name) — portzilla can't verify safety, so it says so rather than silently allowing or denying | Implemented |
+| `portzilla hook claude-code` — Claude Code `PreToolUse` adapter over the core, schema verified against current docs | Implemented |
+| `portzilla init claude-code` — prints (never writes) the `settings.json` registration snippet | Implemented |
+| Fail-open at every step: unreadable stdin, malformed hook JSON, unreadable lease store, even an internal panic → allow, never block or crash | Implemented |
 
 **Rationale**: this is identified as the key adoption feature. MCP tool access (v0.1.x) makes querying *possible*; a hook makes the safe path the *default* path by intervening at the exact moment an agent is about to do the destructive thing it would otherwise do unprompted. This directly targets the adoption risk described in the PRD: value only accrues if agents check before killing, and a hook is the mechanism most likely to make that happen without relying on every agent's system prompt independently deciding to use `portzilla`.
+
+**Design decision — harness-agnostic core, thin adapter**: the roadmap beyond this release is "Claude Code first, then any harness." All detection and lease-resolution logic lives in `guard::check`, a pure function that has never heard of Claude Code, hooks, or JSON-RPC. `claude_code.rs` only translates a `PreToolUse` payload into a `guard::check` call and translates the `Verdict` back into Claude Code's hook response shape. A second harness (Cursor, a generic shell wrapper, whatever comes next) means writing a second thin adapter module against the same `guard::check`, not touching the detection logic itself.
+
+**Detection is an approximation, not a shell parser**: segments are split on `|`/`;`/`&&`/`||` and each segment's first word is checked — no quoting, subshell, or variable-expansion awareness. This is a deliberate false-negative-over-false-positive tradeoff (a missed kill is invisible; a wrongly blocked legitimate command breaks the user's session) — see `src/guard.rs`'s module doc comment and its boundary tests (`killall-whatever` doesn't false-trigger `killall`; `echo "kill 123"` doesn't false-trigger `kill`) for exactly where the line is drawn.
+
+## v0.2.x — Other harness adapters — Planned
+
+Adapters for harnesses beyond Claude Code (Cursor, a generic pre-exec shell wrapper, etc.), each a thin translation layer over the same `guard::check` core used by the Claude Code adapter.
+
+**Rationale**: the core was built harness-agnostic specifically so this is additive work, not a rewrite — validate the adapter pattern against a second real harness once there's a concrete integration point to design against, rather than speculatively generalizing now.
 
 ## Later — Planned, not yet scheduled
 
@@ -52,4 +72,4 @@ Three further directions, listed in order of how directly each extends the coord
 - **TUI dashboard.** A live view of `ls`-equivalent data for interactive human monitoring of a machine with many concurrent sessions, built once there is enough real usage to know what a human actually wants to see at a glance versus what `ls`/`who` already cover.
 - **Session flight-recorder journal.** A log of what each session/agent started and stopped over time (not just current state), to answer "what did agent X do to my ports during this session" retrospectively. Depends on session identifiers (`--session`, already in v0.1) being used consistently in practice before the journal format is worth committing to.
 
-These are ordered by dependency and risk, not by priority: the daemon and hook work (v0.1.x/v0.2) are prerequisites for judging whether the "later" items are worth building at all, since they determine whether `portzilla` reaches enough real agent sessions to know what's actually needed next.
+These are ordered by dependency and risk, not by priority: the daemon and adapter work (v0.1.x/v0.2/v0.2.x) are prerequisites for judging whether the "later" items are worth building at all, since they determine whether `portzilla` reaches enough real agent sessions to know what's actually needed next.

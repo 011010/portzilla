@@ -157,6 +157,52 @@ Every tool's description is written to make the intended behavior explicit to th
 
 The MCP server reads and writes the exact same locked `leases.json` the CLI does (respecting `PORTZILLA_DATA_DIR`) — it is a second front end onto the same on-disk state, not a separate store.
 
+## Kill guard
+
+MCP tool access (above) makes it *possible* for an agent to check ownership before acting. The kill guard is what makes checking the *default*: it intercepts kill-shaped commands before they run and blocks the ones that would kill another session's live, leased process — instead of relying on the agent to remember to run `who` first.
+
+The guard itself (`src/guard.rs`) is harness-agnostic: it takes a shell command string and the current lease list and returns a verdict, with no knowledge of Claude Code or any other tool. `portzilla hook claude-code` is a thin adapter over it — the shape a second harness integration would take is to write another adapter like it, not to change the guard.
+
+It recognizes:
+
+- `kill <pid>` / `kill -9 <pid>` — explicit PIDs
+- `pkill <name>` / `killall <name>` — process names (can't be resolved to a specific lease, so this only ever warns, never denies)
+- `lsof -ti:<port> | xargs kill` (and the `lsof -ti :<port>` / `-9` variants)
+- `fuser -k <port>/tcp`
+- `npx kill-port <port>` / `kill-port <port>`
+
+For each, it resolves the target PID or port against the lease registry and decides:
+
+- **Allow** — no kill intent detected, the target has no live lease, the lease is dead, or the lease is yours (you're allowed to kill/restart your own claimed process).
+- **Deny** — the target has a live lease owned by someone else. The explanation names the port, PID, and tag, and says what to do instead: check `portzilla who <port>`, claim a different port, or ask before proceeding if the lease looks stale.
+- **Warn** — a kill intent was detected but can't be resolved to a specific port/PID (killing by process name). portzilla can't verify safety here, so it surfaces a warning instead of silently allowing or incorrectly denying.
+
+This is intentionally not a real shell parser — see the module doc comment in `src/guard.rs` for the exact approximation (split on `|`/`;`/`&&`/`||`, look at each segment's first word) and its tested boundaries, e.g. `killall-whatever` doesn't trigger `killall` detection, and `echo "kill 123"` doesn't trigger `kill` detection. False negatives are an accepted tradeoff; false positives are not.
+
+### Claude Code setup
+
+```console
+$ portzilla init claude-code
+```
+
+prints the exact `.claude/settings.json` snippet to add (project-level `.claude/settings.json` or user-level `~/.claude/settings.json`), registering `portzilla hook claude-code` as a `PreToolUse` hook on the `Bash` tool. This only prints instructions — it never writes to your settings file, so there's no risk of it mangling an existing config.
+
+Once registered, `portzilla hook claude-code` reads the hook's JSON payload from stdin on every Bash tool call, and when it denies a command, Claude sees the reason directly (`permissionDecisionReason`, per Claude Code's hook schema) — the same explanation text described above.
+
+### Session ownership: letting a session restart its own processes
+
+The guard decides "this lease is yours" by comparing the hook payload's `session_id` against the lease's `session` field. That means a lease claimed without `--session` can never be recognized as the current session's own — the guard will deny the kill even though the same session started the process. For ownership to resolve end to end, claim with the session id Claude Code exposes to Bash commands:
+
+```console
+$ portzilla claim 3000 --tag "vite dev" --session "$CLAUDE_CODE_SESSION_ID"
+```
+
+With that in place, the session that claimed port 3000 can freely kill or restart its own dev server, while every other session is still denied. Without it, the guard fails safe: it protects the process from everyone, including you.
+
+### Fail-open, always
+
+A guard that can crash or hang and take the user's session down with it is worse than no guard. `portzilla hook claude-code` fails open at every step: unreadable stdin, malformed hook JSON, an unreadable lease store, even an internal panic — all of it is caught and turned into "print nothing, allow, note it on stderr" rather than ever blocking or erroring out. Per Claude Code's own hook contract, empty stdout on exit `0` means "no decision, continue with normal permission flow," so a portzilla-side failure degrades to exactly the same thing as not having the hook installed at all — it never denies a command because *portzilla* had a problem, only because the command itself looked unsafe.
+
 ## Data file location
 
 `portzilla` resolves its data directory in this order:
@@ -177,7 +223,7 @@ Set `PORTZILLA_DATA_DIR` to isolate tests, CI runs, or throwaway experiments fro
 
 ## Roadmap
 
-v0.1 covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state. v0.1.x adds the MCP server (`serve --mcp`, documented above) so agents can call `portzilla` natively instead of shelling out. Planned next: a Claude Code hook that intercepts kill/lsof-style patterns and suggests a `portzilla who` check instead. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
+v0.1 covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state. v0.1.x adds the MCP server (`serve --mcp`, documented above) so agents can call `portzilla` natively instead of shelling out. v0.2 adds the kill guard (documented above): a harness-agnostic core plus a Claude Code adapter that intercepts kill-shaped commands before they run. Planned next: adapters for other harnesses, since the core already doesn't know Claude Code exists. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
 
 ## License
 

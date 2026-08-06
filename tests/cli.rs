@@ -499,3 +499,127 @@ fn serve_without_mcp_flag_fails_with_a_clear_error() {
             predicate::str::contains("--mcp").and(predicate::str::contains("serve requires")),
         );
 }
+
+// ---- hook claude-code ----
+
+fn pretooluse_bash_json(command: &str) -> String {
+    serde_json::json!({
+        "session_id": "abc123",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "toolu_01"
+    })
+    .to_string()
+}
+
+#[test]
+fn hook_claude_code_denies_kill_of_a_foreign_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    let output = cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(pretooluse_bash_json(&format!("kill {own_pid}")))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("permissionDecisionReason must be a string");
+    assert!(reason.contains("3000"));
+    assert!(reason.contains("dev-server"));
+}
+
+#[test]
+fn hook_claude_code_allows_kill_of_an_unleased_pid() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(pretooluse_bash_json("kill 999999"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_claude_code_allows_non_bash_tool_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/tmp/x", "old_string": "kill 1", "new_string": ""}
+    })
+    .to_string();
+
+    cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_claude_code_malformed_json_fails_open_with_a_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Fail-open, end to end: garbage on stdin must never block or crash —
+    // exit 0, nothing on stdout (so Claude Code's normal permission flow
+    // applies unmodified), a diagnostic on stderr for troubleshooting.
+    cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin("{ not valid json")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("failing open"));
+}
+
+#[test]
+fn hook_claude_code_warns_on_process_name_kill() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(pretooluse_bash_json("pkill node"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert!(json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .contains("node"));
+    assert!(json["systemMessage"].as_str().unwrap().contains("node"));
+}
+
+// ---- init claude-code ----
+
+#[test]
+fn init_claude_code_prints_the_settings_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["init", "claude-code"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"PreToolUse\""))
+        .stdout(predicate::str::contains("\"matcher\": \"Bash\""))
+        .stdout(predicate::str::contains("portzilla hook claude-code"));
+}

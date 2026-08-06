@@ -1,3 +1,5 @@
+mod claude_code;
+mod guard;
 mod lease;
 mod mcp;
 mod store;
@@ -6,6 +8,7 @@ mod view;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lease::{Lease, SystemPidChecker};
+use std::io::Read;
 use store::{ClaimOutcome, Store};
 use view::{to_claim_view, to_view, LeaseView};
 
@@ -73,6 +76,32 @@ enum Commands {
         #[arg(long)]
         mcp: bool,
     },
+    /// Run portzilla as a kill-guard hook for an AI coding agent harness.
+    Hook {
+        #[command(subcommand)]
+        harness: HookHarness,
+    },
+    /// Print setup instructions for integrating portzilla with a harness.
+    Init {
+        #[command(subcommand)]
+        harness: InitHarness,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookHarness {
+    /// Run as a Claude Code `PreToolUse` hook: reads the hook payload JSON
+    /// from stdin, evaluates any Bash command against the lease registry,
+    /// and writes the hook response JSON to stdout. Never blocks or fails
+    /// the tool call because of a portzilla-side error (fails open).
+    ClaudeCode,
+}
+
+#[derive(Subcommand)]
+enum InitHarness {
+    /// Print the settings.json snippet that registers portzilla's
+    /// kill-guard as a Claude Code `PreToolUse` hook on the `Bash` tool.
+    ClaudeCode,
 }
 
 /// Exit code for "the requested lease does not exist" — distinct from the
@@ -128,10 +157,31 @@ fn run() -> Result<(), RunError> {
         return Ok(());
     }
 
+    // `init claude-code` is pure output, no store needed.
+    if let Commands::Init { harness } = &cli.command {
+        match harness {
+            InitHarness::ClaudeCode => print_init_claude_code(),
+        }
+        return Ok(());
+    }
+
+    // `hook claude-code` manages its own store access with fail-open
+    // semantics throughout (see `run_hook_claude_code`) — it must never
+    // propagate an error via `?`, since that would turn into a nonzero exit
+    // for what should always be a silent, non-blocking hook response.
+    if let Commands::Hook { harness } = &cli.command {
+        match harness {
+            HookHarness::ClaudeCode => run_hook_claude_code(),
+        }
+        return Ok(());
+    }
+
     let store = Store::open(None)?;
 
     match cli.command {
         Commands::Serve { .. } => unreachable!("handled above"),
+        Commands::Init { .. } => unreachable!("handled above"),
+        Commands::Hook { .. } => unreachable!("handled above"),
         Commands::Claim {
             port,
             tag,
@@ -169,6 +219,73 @@ fn run() -> Result<(), RunError> {
         }
     }
     Ok(())
+}
+
+/// Runs the Claude Code `PreToolUse` hook: reads the hook payload from
+/// stdin, evaluates it, and writes the response to stdout/stderr.
+///
+/// This function is the fail-open boundary described in `claude_code.rs`'s
+/// module docs, made concrete: reading stdin, opening the store, listing
+/// leases, and even a panic inside the guard/adapter logic are all caught
+/// here and turned into "print nothing, note it on stderr" rather than ever
+/// propagating an error out of `run()` — a nonzero exit here would risk
+/// alarming or blocking the user over a portzilla-side problem that has
+/// nothing to do with whether their command is actually safe to run.
+fn run_hook_claude_code() {
+    let mut raw_input = String::new();
+    if let Err(err) = std::io::stdin().read_to_string(&mut raw_input) {
+        eprintln!("portzilla hook claude-code: failed to read stdin, failing open (allow): {err:#}");
+        return;
+    }
+
+    let leases = match Store::open(None).and_then(|store| store.list()) {
+        Ok(leases) => leases,
+        Err(err) => {
+            eprintln!(
+                "portzilla hook claude-code: failed to read the lease store, failing open (allow): {err:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        claude_code::handle(&raw_input, &leases, &SystemPidChecker)
+    }));
+
+    match result {
+        Ok(outcome) => {
+            if let Some(json) = outcome.stdout_json {
+                println!("{json}");
+            }
+            if let Some(note) = outcome.stderr_note {
+                eprintln!("{note}");
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "portzilla hook claude-code: internal error while evaluating the command, failing \
+                 open (allow)"
+            );
+        }
+    }
+}
+
+fn print_init_claude_code() {
+    println!(
+        "Add the following to your Claude Code settings (.claude/settings.json for a project,"
+    );
+    println!("or ~/.claude/settings.json for your user) to register portzilla's kill-guard as a");
+    println!("PreToolUse hook on the Bash tool:");
+    println!();
+    println!("{}", claude_code::SETTINGS_SNIPPET);
+    println!();
+    println!(
+        "If you already have a \"hooks\" key in settings.json, merge the \"PreToolUse\" entry"
+    );
+    println!("above into your existing hooks instead of overwriting the file.");
+    println!();
+    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    println!("Verify with: portzilla --version");
 }
 
 /// Resolves the default PID to attribute a claim to: the parent process
