@@ -503,8 +503,12 @@ fn serve_without_mcp_flag_fails_with_a_clear_error() {
 // ---- hook claude-code ----
 
 fn pretooluse_bash_json(command: &str) -> String {
+    pretooluse_bash_json_with_session(command, "abc123")
+}
+
+fn pretooluse_bash_json_with_session(command: &str, session_id: &str) -> String {
     serde_json::json!({
-        "session_id": "abc123",
+        "session_id": session_id,
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": { "command": command },
@@ -514,17 +518,34 @@ fn pretooluse_bash_json(command: &str) -> String {
 }
 
 #[test]
-fn hook_claude_code_denies_kill_of_a_foreign_live_lease() {
+fn hook_claude_code_denies_kill_of_a_foreign_session_live_lease() {
     let dir = tempfile::tempdir().unwrap();
+    // `own_pid` is only here so the lease's PID is a REAL, currently-alive
+    // process (required to exercise the live-lease Deny path against the
+    // real system PID checker) — it is deliberately NOT what makes this
+    // "foreign". The adapter never passes a self_pid at all (PreToolUse
+    // fires before the Bash process exists), so ownership through this
+    // adapter is decided entirely by session: the claim below carries
+    // session "other-session", while the hook payload declares
+    // "my-session" — genuinely different sessions, not a same-PID coincidence.
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "other-session",
+        ])
         .assert()
         .success();
 
     let output = cmd(dir.path())
         .args(["hook", "claude-code"])
-        .write_stdin(pretooluse_bash_json(&format!("kill {own_pid}")))
+        .write_stdin(pretooluse_bash_json_with_session(&format!("kill {own_pid}"), "my-session"))
         .assert()
         .success()
         .get_output()
@@ -539,6 +560,37 @@ fn hook_claude_code_denies_kill_of_a_foreign_live_lease() {
         .expect("permissionDecisionReason must be a string");
     assert!(reason.contains("3000"));
     assert!(reason.contains("dev-server"));
+}
+
+#[test]
+fn hook_claude_code_allows_kill_of_an_own_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    // Same session on both the claim and the hook payload: this is the
+    // "restart my own dev server" case. Since the adapter never supplies a
+    // self_pid, session is the ONLY mechanism that can allow this — this
+    // test is the direct end-to-end regression guard for that fix.
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "shared-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(pretooluse_bash_json_with_session(&format!("kill {own_pid}"), "shared-session"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -622,4 +674,378 @@ fn init_claude_code_prints_the_settings_snippet() {
         .stdout(predicate::str::contains("\"PreToolUse\""))
         .stdout(predicate::str::contains("\"matcher\": \"Bash\""))
         .stdout(predicate::str::contains("portzilla hook claude-code"));
+}
+
+// ---- hook cursor / gemini, init cursor / gemini ----
+
+#[test]
+fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "command": format!("kill {own_pid}"),
+        "cwd": "/tmp",
+        "sandbox": false,
+        "conversation_id": "conv-unrelated"
+    })
+    .to_string();
+
+    let output = cmd(dir.path())
+        .args(["hook", "cursor"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["permission"], "deny");
+    assert!(json["agent_message"].as_str().unwrap().contains("3000"));
+}
+
+#[test]
+fn hook_gemini_denies_kill_of_a_foreign_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    let input = serde_json::json!({
+        "session_id": "sess-unrelated",
+        "hook_event_name": "BeforeTool",
+        "tool_name": "run_shell_command",
+        "tool_input": { "command": format!("kill {own_pid}") }
+    })
+    .to_string();
+
+    let output = cmd(dir.path())
+        .args(["hook", "gemini"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["decision"], "deny");
+    assert!(json["reason"].as_str().unwrap().contains("3000"));
+}
+
+#[test]
+fn init_cursor_prints_the_hooks_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"beforeShellExecution\""))
+        .stdout(predicate::str::contains("portzilla hook cursor"));
+}
+
+#[test]
+fn init_gemini_prints_the_settings_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "gemini"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"BeforeTool\""))
+        .stdout(predicate::str::contains("run_shell_command"))
+        .stdout(predicate::str::contains("portzilla hook gemini"));
+}
+
+// ---- guard ----
+//
+// These tests spawn the real binary with `guard -- <fake script>` instead of
+// a real `kill`, so a bug that lets a Deny slip through can't actually
+// terminate the test process: the "kill"/"pkill" named scripts are
+// test-controlled no-ops that just touch a marker file, never real signals.
+
+#[cfg(unix)]
+fn write_fake_command(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    // Named "kill" so guard's basename-based verb matching recognizes it —
+    // but it is our own harmless script, not the real system `kill`.
+    let script = dir.path().join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    cmd(dir.path())
+        .args(["guard", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+
+    assert!(
+        !dir.path().join("marker").exists(),
+        "a denied command must never have run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_allow_executes_and_propagates_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("myapp");
+    write_fake_command(&script, &format!("touch '{}/marker'\nexit 7", dir.path().display()));
+
+    cmd(dir.path()).args(["guard", "--", script.to_str().unwrap()]).assert().code(7);
+
+    assert!(dir.path().join("marker").exists(), "an allowed command must have run");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_warn_executes_with_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    // Named "pkill" so guard resolves it to a Warn (unresolvable process
+    // name), not a Deny.
+    let script = dir.path().join("pkill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    cmd(dir.path())
+        .args(["guard", "--", script.to_str().unwrap(), "node"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("node"));
+
+    assert!(dir.path().join("marker").exists(), "a warned command must still execute");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_analyzes_the_sh_c_payload_and_denies() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    let script = dir.path().join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    // The whole point of the `sh -c` unwrap: the pipe-shaped payload is one
+    // pre-quoted argv element, exactly as a real invocation would produce.
+    let payload = format!("{} {} | true", script.display(), own_pid);
+    cmd(dir.path())
+        .args(["guard", "--", "sh", "-c", &payload])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert!(!dir.path().join("marker").exists());
+}
+
+// ---- CRITICAL fix regression: generalized shell -c unwrap ----
+//
+// Each of these previously bypassed detection entirely (the old unwrap only
+// matched the exact 3-argv `[shell, "-c", payload]` shape) and would have
+// let the fake "kill" script run for real, denying only by accident of test
+// design rather than by the guard actually recognizing the command.
+
+#[cfg(unix)]
+fn setup_foreign_live_lease_and_kill_script(dir: &std::path::Path) -> (u32, std::path::PathBuf) {
+    let own_pid = std::process::id();
+    cmd(dir)
+        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .assert()
+        .success();
+
+    let script = dir.join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.display()));
+    (own_pid, script)
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_denies_via_combined_dash_lc_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
+    let payload = format!("{} {}", script.display(), own_pid);
+
+    cmd(dir.path())
+        .args(["guard", "--", "sh", "-lc", &payload])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert!(!dir.path().join("marker").exists(), "sh -lc must not bypass the guard");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_denies_via_separate_dash_x_dash_c_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
+    let payload = format!("{} {}", script.display(), own_pid);
+
+    cmd(dir.path())
+        .args(["guard", "--", "sh", "-x", "-c", &payload])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert!(!dir.path().join("marker").exists(), "sh -x -c must not bypass the guard");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_denies_via_long_flag_then_dash_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
+    let payload = format!("{} {}", script.display(), own_pid);
+
+    cmd(dir.path())
+        .args(["guard", "--", "bash", "--norc", "-c", &payload])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert!(!dir.path().join("marker").exists(), "bash --norc -c must not bypass the guard");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_denies_via_nested_sh_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
+    let inner = format!("{} {}", script.display(), own_pid);
+    let payload = format!("sh -c '{inner}'");
+
+    cmd(dir.path())
+        .args(["guard", "--", "sh", "-c", &payload])
+        .assert()
+        .failure()
+        .code(2);
+
+    assert!(!dir.path().join("marker").exists(), "nested sh -c must not bypass the guard");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_sh_c_with_non_kill_payload_still_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("marker");
+
+    cmd(dir.path())
+        .args(["guard", "--", "sh", "-c", &format!("touch '{}'", marker.display())])
+        .assert()
+        .success();
+
+    assert!(marker.exists(), "a non-kill sh -c payload must still run");
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_own_session_lease_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "my-sess",
+        ])
+        .assert()
+        .success();
+
+    let script = dir.path().join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    cmd(dir.path())
+        .args(["guard", "--session", "my-sess", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("marker").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_session_from_env_var_executes_own_session_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "env-sess",
+        ])
+        .assert()
+        .success();
+
+    let script = dir.path().join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    cmd(dir.path())
+        .env("PORTZILLA_SESSION", "env-sess")
+        .args(["guard", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("marker").exists());
+}
+
+// ---- WARNING 1 fix regression: POSIX exec-failure exit codes ----
+
+#[cfg(unix)]
+#[test]
+fn guard_allowed_command_not_found_exits_127() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["guard", "--", "/nonexistent/portzilla-test-binary-xyz"])
+        .assert()
+        .code(127);
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_allowed_non_executable_file_exits_126() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("not-executable");
+    std::fs::write(&file, "just a text file, no shebang, no +x bit").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    cmd(dir.path())
+        .args(["guard", "--", file.to_str().unwrap()])
+        .assert()
+        .code(126);
 }
