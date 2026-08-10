@@ -26,7 +26,7 @@
 //! process), so failures are surfaced on stderr rather than swallowed
 //! entirely, but they never block execution.
 
-use crate::guard::{self, Verdict};
+use crate::guard::{self, MAX_SHELL_UNWRAP_DEPTH, Verdict, find_shell_c_payload, shell_words};
 use crate::lease::{Lease, PidChecker};
 
 /// What `main.rs` should do after resolving a verdict for the command.
@@ -40,13 +40,6 @@ pub enum GuardAction {
     /// Run the command with no message.
     Execute,
 }
-
-/// How many nested `sh -c '...'` levels [`join_command`] will unwrap before
-/// giving up and returning whatever payload it has at that point. Bounds
-/// the recursion against pathological/adversarial input (e.g. a payload
-/// engineered to nest hundreds of levels deep) — this is a resource limit,
-/// not a realistic depth any legitimate invocation would need.
-const MAX_SHELL_UNWRAP_DEPTH: u32 = 8;
 
 /// Builds the string [`guard::check`] analyzes from `args` (the command and
 /// its arguments, exactly as given after `--`).
@@ -64,9 +57,10 @@ const MAX_SHELL_UNWRAP_DEPTH: u32 = 8;
 /// `guard::check` requires a kill verb to be the FIRST word of its own
 /// pipeline segment (a deliberate anti-false-positive design — see
 /// `src/guard.rs`), and in the naively-joined string `sh`/`-c` occupy that
-/// position instead of the real verb inside the payload. Unwrapping here is
-/// an adapter-level decision about what string to hand to the
-/// harness-agnostic core, not a change to the core's own matching rules.
+/// position instead of the real verb inside the payload. Unwrapping here
+/// is the same normalization the core now applies to the joined command
+/// string it eventually analyzes, so detection never depends on which
+/// adapter produced the string.
 ///
 /// # Known gaps (disclosed, not silent)
 ///
@@ -109,82 +103,6 @@ fn unwrap_shell_c(args: &[String], depth: u32) -> Option<String> {
     Some(unwrap_shell_c(&inner_tokens, depth - 1).unwrap_or(payload))
 }
 
-/// If `args` is `<shell> <flags...> <payload>` where `<shell>`'s basename is
-/// `sh`/`bash`/`zsh`/`dash` and at least one flag token in the leading run
-/// of dash-prefixed tokens is `-c` or a short cluster containing `c` (e.g.
-/// `-lc`), returns the payload token. A `--`-prefixed (long) flag is never
-/// treated as containing `-c` regardless of its letters (`--norc` must not
-/// match on the `c` in "norc").
-fn find_shell_c_payload(args: &[String]) -> Option<String> {
-    let (shell, rest) = args.split_first()?;
-    if !is_shell_name(shell) {
-        return None;
-    }
-
-    let mut index = 0;
-    let mut saw_c_flag = false;
-    while index < rest.len() && rest[index].starts_with('-') {
-        let token = &rest[index];
-        if !token.starts_with("--") && token[1..].contains('c') {
-            saw_c_flag = true;
-        }
-        index += 1;
-    }
-
-    if !saw_c_flag {
-        return None;
-    }
-    rest.get(index).cloned()
-}
-
-fn is_shell_name(token: &str) -> bool {
-    matches!(token.rsplit('/').next().unwrap_or(token), "sh" | "bash" | "zsh" | "dash")
-}
-
-/// Minimal, quote-aware whitespace tokenizer used only to look inside a
-/// `sh -c` payload string for a nested shell invocation (see
-/// [`unwrap_shell_c`]). Not a shell parser: understands single and double
-/// quotes (each preserves whitespace and, per POSIX rules, treats the OTHER
-/// quote character as literal while active — which is exactly what makes
-/// `sh -c 'sh -c "kill 1234"'` tokenize into three parts with the inner
-/// `"kill 1234"` intact), but has no concept of escape characters, command
-/// substitution, or variable expansion. See `join_command`'s doc comment
-/// for the full list of disclosed gaps.
-fn shell_words(input: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut has_content = false;
-
-    for c in input.chars() {
-        match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                has_content = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                has_content = true;
-            }
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if has_content {
-                    words.push(std::mem::take(&mut current));
-                    has_content = false;
-                }
-            }
-            c => {
-                current.push(c);
-                has_content = true;
-            }
-        }
-    }
-    if has_content {
-        words.push(current);
-    }
-    words
-}
-
 /// Decides what to do with a command about to be run, given the current
 /// lease registry and the caller's session/PID identity (see the module
 /// doc comment for how those are resolved before this is called).
@@ -205,8 +123,8 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
     use crate::lease::Lease;
+    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -238,13 +156,21 @@ mod tests {
         // detection for anything piped inside the payload (see the
         // decide_analyzes_a_joined_sh_c_payload_and_still_denies test for
         // why). The payload alone must be handed to guard::check instead.
-        let args = vec!["sh".to_string(), "-c".to_string(), "lsof -ti:3000 | xargs kill".to_string()];
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "lsof -ti:3000 | xargs kill".to_string(),
+        ];
         assert_eq!(join_command(&args), "lsof -ti:3000 | xargs kill");
     }
 
     #[test]
     fn join_command_unwraps_bash_dash_c_too() {
-        let args = vec!["bash".to_string(), "-c".to_string(), "kill 1234".to_string()];
+        let args = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "kill 1234".to_string(),
+        ];
         assert_eq!(join_command(&args), "kill 1234");
     }
 
@@ -266,14 +192,22 @@ mod tests {
 
     #[test]
     fn join_command_unwraps_combined_short_flags_eic() {
-        let args = vec!["bash".to_string(), "-eic".to_string(), "kill 1234".to_string()];
+        let args = vec![
+            "bash".to_string(),
+            "-eic".to_string(),
+            "kill 1234".to_string(),
+        ];
         assert_eq!(join_command(&args), "kill 1234");
     }
 
     #[test]
     fn join_command_unwraps_separate_dash_x_dash_c() {
-        let args =
-            vec!["sh".to_string(), "-x".to_string(), "-c".to_string(), "kill 1234".to_string()];
+        let args = vec![
+            "sh".to_string(),
+            "-x".to_string(),
+            "-c".to_string(),
+            "kill 1234".to_string(),
+        ];
         assert_eq!(join_command(&args), "kill 1234");
     }
 
@@ -341,7 +275,11 @@ mod tests {
             vec!["sh".to_string(), "-".to_string(), "x".to_string()],
             vec!["sh".to_string(), "--".to_string(), "-c".to_string()],
             vec!["sh".to_string(), "-c".to_string(), "sh -c".to_string()],
-            vec!["sh".to_string(), "-c".to_string(), "sh -c 'sh -c 'sh -c".to_string()],
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sh -c 'sh -c 'sh -c".to_string(),
+            ],
             {
                 // A deeply (pathologically) nested chain must not blow the
                 // stack or hang — bounded recursion should just stop.
@@ -367,7 +305,10 @@ mod tests {
         let joined = join_command(&args);
         let leases = vec![lease(3000, 1234, "dev-server")];
         let action = decide(&joined, &leases, None, None, &AlwaysAlive);
-        assert!(matches!(action, GuardAction::Deny { .. }), "joined command was: {joined}");
+        assert!(
+            matches!(action, GuardAction::Deny { .. }),
+            "joined command was: {joined}"
+        );
     }
 
     #[test]
@@ -394,7 +335,10 @@ mod tests {
     #[test]
     fn decide_executes_on_a_non_kill_command() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(decide("git status", &leases, None, None, &AlwaysAlive), GuardAction::Execute);
+        assert_eq!(
+            decide("git status", &leases, None, None, &AlwaysAlive),
+            GuardAction::Execute
+        );
     }
 
     #[test]
@@ -409,7 +353,12 @@ mod tests {
 
     #[test]
     fn decide_allows_own_session_lease() {
-        let leases = vec![Lease::new(3000, 1234, "dev-server", Some("sess-mine".to_string()))];
+        let leases = vec![Lease::new(
+            3000,
+            1234,
+            "dev-server",
+            Some("sess-mine".to_string()),
+        )];
         assert_eq!(
             decide("kill 1234", &leases, None, Some("sess-mine"), &AlwaysAlive),
             GuardAction::Execute
@@ -418,7 +367,12 @@ mod tests {
 
     #[test]
     fn decide_denies_foreign_session_lease() {
-        let leases = vec![Lease::new(3000, 1234, "dev-server", Some("sess-theirs".to_string()))];
+        let leases = vec![Lease::new(
+            3000,
+            1234,
+            "dev-server",
+            Some("sess-theirs".to_string()),
+        )];
         let action = decide("kill 1234", &leases, None, Some("sess-mine"), &AlwaysAlive);
         assert!(matches!(action, GuardAction::Deny { .. }));
     }
@@ -437,6 +391,9 @@ mod tests {
         let joined = join_command(&args);
         let leases = vec![lease(3000, 1234, "dev-server")];
         let action = decide(&joined, &leases, None, None, &AlwaysAlive);
-        assert!(matches!(action, GuardAction::Deny { .. }), "joined command was: {joined}");
+        assert!(
+            matches!(action, GuardAction::Deny { .. }),
+            "joined command was: {joined}"
+        );
     }
 }

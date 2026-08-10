@@ -33,6 +33,29 @@
 //! what does and doesn't get caught, e.g. a command name inside a quoted
 //! string (`echo "kill 123"`) is not detected, because the first word of
 //! that segment is `echo`, not `kill`.
+//!
+//! # Normalization (shared by every caller — hooks and `guard` alike)
+//!
+//! Before segment detection, [`check`] normalizes the command in two ways,
+//! so harness hooks (which hand over raw command strings) and the universal
+//! `portzilla guard` wrapper see the same thing:
+//!
+//! - A LEADING `sh -c '<payload>'`-family invocation (`sh`/`bash`/`zsh`/
+//!   `dash` by basename, any run of dash-prefixed flags with a `c` in a
+//!   short cluster or as `-c`) is unwrapped to its payload, recursively, up
+//!   to [`MAX_SHELL_UNWRAP_DEPTH`] levels. Only at the very start of the
+//!   command string: a shell invocation appearing after another statement
+//!   (`echo hi && sh -c 'kill 1234'`) is NOT unwrapped — an accepted false
+//!   negative.
+//! - Each pipeline segment's leading wrapper prefixes are stripped before
+//!   the verb is read: env-var assignments (`FOO=1`), `sudo`, `env`
+//!   (including its flags `-i`/`-u NAME`/... and its own `VAR=val`
+//!   assignments), `command`, `exec`, `nohup`, `builtin`, and `npx` —
+//!   repeatedly, until a non-wrapper first word is exposed
+//!   (`sudo env FOO=1 command kill 1234` resolves to `kill`). Boundaries:
+//!   `command` followed by its own flags (`command -v kill`, which only
+//!   LOCATES the binary) is left as-is and therefore not detected; no
+//!   command substitution, variable expansion, or backslash escapes.
 
 use crate::lease::{Lease, PidChecker};
 
@@ -96,7 +119,9 @@ pub fn check(
             Verdict::Allow
         }
         Some(KillTarget::Port(port)) => match leases.iter().find(|l| l.port == port) {
-            Some(lease) if lease.is_alive(checker) && !owned_by_self(lease, self_pid, self_session) => {
+            Some(lease)
+                if lease.is_alive(checker) && !owned_by_self(lease, self_pid, self_session) =>
+            {
                 deny(lease)
             }
             _ => Verdict::Allow,
@@ -113,7 +138,8 @@ pub fn check(
 }
 
 fn owned_by_self(lease: &Lease, self_pid: Option<u32>, self_session: Option<&str>) -> bool {
-    let session_match = self_session.is_some_and(|session| lease.session.as_deref() == Some(session));
+    let session_match =
+        self_session.is_some_and(|session| lease.session.as_deref() == Some(session));
     let pid_match = self_pid.is_some_and(|pid| pid == lease.pid);
     session_match || pid_match
 }
@@ -150,9 +176,27 @@ enum KillTarget {
 
 /// Detects a kill intent anywhere in `command` and resolves what it targets.
 ///
-/// See the module doc comment for the detection approximation and its
-/// documented boundaries.
+/// See the module doc comment for the detection approximation, the shared
+/// normalization, and their documented boundaries.
 fn detect_target(command: &str) -> Option<KillTarget> {
+    detect_target_impl(command, MAX_SHELL_UNWRAP_DEPTH)
+}
+
+/// The recursive core of [`detect_target`], carrying the remaining
+/// `sh -c`-unwrap budget (`depth`). A leading `sh -c`-family invocation is
+/// unwrapped one level and detection re-runs on the raw payload — so a kill
+/// (including a whole `lsof | xargs kill` pipeline) hidden inside the
+/// payload is analyzed exactly as if it had been typed directly. Once the
+/// budget is exhausted the command is analyzed as-is (accepted false
+/// negative beyond [`MAX_SHELL_UNWRAP_DEPTH`] nesting levels; never a panic).
+fn detect_target_impl(command: &str, depth: u32) -> Option<KillTarget> {
+    if depth > 0 {
+        let tokens = shell_words(command);
+        if let Some(payload) = find_shell_c_payload(&tokens) {
+            return detect_target_impl(&payload, depth - 1);
+        }
+    }
+
     // Checked first and across the WHOLE command, not per-segment: the verb
     // (`xargs kill`) and the target (`lsof`'s `-ti:<port>`) live in
     // different pipeline segments.
@@ -168,6 +212,90 @@ fn detect_target(command: &str) -> Option<KillTarget> {
     None
 }
 
+/// Maximum `sh -c` nesting depth the unwrap will descend before analyzing
+/// whatever payload it has as-is. Bounds the recursion against pathological
+/// input; 8 levels is far beyond any legitimate invocation. Shared with the
+/// universal `portzilla guard` wrapper (`crate::guard_cmd`), which unwraps
+/// the same shape from real argv instead of a joined string.
+pub(crate) const MAX_SHELL_UNWRAP_DEPTH: u32 = 8;
+
+/// If `args` is `<shell> <flags...> <payload>` where `<shell>`'s basename is
+/// `sh`/`bash`/`zsh`/`dash` and at least one flag token in the leading run
+/// of dash-prefixed tokens is `-c` or a short cluster containing `c` (e.g.
+/// `-lc`), returns the payload token. A `--`-prefixed (long) flag is never
+/// treated as containing `-c` regardless of its letters (`--norc` must not
+/// match on the `c` in "norc"). Shared with `crate::guard_cmd`.
+pub(crate) fn find_shell_c_payload(args: &[String]) -> Option<String> {
+    let (shell, rest) = args.split_first()?;
+    if !is_shell_name(shell) {
+        return None;
+    }
+
+    let mut index = 0;
+    let mut saw_c_flag = false;
+    while index < rest.len() && rest[index].starts_with('-') {
+        let token = &rest[index];
+        if !token.starts_with("--") && token[1..].contains('c') {
+            saw_c_flag = true;
+        }
+        index += 1;
+    }
+
+    if !saw_c_flag {
+        return None;
+    }
+    rest.get(index).cloned()
+}
+
+pub(crate) fn is_shell_name(token: &str) -> bool {
+    matches!(
+        token.rsplit('/').next().unwrap_or(token),
+        "sh" | "bash" | "zsh" | "dash"
+    )
+}
+
+/// Minimal, quote-aware whitespace tokenizer. Not a shell parser:
+/// understands single and double quotes (each preserves whitespace and, per
+/// POSIX rules, treats the OTHER quote character as literal while active —
+/// which is exactly what makes `sh -c 'sh -c "kill 1234"'` tokenize with the
+/// inner `"kill 1234"` intact), but has no concept of escape characters,
+/// command substitution, or variable expansion. Shared with
+/// `crate::guard_cmd`.
+pub(crate) fn shell_words(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_content = false;
+
+    for c in input.chars() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_content = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_content = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if has_content {
+                    words.push(std::mem::take(&mut current));
+                    has_content = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_content = true;
+            }
+        }
+    }
+    if has_content {
+        words.push(current);
+    }
+    words
+}
+
 /// Splits `command` into pipeline/sequencing segments on `|`, `;`, `&&`, and
 /// `||`, with no distinction between the separators. Used by [`detect_segment`],
 /// which only cares about "is this segment's first word a kill verb" and
@@ -175,7 +303,10 @@ fn detect_target(command: &str) -> Option<KillTarget> {
 /// sequencer. Not shell-aware: does not respect quoting, so a literal `|`
 /// inside a quoted string would also split there. See the module doc comment.
 fn split_segments(command: &str) -> Vec<&str> {
-    split_statements(command).into_iter().flat_map(split_pipeline).collect()
+    split_statements(command)
+        .into_iter()
+        .flat_map(split_pipeline)
+        .collect()
 }
 
 /// Splits `command` into top-level statements on `;`, `&&`, and `||` —
@@ -202,7 +333,11 @@ fn split_statements(command: &str) -> Vec<&str> {
 
 /// Splits a single statement into its `|`-piped segments, in order.
 fn split_pipeline(statement: &str) -> Vec<&str> {
-    statement.split('|').map(str::trim).filter(|s| !s.is_empty()).collect()
+    statement
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Detects a kill intent within a single pipeline segment (everything
@@ -217,8 +352,51 @@ fn detect_segment(segment: &str) -> Option<KillTarget> {
         tokens = &tokens[1..];
     }
 
-    while tokens.first().is_some_and(|token| basename(token) == "sudo") {
+    while tokens
+        .first()
+        .is_some_and(|token| basename(token) == "sudo")
+    {
         tokens = &tokens[1..];
+    }
+
+    // Leading command-wrappers that a real shell would still resolve to the
+    // wrapped verb: `env`, `command`, `exec`, `nohup`, `builtin`. Each is
+    // stripped repeatedly (so `sudo env command kill 1234` resolves to
+    // `kill`). See the module doc for the documented boundaries: `command`
+    // followed by its own flags (`command -v kill`, which only LOCATES the
+    // binary) is left as-is and therefore not detected.
+    while let Some(first) = tokens.first() {
+        match basename(first) {
+            "env" => {
+                tokens = skip_env_args(&tokens[1..]);
+            }
+            "command" => {
+                // `command -v kill` / `command -p kill ...`: a `command`
+                // whose next token is a flag of its own is not an execution
+                // of the wrapped verb we can resolve — leave it alone
+                // (first word is then `command` itself, which is not a kill
+                // verb, so this is a clean false negative).
+                if tokens.get(1).is_some_and(|next| next.starts_with('-')) {
+                    break;
+                }
+                tokens = &tokens[1..];
+            }
+            "exec" | "nohup" | "builtin" => {
+                tokens = &tokens[1..];
+            }
+            _ => break,
+        }
+        // After stripping a wrapper, new env assignments or `sudo` may be
+        // exposed before the next wrapper/verb — re-strip them too.
+        while tokens.first().is_some_and(|token| is_env_assignment(token)) {
+            tokens = &tokens[1..];
+        }
+        while tokens
+            .first()
+            .is_some_and(|token| basename(token) == "sudo")
+        {
+            tokens = &tokens[1..];
+        }
     }
 
     if tokens.first().is_some_and(|token| basename(token) == "npx") {
@@ -261,7 +439,10 @@ fn detect_segment(segment: &str) -> Option<KillTarget> {
                 .unwrap_or_else(|| "<unspecified>".to_string());
             Some(KillTarget::ProcessName(target_name))
         }
-        "kill-port" => rest.iter().find_map(|token| token.parse::<u16>().ok()).map(KillTarget::Port),
+        "kill-port" => rest
+            .iter()
+            .find_map(|token| token.parse::<u16>().ok())
+            .map(KillTarget::Port),
         "fuser" => {
             if rest.contains(&"-k") {
                 // fuser only treats a numeric argument as a port when it
@@ -304,6 +485,33 @@ fn is_env_assignment(token: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Skips `env`'s OWN arguments — `VAR=value` assignments and option flags
+/// (`-i`, `-0`, `-u NAME`, `--unset=NAME`, ...) — returning the slice
+/// starting at the command `env` would actually run. Used to strip an `env`
+/// wrapper prefix before verb detection, so `env FOO=1 kill 1234` resolves
+/// to `kill`. Deliberately conservative: `-u NAME` is the one common flag
+/// that takes a SEPARATE argument, so it also consumes its next token; every
+/// other dash-prefixed token is skipped singly. A flag whose separate
+/// argument this doesn't model would leave that argument as the apparent
+/// verb — a false NEGATIVE, the accepted tradeoff direction.
+fn skip_env_args<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if is_env_assignment(token) {
+            i += 1;
+        } else if token == "-u" {
+            // `-u NAME`: skip the flag and its separate argument (if any).
+            i = (i + 2).min(tokens.len());
+        } else if token.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[i..]
 }
 
 /// Detects the `lsof -ti:<port> | xargs kill` family: a `|`-piped segment
@@ -360,8 +568,8 @@ fn scan_port_after_colon(segment: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlivePids, AlwaysAlive, AlwaysDead};
     use crate::lease::Lease;
+    use crate::lease::test_support::{AlivePids, AlwaysAlive, AlwaysDead};
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -378,12 +586,20 @@ mod tests {
         let leases = vec![lease(3000, 1234, "dev-server")];
         let verdict = check("kill 1234", &leases, None, None, &AlwaysAlive);
         match verdict {
-            Verdict::Deny { port, owner_pid, tag, explanation } => {
+            Verdict::Deny {
+                port,
+                owner_pid,
+                tag,
+                explanation,
+            } => {
                 assert_eq!(port, 3000);
                 assert_eq!(owner_pid, 1234);
                 assert_eq!(tag, "dev-server");
                 assert!(explanation.contains("3000"));
-                assert!(explanation.contains("who"), "explanation should point at `who`: {explanation}");
+                assert!(
+                    explanation.contains("who"),
+                    "explanation should point at `who`: {explanation}"
+                );
             }
             other => panic!("expected Deny, got {other:?}"),
         }
@@ -392,19 +608,28 @@ mod tests {
     #[test]
     fn kill_pid_with_no_lease_allows() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(check("kill 1234", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("kill 1234", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn kill_pid_owned_by_self_allows() {
         let leases = vec![lease(3000, 1234, "dev-server")];
-        assert_eq!(check("kill 1234", &leases, Some(1234), None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("kill 1234", &leases, Some(1234), None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn kill_pid_with_dead_lease_allows() {
         let leases = vec![lease(3000, 1234, "dev-server")];
-        assert_eq!(check("kill 1234", &leases, None, None, &AlwaysDead), Verdict::Allow);
+        assert_eq!(
+            check("kill 1234", &leases, None, None, &AlwaysDead),
+            Verdict::Allow
+        );
     }
 
     // ==== ownership: self_pid / self_session ====
@@ -444,7 +669,10 @@ mod tests {
         // Backward-compatible path: a caller with only a PID (no session
         // concept at all) can still recognize its own lease by PID.
         let leases = vec![lease(3000, 1234, "dev-server")];
-        assert_eq!(check("kill 1234", &leases, Some(1234), None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("kill 1234", &leases, Some(1234), None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -453,7 +681,13 @@ mod tests {
         // must not override it.
         let leases = vec![lease_with_session(3000, 1234, "dev-server", "session-a")];
         assert_eq!(
-            check("kill 1234", &leases, Some(9999), Some("session-a"), &AlwaysAlive),
+            check(
+                "kill 1234",
+                &leases,
+                Some(9999),
+                Some("session-a"),
+                &AlwaysAlive
+            ),
             Verdict::Allow
         );
     }
@@ -461,7 +695,13 @@ mod tests {
     #[test]
     fn neither_self_pid_nor_self_session_matching_denies() {
         let leases = vec![lease_with_session(3000, 1234, "dev-server", "session-a")];
-        let verdict = check("kill 1234", &leases, Some(9999), Some("session-b"), &AlwaysAlive);
+        let verdict = check(
+            "kill 1234",
+            &leases,
+            Some(9999),
+            Some("session-b"),
+            &AlwaysAlive,
+        );
         assert!(matches!(verdict, Verdict::Deny { .. }));
     }
 
@@ -503,7 +743,10 @@ mod tests {
         // can't resolve a target, and this is a documented, accepted
         // false-negative boundary rather than a Warn.
         let leases = vec![lease(3000, 1234, "dev-server")];
-        assert_eq!(check("kill -l", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("kill -l", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     // ==== pkill / killall <name> ====
@@ -533,9 +776,17 @@ mod tests {
     #[test]
     fn lsof_xargs_kill_with_foreign_live_lease_denies() {
         let leases = vec![lease(3000, 5555, "next-dev")];
-        let verdict = check("lsof -ti:3000 | xargs kill", &leases, None, None, &AlwaysAlive);
+        let verdict = check(
+            "lsof -ti:3000 | xargs kill",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
         match verdict {
-            Verdict::Deny { port, owner_pid, .. } => {
+            Verdict::Deny {
+                port, owner_pid, ..
+            } => {
                 assert_eq!(port, 3000);
                 assert_eq!(owner_pid, 5555);
             }
@@ -547,7 +798,13 @@ mod tests {
     fn lsof_xargs_kill_with_no_lease_allows() {
         let leases: Vec<Lease> = vec![];
         assert_eq!(
-            check("lsof -ti:3000 | xargs kill", &leases, None, None, &AlwaysAlive),
+            check(
+                "lsof -ti:3000 | xargs kill",
+                &leases,
+                None,
+                None,
+                &AlwaysAlive
+            ),
             Verdict::Allow
         );
     }
@@ -556,7 +813,13 @@ mod tests {
     fn lsof_xargs_kill_owned_by_self_allows() {
         let leases = vec![lease(3000, 5555, "next-dev")];
         assert_eq!(
-            check("lsof -ti:3000 | xargs kill", &leases, Some(5555), None, &AlwaysAlive),
+            check(
+                "lsof -ti:3000 | xargs kill",
+                &leases,
+                Some(5555),
+                None,
+                &AlwaysAlive
+            ),
             Verdict::Allow
         );
     }
@@ -565,7 +828,13 @@ mod tests {
     fn lsof_xargs_kill_with_dead_lease_allows() {
         let leases = vec![lease(3000, 5555, "next-dev")];
         assert_eq!(
-            check("lsof -ti:3000 | xargs kill", &leases, None, None, &AlwaysDead),
+            check(
+                "lsof -ti:3000 | xargs kill",
+                &leases,
+                None,
+                None,
+                &AlwaysDead
+            ),
             Verdict::Allow
         );
     }
@@ -573,7 +842,13 @@ mod tests {
     #[test]
     fn lsof_space_colon_variant_with_dash_9_denies() {
         let leases = vec![lease(3000, 5555, "next-dev")];
-        let verdict = check("lsof -ti :3000 | xargs kill -9", &leases, None, None, &AlwaysAlive);
+        let verdict = check(
+            "lsof -ti :3000 | xargs kill -9",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
         assert!(matches!(verdict, Verdict::Deny { .. }));
     }
 
@@ -581,7 +856,10 @@ mod tests {
     fn bare_lsof_without_xargs_kill_allows() {
         // Just inspecting, not killing anything.
         let leases = vec![lease(3000, 5555, "next-dev")];
-        assert_eq!(check("lsof -ti:3000", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("lsof -ti:3000", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -618,7 +896,13 @@ mod tests {
         // pipeline must still be caught, including when followed by an
         // unrelated `;`-joined statement.
         let leases = vec![lease(3000, 5555, "next-dev")];
-        let verdict = check("lsof -ti:3000 | xargs kill; echo done", &leases, None, None, &AlwaysAlive);
+        let verdict = check(
+            "lsof -ti:3000 | xargs kill; echo done",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
         assert!(matches!(verdict, Verdict::Deny { .. }));
     }
 
@@ -629,7 +913,9 @@ mod tests {
         let leases = vec![lease(3000, 777, "vite-dev")];
         let verdict = check("fuser -k 3000/tcp", &leases, None, None, &AlwaysAlive);
         match verdict {
-            Verdict::Deny { port, owner_pid, .. } => {
+            Verdict::Deny {
+                port, owner_pid, ..
+            } => {
                 assert_eq!(port, 3000);
                 assert_eq!(owner_pid, 777);
             }
@@ -640,7 +926,10 @@ mod tests {
     #[test]
     fn fuser_kill_with_no_lease_allows() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(check("fuser -k 3000/tcp", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("fuser -k 3000/tcp", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -655,14 +944,20 @@ mod tests {
     #[test]
     fn fuser_kill_with_dead_lease_allows() {
         let leases = vec![lease(3000, 777, "vite-dev")];
-        assert_eq!(check("fuser -k 3000/tcp", &leases, None, None, &AlwaysDead), Verdict::Allow);
+        assert_eq!(
+            check("fuser -k 3000/tcp", &leases, None, None, &AlwaysDead),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn fuser_without_kill_flag_allows() {
         // Read-only: lists processes on the port, doesn't kill them.
         let leases = vec![lease(3000, 777, "vite-dev")];
-        assert_eq!(check("fuser 3000/tcp", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("fuser 3000/tcp", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -672,7 +967,10 @@ mod tests {
         // port — fuser only understands port numbers with an explicit
         // `/tcp` or `/udp` suffix. Must not be mistaken for a port kill.
         let leases = vec![lease(3000, 777, "vite-dev")];
-        assert_eq!(check("fuser -k 3000", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("fuser -k 3000", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -689,7 +987,9 @@ mod tests {
         let leases = vec![lease(3000, 888, "storybook")];
         let verdict = check("kill-port 3000", &leases, None, None, &AlwaysAlive);
         match verdict {
-            Verdict::Deny { port, owner_pid, .. } => {
+            Verdict::Deny {
+                port, owner_pid, ..
+            } => {
                 assert_eq!(port, 3000);
                 assert_eq!(owner_pid, 888);
             }
@@ -700,7 +1000,10 @@ mod tests {
     #[test]
     fn kill_port_with_no_lease_allows() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(check("kill-port 3000", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("kill-port 3000", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -715,7 +1018,10 @@ mod tests {
     #[test]
     fn kill_port_with_dead_lease_allows() {
         let leases = vec![lease(3000, 888, "storybook")];
-        assert_eq!(check("kill-port 3000", &leases, None, None, &AlwaysDead), Verdict::Allow);
+        assert_eq!(
+            check("kill-port 3000", &leases, None, None, &AlwaysDead),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -735,7 +1041,13 @@ mod tests {
     #[test]
     fn npx_dash_dash_yes_kill_port_denies() {
         let leases = vec![lease(3000, 888, "storybook")];
-        let verdict = check("npx --yes kill-port 3000", &leases, None, None, &AlwaysAlive);
+        let verdict = check(
+            "npx --yes kill-port 3000",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
         assert!(matches!(verdict, Verdict::Deny { .. }));
     }
 
@@ -778,7 +1090,10 @@ mod tests {
     #[test]
     fn ordinary_non_kill_command_allows() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(check("git log --oneline", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("git log --oneline", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -814,14 +1129,23 @@ mod tests {
     #[test]
     fn script_name_containing_kill_as_a_substring_does_not_trigger() {
         let leases: Vec<Lease> = vec![];
-        assert_eq!(check("npm run kill-server", &leases, None, None, &AlwaysAlive), Verdict::Allow);
+        assert_eq!(
+            check("npm run kill-server", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn unrelated_command_mentioning_a_leased_port_number_allows() {
         let leases = vec![lease(3000, 1234, "dev-server")];
         assert_eq!(
-            check("curl -X DELETE http://localhost:3000", &leases, None, None, &AlwaysAlive),
+            check(
+                "curl -X DELETE http://localhost:3000",
+                &leases,
+                None,
+                None,
+                &AlwaysAlive
+            ),
             Verdict::Allow
         );
     }
@@ -831,11 +1155,293 @@ mod tests {
         // Detection is per-pipeline-segment: an unrelated first segment
         // shouldn't stop a real `kill` in a later segment from being seen.
         let leases = vec![lease(3000, 1234, "dev-server")];
-        let verdict = check("echo about to clean up; kill 1234", &leases, None, None, &AlwaysAlive);
+        let verdict = check(
+            "echo about to clean up; kill 1234",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
         assert!(matches!(verdict, Verdict::Deny { .. }));
     }
 
+    // ==== sh -c unwrap (core normalization, covers the hook path) ====
+
+    #[test]
+    fn sh_c_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("sh -c 'kill 1234'", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn bash_c_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("bash -c 'kill 1234'", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn sh_combined_flags_c_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("sh -lc 'kill 1234'", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn nested_sh_c_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check(
+            "sh -c \"sh -c 'kill 1234'\"",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn sh_c_wrapped_pipeline_kill_with_foreign_live_lease_denies() {
+        // The unwrap must hand the whole payload to segment detection, so a
+        // pipeline INSIDE the payload is still correlated.
+        let leases = vec![lease(3000, 5555, "next-dev")];
+        let verdict = check(
+            "sh -c 'lsof -ti:3000 | xargs kill'",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn sh_c_wrapped_kill_owned_by_self_allows() {
+        // Normalization changes HOW the command is read, not the ownership
+        // rules that apply once it is read.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("sh -c 'kill 1234'", &leases, Some(1234), None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn sh_c_after_another_statement_is_a_documented_boundary() {
+        // The `sh -c` unwrap applies only at the very start of the command
+        // string (same shape the universal `guard` wrapper unwraps). A shell
+        // invocation that only appears after another statement is not
+        // unwrapped — an accepted false negative, see the module doc.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check(
+                "echo hi && sh -c 'kill 1234'",
+                &leases,
+                None,
+                None,
+                &AlwaysAlive
+            ),
+            Verdict::Allow
+        );
+    }
+
+    // ==== wrapper-prefix stripping (env / command / exec / nohup / builtin) ====
+
+    #[test]
+    fn env_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("env kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn env_with_ignore_environment_flag_wrapped_kill_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("env -i kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn env_with_assignment_wrapped_kill_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("env FOO=1 kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn env_with_unset_flag_wrapped_kill_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("env -u FOO kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn command_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("command kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn exec_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("exec kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn nohup_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("nohup kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn builtin_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("builtin kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn sudo_env_wrapped_kill_with_foreign_live_lease_denies() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check("sudo env kill 1234", &leases, None, None, &AlwaysAlive);
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn env_assignment_then_command_wrapped_kill_denies() {
+        // Combinations must strip repeatedly until the real verb is exposed.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check(
+            "env FOO=1 command kill 1234",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    #[test]
+    fn wrapper_stripping_is_per_pipeline_segment() {
+        // Same per-segment scope as the existing verb detection: an unrelated
+        // first segment must not hide a wrapped kill in a later one.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let verdict = check(
+            "echo cleaning up; env kill 1234",
+            &leases,
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(verdict, Verdict::Deny { .. }));
+    }
+
+    // ==== false-positive guards: wrappers are not verbs ====
+
+    #[test]
+    fn bare_env_allows() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("env", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn bare_command_allows() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("command", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn bare_nohup_allows() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("nohup", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn command_dash_v_locating_kill_allows() {
+        // `command -v kill` only LOCATES the binary, it never executes it —
+        // and more generally a wrapper followed by its own flags is a
+        // documented false-negative boundary (see the module doc), never a
+        // reason to deny.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("command -v kill", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn echo_mentioning_env_kill_does_not_trigger() {
+        // `env` appearing anywhere but the wrapper position must not strip
+        // anything: the segment's first word is still `echo`.
+        let leases = vec![lease(3000, 123, "dev-server")];
+        assert_eq!(
+            check("echo env kill 123", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn nohup_wrapping_a_non_kill_command_allows() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        assert_eq!(
+            check("nohup server", &leases, None, None, &AlwaysAlive),
+            Verdict::Allow
+        );
+    }
+
     // ==== robustness: never panics ====
+
+    #[test]
+    fn never_panics_on_adversarial_wrapper_and_shell_input() {
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let adversarial_inputs = [
+            "env",
+            "env -i",
+            "env -u",
+            "env -u FOO",
+            "env FOO=1",
+            "command",
+            "exec",
+            "nohup",
+            "builtin",
+            "sudo env",
+            "sudo env command",
+            "sh -c",
+            "sh -c ''",
+            "sh -c '",
+            "sh -c \"",
+            "sh -c 'kill",
+            "bash -c",
+            "env sh -c 'kill 1234'",
+            &"sh -c 'kill 1234'; ".repeat(200),
+            &{
+                // A pathologically deep sh -c nest must hit the recursion
+                // bound and stop, not blow the stack.
+                let mut payload = "kill 1234".to_string();
+                for _ in 0..50 {
+                    payload = format!("sh -c '{payload}'");
+                }
+                payload
+            },
+        ];
+        for input in adversarial_inputs {
+            let _ = check(input, &leases, None, None, &AlwaysAlive);
+            let _ = check(input, &leases, Some(1234), None, &AlivePids(vec![1234]));
+        }
+    }
 
     #[test]
     fn never_panics_on_adversarial_input() {
