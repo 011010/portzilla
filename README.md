@@ -1,5 +1,7 @@
 # portzilla
 
+[![CI](https://github.com/portzilla/portzilla/actions/workflows/ci.yml/badge.svg)](https://github.com/portzilla/portzilla/actions/workflows/ci.yml)
+
 `portzilla` is a lease registry for localhost ports. It exists because AI coding agents (Claude Code, Cursor, and similar tools) increasingly run several parallel sessions on one machine — each in its own git worktree, each starting its own dev server — and today those sessions have no way to coordinate. An agent that finds port 3000 busy typically just kills whatever is on it, which can be a sibling session's dev server. `portzilla` gives processes a way to claim a port with an owner PID and a purpose tag, gives conflicting claims the next free port instead of stealing, lets anyone ask who owns a port before killing it, and prunes leases whose owning process has died. All output is available as JSON so agents can consume it directly, and the tool works the same way for a human typing commands in a terminal.
 
 This is coordination, not diagnostics: existing tools like `witr`, `kill-port`, and ServerSlayer tell you what is on a port or kill it after the fact. `portzilla` is the layer that prevents the conflict in the first place.
@@ -171,6 +173,8 @@ It recognizes:
 - `fuser -k <port>/tcp` (and `/udp`) — a bare `fuser -k <port>` with no protocol suffix is not treated as a port kill, matching real `fuser`'s own argument parsing
 - `npx kill-port <port>` / `kill-port <port>` (including `npx -y kill-port ...` / `npx --yes kill-port ...`)
 
+Leading wrapper prefixes are stripped before the verb is read, so the kill intent is detected whether it appears directly or behind one of `env`, `command`, `exec`, `nohup`, `builtin`, or any combination with `sudo` — `sudo env FOO=1 command kill <pid>` resolves to `kill <pid>`. A leading `sh -c '<payload>'` invocation is also unwrapped (the same shape the universal `guard` wrapper handles for argv), so a kill hidden inside the payload is detected through the hook adapters too.
+
 For each, it resolves the target PID or port against the lease registry and decides:
 
 - **Allow** — no kill intent detected, the target has no live lease, the lease is dead, or the lease is yours (you're allowed to kill/restart your own claimed process — see "Session ownership" below).
@@ -250,6 +254,16 @@ $ echo $?
 ### Fail-open, always
 
 A guard that can crash or hang and take the user's session down with it is worse than no guard. Every adapter (`hook claude-code`, `hook cursor`, `hook gemini`) and `guard` fails open at every step: unreadable stdin, malformed hook JSON, an unreadable lease store, even an internal panic — all of it is caught and turned into "allow, note it on stderr" rather than ever blocking or crashing. For the hook adapters this means the harness's own normal permission flow applies unmodified, exactly as if the hook weren't installed; a portzilla-side problem never denies a command, only the command itself looking unsafe does.
+
+### Fail-closed mode (opt-in)
+
+Set `PORTZILLA_FAIL_CLOSED=1` to flip the tradeoff: when portzilla can't verify a command's safety (corrupt store, oversized payload, unparseable input, missing command, internal panic), the hook adapters emit their harness's deny shape with the reason going to the model, and `portzilla guard` exits 2 without running the command. Default is fail-open; this is for users who specifically prefer "block when unverified" over "let it through." The shape and channel of each deny match the harness's own conventions (Claude Code's `permissionDecisionReason`, Cursor's `agent_message`, Gemini's `reason`).
+
+## Input validation
+
+- `claim` rejects port 0 (clap range 1..=65535); the same check exists in `Store::claim` so any other caller (MCP, direct library use) hits it too.
+- `tag` is capped at 1024 characters and `session` at 512; oversized values are rejected with a clear error before the store is touched.
+- Hook runners cap stdin at 1 MiB; over-cap inputs are treated like a malformed payload.
 
 ## Data file location
 
