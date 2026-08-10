@@ -112,10 +112,30 @@ struct HookResponse {
 /// comment for why that only ever protects against foreign kills, and
 /// cannot currently recognize a claim as "your own" (Cursor doesn't expose
 /// `conversation_id` to the agent's shell commands).
+#[allow(dead_code)]
 pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> HookOutcome {
+    handle_with_policy(raw_input, leases, checker, false)
+}
+
+/// Same as [`handle`] but with the explicit fail-closed policy. When
+/// `fail_closed` is `true`, every portzilla-side failure (unparseable JSON,
+/// missing command, …) returns a deny shape on stdout instead of allow +
+/// stderr note.
+pub fn handle_with_policy(
+    raw_input: &str,
+    leases: &[Lease],
+    checker: &dyn PidChecker,
+    fail_closed: bool,
+) -> HookOutcome {
     let input: BeforeShellExecutionInput = match serde_json::from_str(raw_input) {
         Ok(input) => input,
         Err(err) => {
+            if fail_closed {
+                return HookOutcome {
+                    stdout_json: fail_closed_response("could not parse hook input JSON"),
+                    stderr_note: None,
+                };
+            }
             return HookOutcome {
                 stdout_json: allow_response(),
                 stderr_note: Some(format!(
@@ -128,10 +148,17 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
     let self_session = input.conversation_id;
 
     let Some(command) = input.command else {
+        if fail_closed {
+            return HookOutcome {
+                stdout_json: fail_closed_response("hook input had no command"),
+                stderr_note: None,
+            };
+        }
         return HookOutcome {
             stdout_json: allow_response(),
             stderr_note: Some(
-                "portzilla hook cursor: hook input had no command, failing open (allow)".to_string(),
+                "portzilla hook cursor: hook input had no command, failing open (allow)"
+                    .to_string(),
             ),
         };
     };
@@ -142,7 +169,12 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
             user_message: None,
             agent_message: None,
         },
-        Verdict::Deny { port, tag, explanation, .. } => HookResponse {
+        Verdict::Deny {
+            port,
+            tag,
+            explanation,
+            ..
+        } => HookResponse {
             permission: "deny",
             user_message: Some(format!(
                 "portzilla: blocked — port {port} (\"{tag}\") is owned by another session"
@@ -171,6 +203,22 @@ fn allow_response() -> String {
     .expect("HookResponse always serializes")
 }
 
+/// Builds the Cursor `beforeShellExecution` deny JSON for a portzilla-side
+/// failure under fail-closed mode. Same shape as a normal deny, with a
+/// short user-visible `user_message` and the longer reason in
+/// `agent_message` (which the docs describe as "sent to agent"). Kept here
+/// so the adapter owns the exact byte shape Cursor expects on stdout.
+pub fn fail_closed_response(reason: &str) -> String {
+    let response = HookResponse {
+        permission: "deny",
+        user_message: Some(format!(
+            "portzilla: blocked — could not verify this command's safety ({reason})."
+        )),
+        agent_message: Some(reason.to_string()),
+    };
+    serde_json::to_string(&response).expect("HookResponse always serializes")
+}
+
 /// The `.cursor/hooks.json` snippet printed by `portzilla init cursor`,
 /// registering this hook on `beforeShellExecution`. Format verified against
 /// the docs' own worked example (`version: 1`, `hooks.beforeShellExecution`
@@ -189,8 +237,8 @@ pub const HOOKS_SNIPPET: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
     use crate::lease::Lease;
+    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -230,7 +278,9 @@ mod tests {
         assert!(outcome.stderr_note.is_none());
         let json = response_json(&outcome);
         assert_eq!(json["permission"], "deny");
-        let agent_message = json["agent_message"].as_str().expect("agent_message must be a string");
+        let agent_message = json["agent_message"]
+            .as_str()
+            .expect("agent_message must be a string");
         assert!(agent_message.contains("3000"));
         assert!(agent_message.contains("dev-server"));
         assert!(json["user_message"].as_str().unwrap().contains("3000"));
@@ -300,7 +350,11 @@ mod tests {
         let outcome = handle("{ not valid json", &leases, &AlwaysAlive);
 
         assert_eq!(response_json(&outcome)["permission"], "allow");
-        assert!(outcome.stderr_note.is_some_and(|note| note.contains("failing open")));
+        assert!(
+            outcome
+                .stderr_note
+                .is_some_and(|note| note.contains("failing open"))
+        );
     }
 
     #[test]
@@ -318,6 +372,9 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(HOOKS_SNIPPET).expect("HOOKS_SNIPPET must itself be valid JSON");
         assert_eq!(value["version"], 1);
-        assert_eq!(value["hooks"]["beforeShellExecution"][0]["command"], "portzilla hook cursor");
+        assert_eq!(
+            value["hooks"]["beforeShellExecution"][0]["command"],
+            "portzilla hook cursor"
+        );
     }
 }

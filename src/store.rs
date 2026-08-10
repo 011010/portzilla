@@ -1,7 +1,7 @@
 //! Locked JSON persistence for leases, and the port-claiming core logic.
 
 use crate::lease::{Lease, PidChecker};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,48 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 const DATA_DIR_ENV_VAR: &str = "PORTZILLA_DATA_DIR";
 const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 const HOME_ENV_VAR: &str = "HOME";
+
+/// Maximum allowed length of a lease `tag`, in CHARACTERS (not bytes).
+/// Tags are arbitrary caller-supplied text persisted to `leases.json` and
+/// echoed back by every `ls`/`who`; an unbounded tag lets a caller push
+/// megabytes into the store and every listing. 1024 chars is far beyond any
+/// legitimate "what is this port for" description.
+pub const MAX_TAG_CHARS: usize = 1024;
+
+/// Maximum allowed length of a lease `session` identifier, in CHARACTERS
+/// (not bytes). Same reasoning as [`MAX_TAG_CHARS`]; session ids in practice
+/// are short opaque identifiers.
+pub const MAX_SESSION_CHARS: usize = 512;
+
+/// Validates `claim` inputs before anything is read or written, so a
+/// rejected claim never touches the store.
+///
+/// Port `0` is rejected because it is not a real bindable port a process
+/// could own — leasing it is always a mistake (or an attempt to poison the
+/// registry with a meaningless entry). `tag` and `session` are bounded by
+/// [`MAX_TAG_CHARS`] / [`MAX_SESSION_CHARS`], counted in CHARACTERS so a
+/// multibyte string at the character limit is accepted regardless of its
+/// byte size.
+pub(crate) fn validate_claim_inputs(port: u16, tag: &str, session: Option<&str>) -> Result<()> {
+    if port == 0 {
+        bail!("invalid port: port must be between 1 and 65535 (port 0 cannot be leased)");
+    }
+    if tag.chars().count() > MAX_TAG_CHARS {
+        bail!(
+            "invalid tag: at most {MAX_TAG_CHARS} characters, got {}",
+            tag.chars().count()
+        );
+    }
+    if let Some(session) = session
+        && session.chars().count() > MAX_SESSION_CHARS
+    {
+        bail!(
+            "invalid session: at most {MAX_SESSION_CHARS} characters, got {}",
+            session.chars().count()
+        );
+    }
+    Ok(())
+}
 
 /// Result of a `claim` operation: the lease that was actually created/updated,
 /// and whether it landed on a different port than the one requested.
@@ -138,6 +180,9 @@ impl Store {
         session: Option<String>,
         checker: &dyn PidChecker,
     ) -> Result<ClaimOutcome> {
+        // Validate before taking the lock / reading state so a rejected
+        // claim never touches (or even waits on) the store.
+        validate_claim_inputs(requested_port, &tag, session.as_deref())?;
         let _guard = self.lock_exclusive()?;
         let mut leases = self.read_leases()?;
         let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
@@ -181,8 +226,12 @@ impl Store {
     /// access (`0700` on Unix). Leases can carry PIDs and tags that reveal
     /// what a user is running, so the store directory is not world-readable.
     fn ensure_data_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("failed to create data directory at {}", self.data_dir.display()))?;
+        fs::create_dir_all(&self.data_dir).with_context(|| {
+            format!(
+                "failed to create data directory at {}",
+                self.data_dir.display()
+            )
+        })?;
         harden_dir_permissions(&self.data_dir)
     }
 
@@ -195,7 +244,12 @@ impl Store {
             .write(true)
             .truncate(false)
             .open(self.lock_file_path())
-            .with_context(|| format!("failed to open lock file at {}", self.lock_file_path().display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to open lock file at {}",
+                    self.lock_file_path().display()
+                )
+            })?;
         harden_file_permissions(&self.lock_file_path())?;
         // Called explicitly via the `fs4` trait (rather than relying on the
         // newer `std::fs::File::lock` inherent method) so locking stays on a
@@ -211,27 +265,43 @@ impl Store {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => {
-                return Err(err).with_context(|| format!("failed to read state file at {}", path.display()))
+                return Err(err)
+                    .with_context(|| format!("failed to read state file at {}", path.display()));
             }
         };
         if bytes.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(Vec::new());
         }
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("state file at {} contains invalid JSON and was not modified", path.display()))
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "state file at {} contains invalid JSON and was not modified",
+                path.display()
+            )
+        })
     }
 
     fn write_leases(&self, leases: &[Lease]) -> Result<()> {
         let path = self.state_file_path();
-        let tmp_path = self.data_dir.join(format!(".leases.json.tmp.{}", std::process::id()));
-        let json = serde_json::to_vec_pretty(leases).context("failed to serialize leases to JSON")?;
-        fs::write(&tmp_path, json)
-            .with_context(|| format!("failed to write temporary state file at {}", tmp_path.display()))?;
+        let tmp_path = self
+            .data_dir
+            .join(format!(".leases.json.tmp.{}", std::process::id()));
+        let json =
+            serde_json::to_vec_pretty(leases).context("failed to serialize leases to JSON")?;
+        fs::write(&tmp_path, json).with_context(|| {
+            format!(
+                "failed to write temporary state file at {}",
+                tmp_path.display()
+            )
+        })?;
         // Harden before the rename: rename preserves the file's existing mode,
         // so this also leaves the final `leases.json` owner-only (0600).
         harden_file_permissions(&tmp_path)?;
-        fs::rename(&tmp_path, &path)
-            .with_context(|| format!("failed to atomically replace state file at {}", path.display()))?;
+        fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "failed to atomically replace state file at {}",
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -391,8 +461,8 @@ mod tests {
     use super::*;
     use crate::lease::test_support::{AlivePids, AlwaysAlive, AlwaysDead};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -424,15 +494,20 @@ mod tests {
 
     #[test]
     fn resolve_data_dir_uses_xdg_data_home_and_appends_portzilla() {
-        let resolved =
-            Store::resolve_data_dir(None, None, Some("/xdg/dir".to_string()), Some("/home/dir".to_string()))
-                .unwrap();
+        let resolved = Store::resolve_data_dir(
+            None,
+            None,
+            Some("/xdg/dir".to_string()),
+            Some("/home/dir".to_string()),
+        )
+        .unwrap();
         assert_eq!(resolved, PathBuf::from("/xdg/dir/portzilla"));
     }
 
     #[test]
     fn resolve_data_dir_falls_back_to_home_local_share() {
-        let resolved = Store::resolve_data_dir(None, None, None, Some("/home/dir".to_string())).unwrap();
+        let resolved =
+            Store::resolve_data_dir(None, None, None, Some("/home/dir".to_string())).unwrap();
         assert_eq!(resolved, PathBuf::from("/home/dir/.local/share/portzilla"));
     }
 
@@ -492,13 +567,20 @@ mod tests {
             let overlap_detected = Arc::clone(&overlap_detected);
             handles.push(thread::spawn(move || {
                 store
-                    .claim_with_hook(5000 + i as u16, 200 + i, "svc".to_string(), None, &AlwaysAlive, || {
-                        if in_critical_section.swap(true, Ordering::SeqCst) {
-                            overlap_detected.store(true, Ordering::SeqCst);
-                        }
-                        thread::sleep(Duration::from_millis(20));
-                        in_critical_section.store(false, Ordering::SeqCst);
-                    })
+                    .claim_with_hook(
+                        5000 + i as u16,
+                        200 + i,
+                        "svc".to_string(),
+                        None,
+                        &AlwaysAlive,
+                        || {
+                            if in_critical_section.swap(true, Ordering::SeqCst) {
+                                overlap_detected.store(true, Ordering::SeqCst);
+                            }
+                            thread::sleep(Duration::from_millis(20));
+                            in_critical_section.store(false, Ordering::SeqCst);
+                        },
+                    )
                     .unwrap();
             }));
         }
@@ -576,8 +658,15 @@ mod tests {
     #[test]
     fn claim_free_port_creates_a_lease() {
         let mut leases = vec![];
-        let outcome =
-            claim_in_place(&mut leases, 3000, 100, "server".to_string(), None, &AlwaysAlive).unwrap();
+        let outcome = claim_in_place(
+            &mut leases,
+            3000,
+            100,
+            "server".to_string(),
+            None,
+            &AlwaysAlive,
+        )
+        .unwrap();
 
         assert!(!outcome.reassigned);
         assert_eq!(outcome.lease.port, 3000);
@@ -588,13 +677,24 @@ mod tests {
     #[test]
     fn claim_replaces_a_dead_lease_on_the_same_port() {
         let mut leases = vec![Lease::new(3000, 999, "stale-owner", None)];
-        let outcome =
-            claim_in_place(&mut leases, 3000, 100, "server".to_string(), None, &AlwaysDead).unwrap();
+        let outcome = claim_in_place(
+            &mut leases,
+            3000,
+            100,
+            "server".to_string(),
+            None,
+            &AlwaysDead,
+        )
+        .unwrap();
 
         assert!(!outcome.reassigned);
         assert_eq!(outcome.lease.port, 3000);
         assert_eq!(outcome.lease.pid, 100);
-        assert_eq!(leases.len(), 1, "dead lease should be replaced, not duplicated");
+        assert_eq!(
+            leases.len(),
+            1,
+            "dead lease should be replaced, not duplicated"
+        );
     }
 
     #[test]
@@ -678,11 +778,18 @@ mod tests {
         // lease must upsert, not leave the old dead entry AND a new one
         // sitting on the same port. Exactly one entry per port, and the
         // survivor on base+1 must be the new claim, not the stale one.
-        assert_eq!(leases.len(), 2, "must not duplicate the lease on the reused port");
+        assert_eq!(
+            leases.len(),
+            2,
+            "must not duplicate the lease on the reused port"
+        );
         let ports: std::collections::HashSet<u16> = leases.iter().map(|l| l.port).collect();
         assert_eq!(ports.len(), leases.len(), "no two leases may share a port");
         let survivor = leases.iter().find(|l| l.port == base + 1).unwrap();
-        assert_eq!(survivor.pid, 100, "the new owner must replace the stale lease");
+        assert_eq!(
+            survivor.pid, 100,
+            "the new owner must replace the stale lease"
+        );
         assert_eq!(survivor.tag, "server");
     }
 
@@ -842,6 +949,112 @@ mod tests {
         let pruned = store.prune(&AlwaysAlive).unwrap();
         assert!(pruned.is_empty());
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    // ---- claim input validation ----
+
+    #[test]
+    fn claim_rejects_port_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let err = store
+            .claim(0, 100, "server".to_string(), None, &AlwaysAlive)
+            .expect_err("port 0 must be rejected");
+        assert!(
+            err.to_string().contains("port must be between 1 and 65535"),
+            "error must name the valid port range, got: {err:#}"
+        );
+        assert!(
+            store.list().unwrap().is_empty(),
+            "a rejected claim must not write anything to the store"
+        );
+    }
+
+    #[test]
+    fn claim_accepts_a_tag_at_exactly_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let outcome = store
+            .claim(3000, 100, "a".repeat(MAX_TAG_CHARS), None, &AlwaysAlive)
+            .unwrap();
+        assert_eq!(outcome.lease.tag.chars().count(), MAX_TAG_CHARS);
+    }
+
+    #[test]
+    fn claim_rejects_a_tag_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let err = store
+            .claim(3000, 100, "a".repeat(MAX_TAG_CHARS + 1), None, &AlwaysAlive)
+            .expect_err("an oversized tag must be rejected");
+        assert!(
+            err.to_string().contains("tag"),
+            "error must say which field is too long, got: {err:#}"
+        );
+        assert!(
+            store.list().unwrap().is_empty(),
+            "a rejected claim must not write anything to the store"
+        );
+    }
+
+    #[test]
+    fn claim_accepts_a_session_at_exactly_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let outcome = store
+            .claim(
+                3000,
+                100,
+                "server".to_string(),
+                Some("s".repeat(MAX_SESSION_CHARS)),
+                &AlwaysAlive,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.lease.session.as_deref().unwrap().chars().count(),
+            MAX_SESSION_CHARS
+        );
+    }
+
+    #[test]
+    fn claim_rejects_a_session_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let err = store
+            .claim(
+                3000,
+                100,
+                "server".to_string(),
+                Some("s".repeat(MAX_SESSION_CHARS + 1)),
+                &AlwaysAlive,
+            )
+            .expect_err("an oversized session must be rejected");
+        assert!(
+            err.to_string().contains("session"),
+            "error must say which field is too long, got: {err:#}"
+        );
+        assert!(
+            store.list().unwrap().is_empty(),
+            "a rejected claim must not write anything to the store"
+        );
+    }
+
+    #[test]
+    fn claim_limits_count_characters_not_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        // MAX_TAG_CHARS multibyte characters: far more bytes than the limit,
+        // but exactly the limit in characters, so it must be accepted.
+        let outcome = store
+            .claim(3000, 100, "é".repeat(MAX_TAG_CHARS), None, &AlwaysAlive)
+            .unwrap();
+        assert_eq!(outcome.lease.tag.chars().count(), MAX_TAG_CHARS);
     }
 
     // ---- Unix permissions ----

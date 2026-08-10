@@ -25,6 +25,17 @@
 //! stderr for troubleshooting, which Claude Code only writes to its debug
 //! log on exit 0 — it is never shown to the user or the model, so it can
 //! never itself interrupt or alarm anyone.
+//!
+//! # Fail-closed mode (opt-in)
+//!
+//! When `PORTZILLA_FAIL_CLOSED=1` is set, every portzilla-side failure
+//! (unparseable input, missing command, store read error, oversized stdin)
+//! flips from "allow + note" to "deny + reason" instead. The exact JSON
+//! shape on stdout is owned by [`fail_closed_response`] and the same
+//! `permissionDecisionReason` field Claude Code forwards to the model on
+//! a deny. Pass-through is strict: the only way to enter fail-closed mode
+//! is through the policy flag set by `main.rs` based on the environment
+//! variable.
 
 use crate::guard::{self, Verdict};
 use crate::lease::{Lease, PidChecker};
@@ -56,6 +67,31 @@ impl HookOutcome {
             stderr_note: Some(note.into()),
         }
     }
+
+    fn deny_with_reason(reason: String) -> Self {
+        Self {
+            stdout_json: Some(fail_closed_response(&reason)),
+            stderr_note: None,
+        }
+    }
+}
+
+/// Builds the Claude Code `PreToolUse` deny JSON for a portzilla-side
+/// failure under fail-closed mode. The reason is sent to the agent via
+/// `permissionDecisionReason`, the field Claude Code forwards to the model
+/// when a tool call is denied. Kept here (rather than in `main.rs`) so the
+/// adapter owns the exact byte shape Claude Code expects on stdout.
+pub fn fail_closed_response(reason: &str) -> String {
+    let response = HookResponse {
+        system_message: None,
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse",
+            permission_decision: Some("deny"),
+            permission_decision_reason: Some(reason.to_string()),
+            additional_context: None,
+        },
+    };
+    serde_json::to_string(&response).expect("HookResponse always serializes")
 }
 
 /// The subset of the Claude Code `PreToolUse` hook input JSON this adapter
@@ -134,10 +170,33 @@ struct HookSpecificOutput {
 /// — see the README's Kill guard section for exactly how an agent should
 /// claim (`$CLAUDE_CODE_SESSION_ID`, verified against the Claude Code
 /// environment variables reference) for this to resolve end to end.
+///
+/// This is the fail-open wrapper kept for compatibility with the existing
+/// in-process unit tests; `main.rs` calls [`handle_with_policy`] so it can
+/// pass the `PORTZILLA_FAIL_CLOSED` policy.
+#[allow(dead_code)]
 pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> HookOutcome {
+    handle_with_policy(raw_input, leases, checker, false)
+}
+
+/// Same as [`handle`] but with the explicit fail-closed policy. When
+/// `fail_closed` is `true`, every portzilla-side failure (unparseable JSON,
+/// missing command, …) returns a deny shape on stdout instead of allow +
+/// stderr note.
+pub fn handle_with_policy(
+    raw_input: &str,
+    leases: &[Lease],
+    checker: &dyn PidChecker,
+    fail_closed: bool,
+) -> HookOutcome {
     let input: PreToolUseInput = match serde_json::from_str(raw_input) {
         Ok(input) => input,
         Err(err) => {
+            if fail_closed {
+                return HookOutcome::deny_with_reason(
+                    "could not parse hook input JSON".to_string(),
+                );
+            }
             return HookOutcome::allow_with_note(format!(
                 "portzilla hook claude-code: could not parse hook input JSON, failing open (allow): {err}"
             ));
@@ -155,6 +214,11 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
     let self_session = input.session_id;
 
     let Some(command) = input.tool_input.and_then(|t| t.command) else {
+        if fail_closed {
+            return HookOutcome::deny_with_reason(
+                "Bash tool call had no tool_input.command".to_string(),
+            );
+        }
         return HookOutcome::allow_with_note(
             "portzilla hook claude-code: Bash tool call had no tool_input.command, failing open (allow)"
                 .to_string(),
@@ -224,8 +288,8 @@ pub const SETTINGS_SNIPPET: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
     use crate::lease::Lease;
+    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -257,7 +321,8 @@ mod tests {
 
         assert!(outcome.stderr_note.is_none());
         let json: serde_json::Value =
-            serde_json::from_str(&outcome.stdout_json.expect("deny must produce stdout JSON")).unwrap();
+            serde_json::from_str(&outcome.stdout_json.expect("deny must produce stdout JSON"))
+                .unwrap();
         assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
         let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
@@ -267,7 +332,11 @@ mod tests {
         assert!(reason.contains("dev-server"));
         // Deny must not also carry a systemMessage/additionalContext.
         assert!(json.get("systemMessage").is_none());
-        assert!(json["hookSpecificOutput"].get("additionalContext").is_none());
+        assert!(
+            json["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none()
+        );
     }
 
     #[test]
@@ -313,9 +382,14 @@ mod tests {
         let leases = vec![lease(3000, 1234, "dev-server")];
         let outcome = handle("{ not valid json", &leases, &AlwaysAlive);
 
-        assert!(outcome.stdout_json.is_none(), "malformed input must fail open (no blocking output)");
         assert!(
-            outcome.stderr_note.is_some_and(|note| note.contains("failing open")),
+            outcome.stdout_json.is_none(),
+            "malformed input must fail open (no blocking output)"
+        );
+        assert!(
+            outcome
+                .stderr_note
+                .is_some_and(|note| note.contains("failing open")),
             "malformed input should still leave a diagnostic trail"
         );
     }
@@ -350,14 +424,21 @@ mod tests {
 
         assert!(outcome.stderr_note.is_none());
         let json: serde_json::Value =
-            serde_json::from_str(&outcome.stdout_json.expect("warn must produce stdout JSON")).unwrap();
+            serde_json::from_str(&outcome.stdout_json.expect("warn must produce stdout JSON"))
+                .unwrap();
         assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        assert!(json["hookSpecificOutput"].get("permissionDecision").is_none());
+        assert!(
+            json["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
         let additional_context = json["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext must be a string");
         assert!(additional_context.contains("node"));
-        let system_message = json["systemMessage"].as_str().expect("systemMessage must be a string");
+        let system_message = json["systemMessage"]
+            .as_str()
+            .expect("systemMessage must be a string");
         assert!(system_message.contains("node"));
     }
 
@@ -374,20 +455,32 @@ mod tests {
             &leases,
             &AlwaysAlive,
         );
-        assert!(outcome.stdout_json.is_none(), "own-session kill must be allowed (silent)");
+        assert!(
+            outcome.stdout_json.is_none(),
+            "own-session kill must be allowed (silent)"
+        );
         assert!(outcome.stderr_note.is_none());
     }
 
     #[test]
     fn denies_kill_of_a_lease_owned_by_a_different_session() {
-        let leases = vec![lease_with_session(3000, 1234, "dev-server", "session-theirs")];
+        let leases = vec![lease_with_session(
+            3000,
+            1234,
+            "dev-server",
+            "session-theirs",
+        )];
         let outcome = handle(
             &bash_input_with_session("kill 1234", "session-mine"),
             &leases,
             &AlwaysAlive,
         );
-        let json: serde_json::Value =
-            serde_json::from_str(&outcome.stdout_json.expect("foreign-session kill must be denied")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &outcome
+                .stdout_json
+                .expect("foreign-session kill must be denied"),
+        )
+        .unwrap();
         assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
@@ -398,6 +491,9 @@ mod tests {
         let hook_entry = &value["hooks"]["PreToolUse"][0];
         assert_eq!(hook_entry["matcher"], "Bash");
         assert_eq!(hook_entry["hooks"][0]["type"], "command");
-        assert_eq!(hook_entry["hooks"][0]["command"], "portzilla hook claude-code");
+        assert_eq!(
+            hook_entry["hooks"][0]["command"],
+            "portzilla hook claude-code"
+        );
     }
 }

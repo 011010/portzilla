@@ -35,14 +35,28 @@ fn claim_conflict_with_a_live_pid_reassigns_and_says_so() {
     assert_ne!(own_pid, parent_pid);
 
     cmd(dir.path())
-        .args(["claim", "4100", "--tag", "first", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "4100",
+            "--tag",
+            "first",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
     // A different, also-alive PID tries to claim the same port and must be
     // reassigned instead of stealing it.
     cmd(dir.path())
-        .args(["claim", "4100", "--tag", "second", "--pid", &parent_pid.to_string()])
+        .args([
+            "claim",
+            "4100",
+            "--tag",
+            "second",
+            "--pid",
+            &parent_pid.to_string(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("4101"));
@@ -148,7 +162,11 @@ fn ls_human_output_is_a_table_with_expected_columns() {
 fn ls_with_no_leases_succeeds_with_empty_output() {
     let dir = tempfile::tempdir().unwrap();
 
-    cmd(dir.path()).args(["ls", "--json"]).assert().success().stdout("[]\n");
+    cmd(dir.path())
+        .args(["ls", "--json"])
+        .assert()
+        .success()
+        .stdout("[]\n");
 }
 
 #[test]
@@ -167,7 +185,16 @@ fn claim_without_explicit_pid_still_succeeds() {
 fn who_human_shows_the_lease_for_a_claimed_port() {
     let dir = tempfile::tempdir().unwrap();
     cmd(dir.path())
-        .args(["claim", "4700", "--tag", "api", "--pid", "700", "--session", "sess-1"])
+        .args([
+            "claim",
+            "4700",
+            "--tag",
+            "api",
+            "--pid",
+            "700",
+            "--session",
+            "sess-1",
+        ])
         .assert()
         .success();
 
@@ -248,7 +275,11 @@ fn release_with_a_dead_pid_succeeds_with_no_warning() {
         .stderr(predicate::str::is_empty());
 
     // The lease is actually gone.
-    cmd(dir.path()).args(["who", "4800"]).assert().failure().code(2);
+    cmd(dir.path())
+        .args(["who", "4800"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 #[test]
@@ -257,7 +288,14 @@ fn release_with_an_alive_pid_still_releases_but_warns_on_stderr() {
     let own_pid = std::process::id();
 
     cmd(dir.path())
-        .args(["claim", "4801", "--tag", "running", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "4801",
+            "--tag",
+            "running",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -267,7 +305,11 @@ fn release_with_an_alive_pid_still_releases_but_warns_on_stderr() {
         .success()
         .stderr(predicate::str::contains("still alive"));
 
-    cmd(dir.path()).args(["who", "4801"]).assert().failure().code(2);
+    cmd(dir.path())
+        .args(["who", "4801"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 #[test]
@@ -312,7 +354,14 @@ fn prune_removes_only_dead_leases_and_reports_them() {
     let own_pid = std::process::id();
 
     cmd(dir.path())
-        .args(["claim", "4900", "--tag", "alive-one", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "4900",
+            "--tag",
+            "alive-one",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
     cmd(dir.path())
@@ -329,7 +378,11 @@ fn prune_removes_only_dead_leases_and_reports_them() {
 
     // The alive lease is untouched; the dead one is gone.
     cmd(dir.path()).args(["who", "4900"]).assert().success();
-    cmd(dir.path()).args(["who", "4901"]).assert().failure().code(2);
+    cmd(dir.path())
+        .args(["who", "4901"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 #[test]
@@ -365,7 +418,14 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
 
     // 1. Claim port 6000 for a PID that is alive for the whole test (this process).
     cmd(dir.path())
-        .args(["claim", "6000", "--tag", "live-owner", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "6000",
+            "--tag",
+            "live-owner",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -378,7 +438,14 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     // 3. A different, also-alive PID conflicts on 6000 and must be reassigned
     //    onto 6001 (the only free-looking port), reusing the stale lease slot.
     cmd(dir.path())
-        .args(["claim", "6000", "--tag", "new-owner", "--pid", &parent_pid.to_string()])
+        .args([
+            "claim",
+            "6000",
+            "--tag",
+            "new-owner",
+            "--pid",
+            &parent_pid.to_string(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("6001"));
@@ -394,7 +461,11 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     let json: Value = serde_json::from_slice(&output).unwrap();
     let leases = json.as_array().unwrap();
     let port_6001_entries: Vec<&Value> = leases.iter().filter(|l| l["port"] == 6001).collect();
-    assert_eq!(port_6001_entries.len(), 1, "port 6001 must appear exactly once in ls");
+    assert_eq!(
+        port_6001_entries.len(),
+        1,
+        "port 6001 must appear exactly once in ls"
+    );
 
     // 5. `who 6001` must return the NEW owner, not the stale one.
     let who_output = cmd(dir.path())
@@ -410,7 +481,11 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
 
     // 6. `release 6001` must actually free it: a subsequent `who` must report not-found.
     cmd(dir.path()).args(["release", "6001"]).assert().success();
-    cmd(dir.path()).args(["who", "6001"]).assert().failure().code(2);
+    cmd(dir.path())
+        .args(["who", "6001"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 // ---- control-character injection in human output ----
@@ -442,7 +517,11 @@ fn ls_human_output_sanitizes_control_characters_in_the_tag() {
     // payload are still allowed to show up as flattened tag text on the one
     // real row — what must not happen is a *separate line* starting with
     // "9999" as if it were its own table row for a port that was never claimed.
-    assert_eq!(lines.len(), 2, "expected header + exactly one lease row, got:\n{stdout}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected header + exactly one lease row, got:\n{stdout}"
+    );
     assert!(
         lines[1].starts_with("6100"),
         "the single data row must be for the real claimed port, got:\n{stdout}"
@@ -475,11 +554,22 @@ fn prune_with_nothing_to_prune_exits_zero() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "4903", "--tag", "alive", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "4903",
+            "--tag",
+            "alive",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
-    cmd(dir.path()).args(["prune", "--json"]).assert().success().stdout("[]\n");
+    cmd(dir.path())
+        .args(["prune", "--json"])
+        .assert()
+        .success()
+        .stdout("[]\n");
 
     cmd(dir.path()).args(["prune"]).assert().success();
 }
@@ -495,9 +585,7 @@ fn serve_without_mcp_flag_fails_with_a_clear_error() {
         .assert()
         .failure()
         .stdout(predicate::str::is_empty())
-        .stderr(
-            predicate::str::contains("--mcp").and(predicate::str::contains("serve requires")),
-        );
+        .stderr(predicate::str::contains("--mcp").and(predicate::str::contains("serve requires")));
 }
 
 // ---- hook claude-code ----
@@ -545,7 +633,10 @@ fn hook_claude_code_denies_kill_of_a_foreign_session_live_lease() {
 
     let output = cmd(dir.path())
         .args(["hook", "claude-code"])
-        .write_stdin(pretooluse_bash_json_with_session(&format!("kill {own_pid}"), "my-session"))
+        .write_stdin(pretooluse_bash_json_with_session(
+            &format!("kill {own_pid}"),
+            "my-session",
+        ))
         .assert()
         .success()
         .get_output()
@@ -586,7 +677,10 @@ fn hook_claude_code_allows_kill_of_an_own_session_live_lease() {
 
     cmd(dir.path())
         .args(["hook", "claude-code"])
-        .write_stdin(pretooluse_bash_json_with_session(&format!("kill {own_pid}"), "shared-session"))
+        .write_stdin(pretooluse_bash_json_with_session(
+            &format!("kill {own_pid}"),
+            "shared-session",
+        ))
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -654,10 +748,12 @@ fn hook_claude_code_warns_on_process_name_kill() {
         .clone();
 
     let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
-    assert!(json["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap()
-        .contains("node"));
+    assert!(
+        json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("node")
+    );
     assert!(json["systemMessage"].as_str().unwrap().contains("node"));
 }
 
@@ -683,7 +779,14 @@ fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -714,7 +817,14 @@ fn hook_gemini_denies_kill_of_a_foreign_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -785,7 +895,14 @@ fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -795,7 +912,12 @@ fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
     write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
 
     cmd(dir.path())
-        .args(["guard", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .args([
+            "guard",
+            "--",
+            script.to_str().unwrap(),
+            &own_pid.to_string(),
+        ])
         .assert()
         .failure()
         .code(2)
@@ -812,11 +934,20 @@ fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
 fn guard_allow_executes_and_propagates_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("myapp");
-    write_fake_command(&script, &format!("touch '{}/marker'\nexit 7", dir.path().display()));
+    write_fake_command(
+        &script,
+        &format!("touch '{}/marker'\nexit 7", dir.path().display()),
+    );
 
-    cmd(dir.path()).args(["guard", "--", script.to_str().unwrap()]).assert().code(7);
+    cmd(dir.path())
+        .args(["guard", "--", script.to_str().unwrap()])
+        .assert()
+        .code(7);
 
-    assert!(dir.path().join("marker").exists(), "an allowed command must have run");
+    assert!(
+        dir.path().join("marker").exists(),
+        "an allowed command must have run"
+    );
 }
 
 #[cfg(unix)]
@@ -834,7 +965,10 @@ fn guard_warn_executes_with_stderr_warning() {
         .success()
         .stderr(predicate::str::contains("node"));
 
-    assert!(dir.path().join("marker").exists(), "a warned command must still execute");
+    assert!(
+        dir.path().join("marker").exists(),
+        "a warned command must still execute"
+    );
 }
 
 #[cfg(unix)]
@@ -843,7 +977,14 @@ fn guard_analyzes_the_sh_c_payload_and_denies() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     cmd(dir.path())
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -873,7 +1014,14 @@ fn guard_analyzes_the_sh_c_payload_and_denies() {
 fn setup_foreign_live_lease_and_kill_script(dir: &std::path::Path) -> (u32, std::path::PathBuf) {
     let own_pid = std::process::id();
     cmd(dir)
-        .args(["claim", "3000", "--tag", "dev-server", "--pid", &own_pid.to_string()])
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -895,7 +1043,10 @@ fn guard_denies_via_combined_dash_lc_flag() {
         .failure()
         .code(2);
 
-    assert!(!dir.path().join("marker").exists(), "sh -lc must not bypass the guard");
+    assert!(
+        !dir.path().join("marker").exists(),
+        "sh -lc must not bypass the guard"
+    );
 }
 
 #[cfg(unix)]
@@ -911,7 +1062,10 @@ fn guard_denies_via_separate_dash_x_dash_c_flags() {
         .failure()
         .code(2);
 
-    assert!(!dir.path().join("marker").exists(), "sh -x -c must not bypass the guard");
+    assert!(
+        !dir.path().join("marker").exists(),
+        "sh -x -c must not bypass the guard"
+    );
 }
 
 #[cfg(unix)]
@@ -927,7 +1081,10 @@ fn guard_denies_via_long_flag_then_dash_c() {
         .failure()
         .code(2);
 
-    assert!(!dir.path().join("marker").exists(), "bash --norc -c must not bypass the guard");
+    assert!(
+        !dir.path().join("marker").exists(),
+        "bash --norc -c must not bypass the guard"
+    );
 }
 
 #[cfg(unix)]
@@ -944,7 +1101,10 @@ fn guard_denies_via_nested_sh_c() {
         .failure()
         .code(2);
 
-    assert!(!dir.path().join("marker").exists(), "nested sh -c must not bypass the guard");
+    assert!(
+        !dir.path().join("marker").exists(),
+        "nested sh -c must not bypass the guard"
+    );
 }
 
 #[cfg(unix)]
@@ -954,7 +1114,13 @@ fn guard_sh_c_with_non_kill_payload_still_executes() {
     let marker = dir.path().join("marker");
 
     cmd(dir.path())
-        .args(["guard", "--", "sh", "-c", &format!("touch '{}'", marker.display())])
+        .args([
+            "guard",
+            "--",
+            "sh",
+            "-c",
+            &format!("touch '{}'", marker.display()),
+        ])
         .assert()
         .success();
 
@@ -984,7 +1150,14 @@ fn guard_own_session_lease_executes() {
     write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
 
     cmd(dir.path())
-        .args(["guard", "--session", "my-sess", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .args([
+            "guard",
+            "--session",
+            "my-sess",
+            "--",
+            script.to_str().unwrap(),
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -1015,7 +1188,12 @@ fn guard_session_from_env_var_executes_own_session_lease() {
 
     cmd(dir.path())
         .env("PORTZILLA_SESSION", "env-sess")
-        .args(["guard", "--", script.to_str().unwrap(), &own_pid.to_string()])
+        .args([
+            "guard",
+            "--",
+            script.to_str().unwrap(),
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 

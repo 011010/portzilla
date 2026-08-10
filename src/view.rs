@@ -5,7 +5,7 @@
 //! outcome). Rather than defining that shape twice and risking drift between
 //! the two surfaces, both go through these types.
 
-use crate::lease::{current_unix_timestamp, Lease, PidChecker};
+use crate::lease::{Lease, PidChecker, current_unix_timestamp};
 use crate::store::ClaimOutcome;
 use serde::Serialize;
 
@@ -95,10 +95,17 @@ mod tests {
         let json = serde_json::to_value(&view).unwrap();
         let obj = json.as_object().unwrap();
         let keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
-        let expected: std::collections::HashSet<&str> =
-            ["port", "pid", "tag", "created_at", "session", "age_secs", "alive"]
-                .into_iter()
-                .collect();
+        let expected: std::collections::HashSet<&str> = [
+            "port",
+            "pid",
+            "tag",
+            "created_at",
+            "session",
+            "age_secs",
+            "alive",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(keys, expected);
     }
 

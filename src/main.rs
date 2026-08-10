@@ -13,7 +13,52 @@ use clap::{Parser, Subcommand};
 use lease::{Lease, SystemPidChecker};
 use std::io::Read;
 use store::{ClaimOutcome, Store};
-use view::{to_claim_view, to_view, LeaseView};
+use view::{LeaseView, to_claim_view, to_view};
+
+/// Maximum number of bytes the hook runners will read from stdin before
+/// giving up. Hook payloads are JSON with a single command string; anything
+/// larger than 1 MiB is either a programming error or an attempt to
+/// exhaust portzilla's memory via a hostile harness. Exceeding the limit
+/// is treated like a malformed payload (fail-open in the default mode,
+/// fail-closed under `PORTZILLA_FAIL_CLOSED`).
+const HOOK_STDIN_LIMIT: usize = 1 << 20;
+
+/// Returns true if `PORTZILLA_FAIL_CLOSED` is set to `"1"` or `"true"`.
+/// Under fail-closed, a portzilla-side failure (corrupt store, unreadable
+/// stdin, oversized payload) flips the verdict from allow to deny instead
+/// of the default fail-open behavior. Fail-open is the default because a
+/// guard that blocks a legitimate command over a portzilla-side problem is
+/// worse than no guard at all — this opt-in flips that tradeoff for users
+/// who specifically prefer the "block when unverified" end of it.
+fn fail_closed_mode() -> bool {
+    std::env::var("PORTZILLA_FAIL_CLOSED").is_ok_and(|v| v == "1" || v == "true")
+}
+
+/// Reads hook stdin into a `String`, with a hard byte cap. Returns a
+/// human-readable reason on failure rather than an `io::Error` so the
+/// callers can render it directly into a fail-closed deny message.
+fn read_hook_stdin(limit: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read stdin: {err}"))?;
+    if bytes.len() > limit {
+        return Err(format!("payload exceeds the {} byte limit", limit));
+    }
+    String::from_utf8(bytes).map_err(|err| format!("payload is not valid UTF-8: {err}"))
+}
+
+/// Builds the standard message shown when a portzilla-side failure flips
+/// the verdict to deny under fail-closed mode. The `cause` is the
+/// short reason (e.g. "corrupt state file", "payload exceeds the 1048576
+/// byte limit"), and the body goes to the adapter that owns the deny shape.
+fn fail_closed_reason(cause: &str) -> String {
+    format!(
+        "portzilla could not verify this command's safety ({cause}). PORTZILLA_FAIL_CLOSED is \
+         enabled, so unverified commands are denied instead of allowed."
+    )
+}
 
 /// Port/process lease coordinator for parallel AI coding-agent sessions.
 #[derive(Parser)]
@@ -27,7 +72,9 @@ struct Cli {
 enum Commands {
     /// Claim a local port, recording who owns it and why.
     Claim {
-        /// The port to claim.
+        /// The port to claim (1-65535). Port 0 is reserved by the OS and
+        /// cannot be leased; clap rejects it with a clear error.
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         /// Human-readable description of what this port is for.
         #[arg(long)]
@@ -273,15 +320,32 @@ fn run() -> Result<(), RunError> {
 /// alarming or blocking the user over a portzilla-side problem that has
 /// nothing to do with whether their command is actually safe to run.
 fn run_hook_claude_code() {
-    let mut raw_input = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut raw_input) {
-        eprintln!("portzilla hook claude-code: failed to read stdin, failing open (allow): {err:#}");
-        return;
-    }
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    claude_code::fail_closed_response(&fail_closed_reason(&cause))
+                );
+                return;
+            }
+            eprintln!("portzilla hook claude-code: {cause}, failing open (allow)");
+            return;
+        }
+    };
 
     let leases = match Store::open(None).and_then(|store| store.list()) {
         Ok(leases) => leases,
         Err(err) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    claude_code::fail_closed_response(&fail_closed_reason(&format!("{err:#}")))
+                );
+                return;
+            }
             eprintln!(
                 "portzilla hook claude-code: failed to read the lease store, failing open (allow): {err:#}"
             );
@@ -290,7 +354,7 @@ fn run_hook_claude_code() {
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        claude_code::handle(&raw_input, &leases, &SystemPidChecker)
+        claude_code::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
     }));
 
     match result {
@@ -303,6 +367,15 @@ fn run_hook_claude_code() {
             }
         }
         Err(_) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    claude_code::fail_closed_response(&fail_closed_reason(
+                        "internal error while evaluating the command",
+                    ))
+                );
+                return;
+            }
             eprintln!(
                 "portzilla hook claude-code: internal error while evaluating the command, failing \
                  open (allow)"
@@ -316,23 +389,43 @@ fn run_hook_claude_code() {
 /// explicit JSON response (Cursor's own reference examples never rely on
 /// "empty stdout means allow" the way Claude Code's do).
 fn run_hook_cursor() {
-    let mut raw_input = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut raw_input) {
-        eprintln!("portzilla hook cursor: failed to read stdin, failing open (allow): {err:#}");
-        println!("{{\"permission\":\"allow\"}}");
-        return;
-    }
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    cursor::fail_closed_response(&fail_closed_reason(&cause))
+                );
+                return;
+            }
+            eprintln!("portzilla hook cursor: {cause}, failing open (allow)");
+            println!("{{\"permission\":\"allow\"}}");
+            return;
+        }
+    };
 
     let leases = match Store::open(None).and_then(|store| store.list()) {
         Ok(leases) => leases,
         Err(err) => {
-            eprintln!("portzilla hook cursor: failed to read the lease store, failing open (allow): {err:#}");
+            if fail_closed {
+                println!(
+                    "{}",
+                    cursor::fail_closed_response(&fail_closed_reason(&format!("{err:#}")))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook cursor: failed to read the lease store, failing open (allow): {err:#}"
+            );
             Vec::new()
         }
     };
 
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cursor::handle(&raw_input, &leases, &SystemPidChecker)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
 
     match result {
         Ok(outcome) => {
@@ -342,6 +435,15 @@ fn run_hook_cursor() {
             }
         }
         Err(_) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    cursor::fail_closed_response(&fail_closed_reason(
+                        "internal error while evaluating the command",
+                    ))
+                );
+                return;
+            }
             eprintln!(
                 "portzilla hook cursor: internal error while evaluating the command, failing open (allow)"
             );
@@ -353,23 +455,43 @@ fn run_hook_cursor() {
 /// Runs the Gemini CLI `BeforeTool` hook. Same fail-open boundary as
 /// [`run_hook_claude_code`].
 fn run_hook_gemini() {
-    let mut raw_input = String::new();
-    if let Err(err) = std::io::stdin().read_to_string(&mut raw_input) {
-        eprintln!("portzilla hook gemini: failed to read stdin, failing open (allow): {err:#}");
-        println!("{{}}");
-        return;
-    }
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    gemini::fail_closed_response(&fail_closed_reason(&cause))
+                );
+                return;
+            }
+            eprintln!("portzilla hook gemini: {cause}, failing open (allow)");
+            println!("{{}}");
+            return;
+        }
+    };
 
     let leases = match Store::open(None).and_then(|store| store.list()) {
         Ok(leases) => leases,
         Err(err) => {
-            eprintln!("portzilla hook gemini: failed to read the lease store, failing open (allow): {err:#}");
+            if fail_closed {
+                println!(
+                    "{}",
+                    gemini::fail_closed_response(&fail_closed_reason(&format!("{err:#}")))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook gemini: failed to read the lease store, failing open (allow): {err:#}"
+            );
             Vec::new()
         }
     };
 
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gemini::handle(&raw_input, &leases, &SystemPidChecker)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gemini::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
 
     match result {
         Ok(outcome) => {
@@ -379,6 +501,15 @@ fn run_hook_gemini() {
             }
         }
         Err(_) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    gemini::fail_closed_response(&fail_closed_reason(
+                        "internal error while evaluating the command",
+                    ))
+                );
+                return;
+            }
             eprintln!(
                 "portzilla hook gemini: internal error while evaluating the command, failing open (allow)"
             );
@@ -392,20 +523,37 @@ fn run_hook_gemini() {
 /// execution), warns then executes, or executes silently. Never returns on
 /// the execute paths — see [`execute`].
 fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
+    let fail_closed = fail_closed_mode();
     let self_session = session_flag.or_else(|| std::env::var("PORTZILLA_SESSION").ok());
     let command_display = guard_cmd::join_command(&command);
 
     // Fail-open: a store problem is not a reason to block a command a
-    // human or script explicitly asked to run.
+    // human or script explicitly asked to run. Under `PORTZILLA_FAIL_CLOSED`,
+    // a store we can't read flips to deny instead.
     let leases = match Store::open(None).and_then(|store| store.list()) {
         Ok(leases) => leases,
         Err(err) => {
-            eprintln!("portzilla guard: failed to read the lease store, failing open (execute): {err:#}");
+            if fail_closed {
+                eprintln!(
+                    "portzilla guard: blocked — could not verify lease safety \
+                     and PORTZILLA_FAIL_CLOSED is set (failing closed): {err:#}"
+                );
+                std::process::exit(2);
+            }
+            eprintln!(
+                "portzilla guard: failed to read the lease store, failing open (execute): {err:#}"
+            );
             Vec::new()
         }
     };
 
-    let action = guard_cmd::decide(&command_display, &leases, None, self_session.as_deref(), &SystemPidChecker);
+    let action = guard_cmd::decide(
+        &command_display,
+        &leases,
+        None,
+        self_session.as_deref(),
+        &SystemPidChecker,
+    );
     match action {
         guard_cmd::GuardAction::Deny { explanation } => {
             eprintln!("portzilla guard: blocked — {explanation}");
@@ -485,15 +633,11 @@ fn print_init_cursor() {
     println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
     println!("Verify with: portzilla --version");
     println!();
-    println!(
-        "Note: Cursor does not currently expose the conversation id to the shell commands it"
-    );
+    println!("Note: Cursor does not currently expose the conversation id to the shell commands it");
     println!(
         "runs, only to the hook payload itself, so claims made from a Cursor session cannot be"
     );
-    println!(
-        "tagged with a matching --session. This hook still protects against killing another"
-    );
+    println!("tagged with a matching --session. This hook still protects against killing another");
     println!("session's live process; it just can't yet recognize a lease as your own.");
 }
 
@@ -510,9 +654,7 @@ fn print_init_gemini() {
     println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
     println!("Verify with: portzilla --version");
     println!();
-    println!(
-        "Note: Gemini CLI's run_shell_command tool only sets GEMINI_CLI=1 in the commands it"
-    );
+    println!("Note: Gemini CLI's run_shell_command tool only sets GEMINI_CLI=1 in the commands it");
     println!(
         "runs, not a session id, so claims made from a Gemini CLI session cannot be tagged with"
     );
@@ -544,7 +686,7 @@ fn print_init_claude_code() {
 /// (the shell or agent invoking `portzilla`). Falls back to this process's
 /// own PID if the parent cannot be determined.
 fn default_pid() -> u32 {
-    use sysinfo::{get_current_pid, ProcessesToUpdate, System};
+    use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
     let Ok(current) = get_current_pid() else {
         return std::process::id();
@@ -566,7 +708,9 @@ fn default_pid() -> u32 {
 /// `release`/`prune` output. JSON output is unaffected (JSON already escapes
 /// control characters) and is not passed through this function.
 fn sanitize_for_display(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) {
@@ -594,7 +738,10 @@ fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) 
 }
 
 fn print_leases(leases: &[Lease], json: bool) {
-    let views: Vec<LeaseView> = leases.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
+    let views: Vec<LeaseView> = leases
+        .iter()
+        .map(|lease| to_view(lease, &SystemPidChecker))
+        .collect();
     if json {
         println!(
             "{}",
@@ -603,7 +750,10 @@ fn print_leases(leases: &[Lease], json: bool) {
         return;
     }
 
-    println!("{:<7} {:<8} {:<6} {:<10} TAG", "PORT", "PID", "STATUS", "AGE");
+    println!(
+        "{:<7} {:<8} {:<6} {:<10} TAG",
+        "PORT", "PID", "STATUS", "AGE"
+    );
     for view in &views {
         print_lease_row(view);
     }
@@ -648,7 +798,10 @@ fn print_lease_view(view: &LeaseView, json: bool) {
 }
 
 fn print_pruned(pruned: &[Lease], json: bool) {
-    let views: Vec<LeaseView> = pruned.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
+    let views: Vec<LeaseView> = pruned
+        .iter()
+        .map(|lease| to_view(lease, &SystemPidChecker))
+        .collect();
     if json {
         println!(
             "{}",

@@ -17,7 +17,7 @@ use rmcp::model::{
     CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::transport::stdio;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -86,6 +86,17 @@ impl PortzillaMcpServer {
         &self,
         Parameters(params): Parameters<ClaimParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Input validation surfaces as INVALID_PARAMS protocol errors (bad
+        // tool arguments, per JSON-RPC), distinct from store failures
+        // (INTERNAL errors, portzilla itself couldn't do its job). The store
+        // re-validates defensively; this check exists so the error CODE is
+        // right at the protocol level.
+        if let Err(err) =
+            crate::store::validate_claim_inputs(params.port, &params.tag, params.session.as_deref())
+        {
+            return Err(McpError::invalid_params(format!("{err:#}"), None));
+        }
+
         let pid_was_given = params.pid.is_some();
         let pid = params.pid.unwrap_or_else(std::process::id);
         let store = self.store.clone();
@@ -163,7 +174,10 @@ impl PortzillaMcpServer {
 
         let value = tokio::task::spawn_blocking(move || {
             store.list().map(|leases| {
-                let views: Vec<_> = leases.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
+                let views: Vec<_> = leases
+                    .iter()
+                    .map(|lease| to_view(lease, &SystemPidChecker))
+                    .collect();
                 serde_json::to_value(views).expect("Vec<LeaseView> always serializes")
             })
         })
@@ -191,8 +205,9 @@ impl PortzillaMcpServer {
         let released = tokio::task::spawn_blocking(move || {
             store.release(port, &SystemPidChecker).map(|outcome| {
                 outcome.map(|outcome| {
-                    let mut value = serde_json::to_value(to_view(&outcome.lease, &SystemPidChecker))
-                        .expect("LeaseView always serializes");
+                    let mut value =
+                        serde_json::to_value(to_view(&outcome.lease, &SystemPidChecker))
+                            .expect("LeaseView always serializes");
                     value["was_alive"] = json!(outcome.was_alive);
                     value
                 })
@@ -217,7 +232,10 @@ impl PortzillaMcpServer {
 
         let value = tokio::task::spawn_blocking(move || {
             store.prune(&SystemPidChecker).map(|pruned| {
-                let views: Vec<_> = pruned.iter().map(|lease| to_view(lease, &SystemPidChecker)).collect();
+                let views: Vec<_> = pruned
+                    .iter()
+                    .map(|lease| to_view(lease, &SystemPidChecker))
+                    .collect();
                 serde_json::to_value(views).expect("Vec<LeaseView> always serializes")
             })
         })
@@ -275,7 +293,10 @@ fn store_error(err: anyhow::Error) -> McpError {
 /// only happen on a bug (a panic inside store/lease code) or shutdown race,
 /// never in normal operation.
 fn blocking_task_failed(err: tokio::task::JoinError) -> McpError {
-    McpError::internal_error(format!("internal error: blocking store task failed: {err}"), None)
+    McpError::internal_error(
+        format!("internal error: blocking store task failed: {err}"),
+        None,
+    )
 }
 
 /// Builds the tool-level error result used for "no lease on this port"
@@ -291,6 +312,7 @@ fn not_found_error(port: u16) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::ErrorCode;
 
     fn server_with_tempdir() -> (PortzillaMcpServer, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -332,7 +354,9 @@ mod tests {
             tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
             names,
-            ["claim", "who", "ls", "release", "prune"].into_iter().collect()
+            ["claim", "who", "ls", "release", "prune"]
+                .into_iter()
+                .collect()
         );
         for tool in &tools {
             assert!(
@@ -383,7 +407,9 @@ mod tests {
 
         let value = structured(&result);
         assert_eq!(value["pid"], std::process::id());
-        let note = value["note"].as_str().expect("note field must be present and a string");
+        let note = value["note"]
+            .as_str()
+            .expect("note field must be present and a string");
         assert!(!note.is_empty());
     }
 
@@ -401,7 +427,10 @@ mod tests {
             .unwrap();
 
         let value = structured(&result);
-        assert!(value.get("note").is_none(), "note must be absent when pid was given explicitly");
+        assert!(
+            value.get("note").is_none(),
+            "note must be absent when pid was given explicitly"
+        );
     }
 
     #[tokio::test]
@@ -434,6 +463,89 @@ mod tests {
         assert_eq!(value["requested_port"], 4003);
     }
 
+    #[tokio::test]
+    async fn claim_with_port_zero_is_an_invalid_params_protocol_error() {
+        let (server, _dir) = server_with_tempdir();
+
+        let err = server
+            .claim(Parameters(ClaimParams {
+                port: 0,
+                tag: "server".to_string(),
+                pid: Some(100),
+                session: None,
+            }))
+            .await
+            .expect_err("port 0 must be a protocol-level error");
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        let message = err.message.to_string();
+        assert!(
+            message.contains("port must be between 1 and 65535"),
+            "error message must name the valid port range, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_with_an_oversized_tag_is_a_protocol_error() {
+        let (server, _dir) = server_with_tempdir();
+
+        let err = server
+            .claim(Parameters(ClaimParams {
+                port: 4010,
+                tag: "a".repeat(crate::store::MAX_TAG_CHARS + 1),
+                pid: Some(100),
+                session: None,
+            }))
+            .await
+            .expect_err("an oversized tag must be a protocol-level error");
+
+        let message = err.message.to_string();
+        assert!(
+            message.contains("tag"),
+            "error message must say which field is too long, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_with_an_oversized_session_is_a_protocol_error() {
+        let (server, _dir) = server_with_tempdir();
+
+        let err = server
+            .claim(Parameters(ClaimParams {
+                port: 4011,
+                tag: "server".to_string(),
+                pid: Some(100),
+                session: Some("s".repeat(crate::store::MAX_SESSION_CHARS + 1)),
+            }))
+            .await
+            .expect_err("an oversized session must be a protocol-level error");
+
+        let message = err.message.to_string();
+        assert!(
+            message.contains("session"),
+            "error message must say which field is too long, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_with_boundary_tag_and_session_lengths_succeeds() {
+        let (server, _dir) = server_with_tempdir();
+
+        let result = server
+            .claim(Parameters(ClaimParams {
+                port: 4012,
+                tag: "a".repeat(crate::store::MAX_TAG_CHARS),
+                pid: Some(100),
+                session: Some("s".repeat(crate::store::MAX_SESSION_CHARS)),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let value = structured(&result);
+        assert_eq!(value["port"], 4012);
+    }
+
     // ---- who ----
 
     #[tokio::test]
@@ -449,7 +561,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = server.who(Parameters(PortParams { port: 4100 })).await.unwrap();
+        let result = server
+            .who(Parameters(PortParams { port: 4100 }))
+            .await
+            .unwrap();
 
         assert_eq!(result.is_error, Some(false));
         let value = structured(&result);
@@ -466,7 +581,10 @@ mod tests {
 
         // `Ok(..)`, not `Err(..)`: this must be a tool-level error the caller
         // sees in the result, not a JSON-RPC protocol error.
-        let result = server.who(Parameters(PortParams { port: 4199 })).await.unwrap();
+        let result = server
+            .who(Parameters(PortParams { port: 4199 }))
+            .await
+            .unwrap();
 
         assert_eq!(result.is_error, Some(true));
         let value = structured(&result);
@@ -529,7 +647,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = server.release(Parameters(PortParams { port: 4300 })).await.unwrap();
+        let result = server
+            .release(Parameters(PortParams { port: 4300 }))
+            .await
+            .unwrap();
 
         assert_eq!(result.is_error, Some(false));
         let value = structured(&result);
@@ -537,7 +658,10 @@ mod tests {
         assert_eq!(value["was_alive"], false);
 
         // Actually released: a follow-up `who` must not find it.
-        let who_result = server.who(Parameters(PortParams { port: 4300 })).await.unwrap();
+        let who_result = server
+            .who(Parameters(PortParams { port: 4300 }))
+            .await
+            .unwrap();
         assert_eq!(who_result.is_error, Some(true));
     }
 
@@ -555,7 +679,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = server.release(Parameters(PortParams { port: 4301 })).await.unwrap();
+        let result = server
+            .release(Parameters(PortParams { port: 4301 }))
+            .await
+            .unwrap();
         let value = structured(&result);
         assert_eq!(value["was_alive"], true);
     }
@@ -563,7 +690,10 @@ mod tests {
     #[tokio::test]
     async fn release_not_found_returns_a_tool_level_error() {
         let (server, _dir) = server_with_tempdir();
-        let result = server.release(Parameters(PortParams { port: 4399 })).await.unwrap();
+        let result = server
+            .release(Parameters(PortParams { port: 4399 }))
+            .await
+            .unwrap();
 
         assert_eq!(result.is_error, Some(true));
         let value = structured(&result);
@@ -611,7 +741,10 @@ mod tests {
         // Corrupt the state file directly on disk, bypassing the store API.
         std::fs::write(dir.path().join("leases.json"), b"{ not valid json").unwrap();
 
-        let err = server.ls().await.expect_err("corrupt state must be a protocol-level error");
+        let err = server
+            .ls()
+            .await
+            .expect_err("corrupt state must be a protocol-level error");
 
         // The CLI shows the full anyhow context chain via `{err:#}`
         // (e.g. "state file at <path> contains invalid JSON and was not

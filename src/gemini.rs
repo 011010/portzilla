@@ -128,10 +128,30 @@ struct HookResponse {
 /// there is no process yet whose PID this adapter could offer.
 /// `self_session` comes from `session_id` — see the module doc comment for
 /// why that only ever protects against foreign kills.
+#[allow(dead_code)]
 pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> HookOutcome {
+    handle_with_policy(raw_input, leases, checker, false)
+}
+
+/// Same as [`handle`] but with the explicit fail-closed policy. When
+/// `fail_closed` is `true`, every portzilla-side failure (unparseable JSON,
+/// missing command, …) returns a deny shape on stdout instead of allow +
+/// stderr note.
+pub fn handle_with_policy(
+    raw_input: &str,
+    leases: &[Lease],
+    checker: &dyn PidChecker,
+    fail_closed: bool,
+) -> HookOutcome {
     let input: BeforeToolInput = match serde_json::from_str(raw_input) {
         Ok(input) => input,
         Err(err) => {
+            if fail_closed {
+                return HookOutcome {
+                    stdout_json: fail_closed_response("could not parse hook input JSON"),
+                    stderr_note: None,
+                };
+            }
             return HookOutcome {
                 stdout_json: empty_response(),
                 stderr_note: Some(format!(
@@ -151,6 +171,14 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
     let self_session = input.session_id;
 
     let Some(command) = input.tool_input.and_then(|t| t.command) else {
+        if fail_closed {
+            return HookOutcome {
+                stdout_json: fail_closed_response(
+                    "run_shell_command call had no tool_input.command",
+                ),
+                stderr_note: None,
+            };
+        }
         return HookOutcome {
             stdout_json: empty_response(),
             stderr_note: Some(
@@ -185,6 +213,20 @@ fn empty_response() -> String {
     serde_json::to_string(&HookResponse::default()).expect("HookResponse always serializes")
 }
 
+/// Builds the Gemini CLI `BeforeTool` deny JSON for a portzilla-side
+/// failure under fail-closed mode. The reason is sent to the agent via
+/// `reason` (the `decision`/`reason` pair is documented as the only
+/// model-visible channel on a deny). Kept here so the adapter owns the
+/// exact byte shape Gemini expects on stdout.
+pub fn fail_closed_response(reason: &str) -> String {
+    let response = HookResponse {
+        decision: Some("deny"),
+        reason: Some(reason.to_string()),
+        system_message: None,
+    };
+    serde_json::to_string(&response).expect("HookResponse always serializes")
+}
+
 /// The `.gemini/settings.json` snippet printed by `portzilla init gemini`,
 /// registering this hook on `BeforeTool` scoped to the shell tool. Format
 /// verified against `docs/hooks/index.md`'s own "Configuration schema"
@@ -209,8 +251,8 @@ pub const SETTINGS_SNIPPET: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
     use crate::lease::Lease;
+    use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -289,14 +331,22 @@ mod tests {
     #[test]
     fn allows_kill_of_a_lease_owned_by_the_same_session() {
         let leases = vec![lease_with_session(3000, 1234, "dev-server", "sess-mine")];
-        let outcome = handle(&shell_input_with_session("kill 1234", "sess-mine"), &leases, &AlwaysAlive);
+        let outcome = handle(
+            &shell_input_with_session("kill 1234", "sess-mine"),
+            &leases,
+            &AlwaysAlive,
+        );
         assert!(response_json(&outcome).get("decision").is_none());
     }
 
     #[test]
     fn denies_kill_of_a_lease_owned_by_a_different_session() {
         let leases = vec![lease_with_session(3000, 1234, "dev-server", "sess-theirs")];
-        let outcome = handle(&shell_input_with_session("kill 1234", "sess-mine"), &leases, &AlwaysAlive);
+        let outcome = handle(
+            &shell_input_with_session("kill 1234", "sess-mine"),
+            &leases,
+            &AlwaysAlive,
+        );
         assert_eq!(response_json(&outcome)["decision"], "deny");
     }
 
@@ -311,7 +361,9 @@ mod tests {
         // never actually see reach it via `decision`.
         assert!(json.get("decision").is_none());
         assert!(json.get("reason").is_none());
-        let system_message = json["systemMessage"].as_str().expect("systemMessage must be present");
+        let system_message = json["systemMessage"]
+            .as_str()
+            .expect("systemMessage must be present");
         assert!(system_message.contains("node"));
     }
 
@@ -321,7 +373,11 @@ mod tests {
         let outcome = handle("{ not valid json", &leases, &AlwaysAlive);
 
         assert!(response_json(&outcome).get("decision").is_none());
-        assert!(outcome.stderr_note.is_some_and(|note| note.contains("failing open")));
+        assert!(
+            outcome
+                .stderr_note
+                .is_some_and(|note| note.contains("failing open"))
+        );
     }
 
     #[test]
@@ -342,8 +398,8 @@ mod tests {
 
     #[test]
     fn settings_snippet_registers_before_tool_on_the_shell_tool_matcher() {
-        let value: serde_json::Value =
-            serde_json::from_str(SETTINGS_SNIPPET).expect("SETTINGS_SNIPPET must itself be valid JSON");
+        let value: serde_json::Value = serde_json::from_str(SETTINGS_SNIPPET)
+            .expect("SETTINGS_SNIPPET must itself be valid JSON");
         let hook_entry = &value["hooks"]["BeforeTool"][0];
         assert_eq!(hook_entry["matcher"], "run_shell_command");
         assert_eq!(hook_entry["hooks"][0]["type"], "command");

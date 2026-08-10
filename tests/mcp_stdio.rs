@@ -5,7 +5,7 @@
 //! here demonstrates the wire protocol actually works end to end, not just
 //! that the in-process tool handlers return the right Rust values.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -78,7 +78,8 @@ impl McpSession {
             .read_line(&mut line)
             .expect("failed to read from child stdout");
         assert_ne!(n, 0, "child closed stdout without responding");
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSON-RPC line: {e}\nline: {line}"))
+        serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("invalid JSON-RPC line: {e}\nline: {line}"))
     }
 
     /// Performs the standard MCP handshake: `initialize` request followed by
@@ -150,7 +151,9 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
         tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         tool_names,
-        ["claim", "who", "ls", "release", "prune"].into_iter().collect(),
+        ["claim", "who", "ls", "release", "prune"]
+            .into_iter()
+            .collect(),
         "tools/list must expose exactly the five portzilla tools"
     );
     let claim_tool = tools.iter().find(|t| t["name"] == "claim").unwrap();
@@ -162,7 +165,10 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
         "claim tool description must be visible over the real wire protocol"
     );
 
-    let claim_response = session.call_tool("claim", json!({"port": 9600, "tag": "wire-test", "pid": 42}));
+    let claim_response = session.call_tool(
+        "claim",
+        json!({"port": 9600, "tag": "wire-test", "pid": 42}),
+    );
     assert!(
         claim_response.get("error").is_none(),
         "tools/call for claim must not be a JSON-RPC protocol error: {claim_response}"
@@ -210,8 +216,13 @@ fn corrupt_state_file_surfaces_as_a_real_json_rpc_protocol_error() {
     let error = ls_response
         .get("error")
         .expect("a store failure must be a top-level JSON-RPC error object");
-    assert!(error.get("code").is_some(), "JSON-RPC error object must carry a code: {error}");
-    let message = error["message"].as_str().expect("error message must be a string");
+    assert!(
+        error.get("code").is_some(),
+        "JSON-RPC error object must carry a code: {error}"
+    );
+    let message = error["message"]
+        .as_str()
+        .expect("error message must be a string");
     assert!(
         message.contains("invalid JSON"),
         "error message must preserve the store's context, got: {message}"
