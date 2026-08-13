@@ -1,12 +1,16 @@
 mod claude_code;
+mod codex;
 mod cursor;
 mod gemini;
 mod guard;
 mod guard_cmd;
+mod kimi;
 mod lease;
 mod mcp;
+mod opencode;
 mod store;
 mod view;
+mod windsurf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -172,6 +176,35 @@ enum HookHarness {
     /// and writes the hook response JSON to stdout. Never blocks or fails
     /// the tool call because of a portzilla-side error (fails open).
     Gemini,
+    /// Run as a Codex CLI `PreToolUse` hook (scoped to the `Bash` tool):
+    /// reads the hook payload JSON from stdin, evaluates the command
+    /// against the lease registry, and writes the hook response JSON to
+    /// stdout. Never blocks or fails the tool call because of a
+    /// portzilla-side error (fails open).
+    Codex,
+    /// Run as a Kimi CLI `PreToolUse` hook (scoped to the `Shell` tool):
+    /// reads the hook payload JSON from stdin, evaluates the command
+    /// against the lease registry, and signals the verdict through Kimi's
+    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). Never
+    /// blocks the tool call because of a portzilla-side error (fails
+    /// open — always exit 0 in that case).
+    Kimi,
+    /// Run as a Windsurf (Cascade) `pre_run_command` hook: reads the hook
+    /// payload JSON from stdin, evaluates `tool_info.command_line` against
+    /// the lease registry, and signals the verdict through Windsurf's
+    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). Never
+    /// blocks the command because of a portzilla-side error (fails open —
+    /// always exit 0 in that case).
+    #[command(name = "windsurf")]
+    Windsurf,
+    /// Run the binary side of OpenCode's kill-guard: called by the
+    /// `portzilla.js` plugin shim (printed by `portzilla init opencode`),
+    /// reads the shim's verdict-request JSON from stdin, evaluates the
+    /// command against the lease registry, and writes the verdict JSON to
+    /// stdout. Always exits 0 — the verdict is the JSON, never the exit
+    /// code. Never denies because of a portzilla-side error (fails open).
+    #[command(name = "opencode")]
+    OpenCode,
 }
 
 #[derive(Subcommand)]
@@ -185,6 +218,21 @@ enum InitHarness {
     /// Print the settings.json snippet that registers portzilla's
     /// kill-guard as a Gemini CLI `BeforeTool` hook on `run_shell_command`.
     Gemini,
+    /// Print the hooks.json snippet that registers portzilla's kill-guard
+    /// as a Codex CLI `PreToolUse` hook on the `Bash` tool.
+    Codex,
+    /// Print the config.toml snippet that registers portzilla's kill-guard
+    /// as a Kimi CLI `PreToolUse` hook on the `Shell` tool.
+    Kimi,
+    /// Print the hooks.json snippet that registers portzilla's kill-guard
+    /// as a Windsurf (Cascade) `pre_run_command` hook (in `.windsurf/`).
+    #[command(name = "windsurf")]
+    Windsurf,
+    /// Print the full source of the `portzilla.js` plugin shim for
+    /// OpenCode (its `tool.execute.before` hook shells out to
+    /// `portzilla hook opencode`), plus where to save it.
+    #[command(name = "opencode")]
+    OpenCode,
 }
 
 /// Exit code for "the requested lease does not exist" — distinct from the
@@ -244,6 +292,10 @@ fn run() -> Result<(), RunError> {
             InitHarness::ClaudeCode => print_init_claude_code(),
             InitHarness::Cursor => print_init_cursor(),
             InitHarness::Gemini => print_init_gemini(),
+            InitHarness::Codex => print_init_codex(),
+            InitHarness::Kimi => print_init_kimi(),
+            InitHarness::OpenCode => print_init_opencode(),
+            InitHarness::Windsurf => print_init_windsurf(),
         },
 
         // Each hook handler manages its own store access with fail-open
@@ -254,6 +306,10 @@ fn run() -> Result<(), RunError> {
             HookHarness::ClaudeCode => run_hook_claude_code(),
             HookHarness::Cursor => run_hook_cursor(),
             HookHarness::Gemini => run_hook_gemini(),
+            HookHarness::Codex => run_hook_codex(),
+            HookHarness::Kimi => run_hook_kimi(),
+            HookHarness::OpenCode => run_hook_opencode(),
+            HookHarness::Windsurf => run_hook_windsurf(),
         },
 
         // `guard` either execs the given command (never returns on unix
@@ -518,6 +574,278 @@ fn run_hook_gemini() {
     }
 }
 
+/// Runs the Codex CLI `PreToolUse` hook. Same fail-open boundary as
+/// [`run_hook_claude_code`]: Codex treats exit 0 with empty stdout as
+/// "continue" (allow), and also honors "exit 2 + stderr" as a deny — so a
+/// nonzero exit here must never happen over a portzilla-side problem.
+fn run_hook_codex() {
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    codex::fail_closed_response(&fail_closed_reason(&cause))
+                );
+                return;
+            }
+            eprintln!("portzilla hook codex: {cause}, failing open (allow)");
+            return;
+        }
+    };
+
+    let leases = match Store::open(None).and_then(|store| store.list()) {
+        Ok(leases) => leases,
+        Err(err) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    codex::fail_closed_response(&fail_closed_reason(&format!("{err:#}")))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook codex: failed to read the lease store, failing open (allow): {err:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        codex::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
+
+    match result {
+        Ok(outcome) => {
+            if let Some(json) = outcome.stdout_json {
+                println!("{json}");
+            }
+            if let Some(note) = outcome.stderr_note {
+                eprintln!("{note}");
+            }
+        }
+        Err(_) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    codex::fail_closed_response(&fail_closed_reason(
+                        "internal error while evaluating the command",
+                    ))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook codex: internal error while evaluating the command, failing \
+                 open (allow)"
+            );
+        }
+    }
+}
+
+/// Runs the Kimi CLI `PreToolUse` hook. Same fail-open boundary as the
+/// other hook runners, but the verdict is signaled through Kimi's
+/// exit-code contract instead of a stdout JSON response: exit 2 + stderr
+/// blocks (and feeds the reason back to the model), exit 0 allows. The
+/// exit code only ever comes from the adapter's own decision — a
+/// portzilla-side failure always resolves to exit 0 — so this function is
+/// the only hook runner whose success path can exit nonzero.
+fn run_hook_kimi() {
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                eprintln!("{}", fail_closed_reason(&cause));
+                std::process::exit(2);
+            }
+            eprintln!("portzilla hook kimi: {cause}, failing open (allow)");
+            return;
+        }
+    };
+
+    let leases = match Store::open(None).and_then(|store| store.list()) {
+        Ok(leases) => leases,
+        Err(err) => {
+            if fail_closed {
+                eprintln!("{}", fail_closed_reason(&format!("{err:#}")));
+                std::process::exit(2);
+            }
+            eprintln!(
+                "portzilla hook kimi: failed to read the lease store, failing open (allow): {err:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kimi::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
+
+    match result {
+        Ok(outcome) => {
+            if let Some(text) = outcome.stdout_text {
+                println!("{text}");
+            }
+            if let Some(note) = outcome.stderr_note {
+                eprintln!("{note}");
+            }
+            if outcome.exit_code != 0 {
+                std::process::exit(outcome.exit_code);
+            }
+        }
+        Err(_) => {
+            if fail_closed {
+                eprintln!(
+                    "{}",
+                    fail_closed_reason("internal error while evaluating the command")
+                );
+                std::process::exit(2);
+            }
+            eprintln!(
+                "portzilla hook kimi: internal error while evaluating the command, failing \
+                 open (allow)"
+            );
+        }
+    }
+}
+
+/// Runs the Windsurf (Cascade) `pre_run_command` kill-guard. Same
+/// exit-code-driven fail-open boundary as `run_hook_kimi`: exit 2 + stderr
+/// is Windsurf's block signal, exit 0 allows, and any portzilla-side failure
+/// resolves to exit 0 (Windsurf documents every exit code except 2 as
+/// allow, which composes with portzilla's fail-open principle).
+fn run_hook_windsurf() {
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                eprintln!("{}", fail_closed_reason(&cause));
+                std::process::exit(2);
+            }
+            eprintln!("portzilla hook windsurf: {cause}, failing open (allow)");
+            return;
+        }
+    };
+
+    let leases = match Store::open(None).and_then(|store| store.list()) {
+        Ok(leases) => leases,
+        Err(err) => {
+            if fail_closed {
+                eprintln!("{}", fail_closed_reason(&format!("{err:#}")));
+                std::process::exit(2);
+            }
+            eprintln!(
+                "portzilla hook windsurf: failed to read the lease store, failing open (allow): \
+                 {err:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        windsurf::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
+
+    match result {
+        Ok(outcome) => {
+            if let Some(text) = outcome.stdout_text {
+                println!("{text}");
+            }
+            if let Some(note) = outcome.stderr_note {
+                eprintln!("{note}");
+            }
+            if outcome.exit_code != 0 {
+                std::process::exit(outcome.exit_code);
+            }
+        }
+        Err(_) => {
+            if fail_closed {
+                eprintln!(
+                    "{}",
+                    fail_closed_reason("internal error while evaluating the command")
+                );
+                std::process::exit(2);
+            }
+            eprintln!(
+                "portzilla hook windsurf: internal error while evaluating the command, failing \
+                 open (allow)"
+            );
+        }
+    }
+}
+
+/// Runs the OpenCode kill-guard binary side, called by the `portzilla.js`
+/// plugin shim. Same fail-open boundary as the other hook runners, with
+/// one difference: stdout ALWAYS carries the verdict JSON (the shim parses
+/// the verdict from stdout — silence must never mean anything), and the
+/// exit code is always 0 (the shim only reads the JSON).
+fn run_hook_opencode() {
+    let fail_closed = fail_closed_mode();
+    let raw_input = match read_hook_stdin(HOOK_STDIN_LIMIT) {
+        Ok(input) => input,
+        Err(cause) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    opencode::fail_closed_response(&fail_closed_reason(&cause))
+                );
+                return;
+            }
+            eprintln!("portzilla hook opencode: {cause}, failing open (allow)");
+            println!(r#"{{"action":"allow"}}"#);
+            return;
+        }
+    };
+
+    let leases = match Store::open(None).and_then(|store| store.list()) {
+        Ok(leases) => leases,
+        Err(err) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    opencode::fail_closed_response(&fail_closed_reason(&format!("{err:#}")))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook opencode: failed to read the lease store, failing open (allow): {err:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        opencode::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+    }));
+
+    match result {
+        Ok(outcome) => {
+            println!("{}", outcome.stdout_json);
+            if let Some(note) = outcome.stderr_note {
+                eprintln!("{note}");
+            }
+        }
+        Err(_) => {
+            if fail_closed {
+                println!(
+                    "{}",
+                    opencode::fail_closed_response(&fail_closed_reason(
+                        "internal error while evaluating the command",
+                    ))
+                );
+                return;
+            }
+            eprintln!(
+                "portzilla hook opencode: internal error while evaluating the command, failing \
+                 open (allow)"
+            );
+            println!(r#"{{"action":"allow"}}"#);
+        }
+    }
+}
+
 /// Runs `portzilla guard --session <S> -- <command...>`: resolves session
 /// identity, evaluates the joined command, and either denies (exit 2, no
 /// execution), warns then executes, or executes silently. Never returns on
@@ -662,6 +990,135 @@ fn print_init_gemini() {
         "a matching --session. This hook still protects against killing another session's live"
     );
     println!("process; it just can't yet recognize a lease as your own.");
+}
+
+fn print_init_opencode() {
+    println!("portzilla's kill-guard for OpenCode is a plugin shim, because OpenCode hooks run");
+    println!("in-process as JavaScript/TypeScript plugin modules — it cannot run `portzilla`");
+    println!("directly as the hook the way Claude Code/Codex/Kimi can. Save the file below as:");
+    println!();
+    println!("  .opencode/plugin/portzilla.js        (project level)");
+    println!("  ~/.config/opencode/plugin/portzilla.js   (user level)");
+    println!();
+    println!(
+        "Then QUIT AND RESTART opencode — plugins are loaded once at startup, not hot-reloaded."
+    );
+    println!();
+    println!("{}", opencode::PLUGIN_SNIPPET);
+    println!();
+    println!("portzilla must be on PATH as `portzilla` for the plugin's guard checks to run.");
+    println!("Verify with: portzilla --version");
+    println!();
+    println!("How it works:");
+    println!(
+        "  - tool.execute.before: intercepts bash calls, asks `portzilla hook opencode` for a"
+    );
+    println!("    verdict; a deny throws, and the reason reaches the model as a tool error.");
+    println!(
+        "  - tool.execute.after: Warn verdicts are appended to the tool result the model reads"
+    );
+    println!("    (OpenCode has no non-blocking model-visible warn channel before execution).");
+    println!("  - shell.env: injects PORTZILLA_SESSION into every bash subprocess, so claims made");
+    println!("    from OpenCode sessions can tag their leases and kill-guard recognizes them as");
+    println!(
+        "    your own — the only non-Claude harness where own-lease recognition works end to end."
+    );
+    println!(
+        "    Claim like: portzilla claim 3000 --tag \"vite dev\" --session \"$PORTZILLA_SESSION\""
+    );
+    println!();
+    println!("Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,");
+    println!("the command is allowed — a portzilla problem never blocks your session.");
+}
+
+fn print_init_codex() {
+    println!("Add the following to your Codex hooks config (.codex/hooks.json for a project,");
+    println!("or ~/.codex/hooks.json for your user) to register portzilla's kill-guard as a");
+    println!("PreToolUse hook on the Bash tool:");
+    println!();
+    println!("{}", codex::HOOKS_SNIPPET);
+    println!();
+    println!("If you already have hooks.json, merge the \"PreToolUse\" entry above into your");
+    println!("existing hooks array instead of overwriting the file.");
+    println!();
+    println!("Note: project-level hooks are only loaded after the project .codex/ layer is");
+    println!("trusted; Codex will ask you to review/trust new hooks (see its /hooks command).");
+    println!();
+    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    println!("Verify with: portzilla --version");
+    println!();
+    println!("Note: Codex does not currently expose the session id to the shell commands it runs,");
+    println!(
+        "only to the hook payload itself, so claims made from a Codex session cannot be tagged"
+    );
+    println!(
+        "with a matching --session. This hook still protects against killing another session's"
+    );
+    println!("live process; it just can't yet recognize a lease as your own.");
+}
+
+fn print_init_kimi() {
+    println!("Add the following to your Kimi CLI config (~/.kimi/config.toml) to register");
+    println!("portzilla's kill-guard as a PreToolUse hook scoped to the Shell tool:");
+    println!();
+    println!("{}", kimi::CONFIG_SNIPPET);
+    println!();
+    println!("If you already have a [[hooks]] array in config.toml, append the entry above to it");
+    println!("instead of overwriting the file. `timeout` is Kimi's hook timeout in seconds");
+    println!("(default 30); portzilla's own stdin cap is 1 MiB.");
+    println!();
+    println!("Note: only user-level registration (~/.kimi/config.toml) is verified; Kimi's");
+    println!("project-level hook configuration is not positively documented, so this snippet");
+    println!("targets the user-level file.");
+    println!();
+    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    println!("Verify with: portzilla --version");
+    println!();
+    println!(
+        "Note: Kimi CLI does not currently expose the session id to the shell commands it runs,"
+    );
+    println!(
+        "only to the hook payload itself, so claims made from a Kimi session cannot be tagged"
+    );
+    println!(
+        "with a matching --session. This hook still protects against killing another session's"
+    );
+    println!("live process; it just can't yet recognize a lease as your own.");
+    println!();
+    println!(
+        "Note: Kimi CLI's hooks system is Beta, and Kimi CLI is transitioning to Kimi Code CLI"
+    );
+    println!("as its successor project — re-verify this integration when adopting the successor.");
+}
+
+fn print_init_windsurf() {
+    println!("Add the following to your `.windsurf/hooks.json` (workspace) to register");
+    println!("portzilla's kill-guard as a pre_run_command hook (blocks dangerous commands like");
+    println!("kills of other sessions' processes):");
+    println!();
+    println!("{}", windsurf::CONFIG_SNIPPET);
+    println!();
+    println!("Alternatively, place the same file at ~/.codeium/windsurf/hooks.json (user level),");
+    println!("or at a system-level path (see the Cascade Hooks docs). If you already have a");
+    println!("hooks.json, merge the \"pre_run_command\" entry into the existing \"hooks\" object");
+    println!("instead of overwriting the file.");
+    println!();
+    println!("`show_output: true` prints portzilla's deny/warning text in the Cascade UI (a deny");
+    println!("reaches the agent regardless via stderr; warnings are human-visible ONLY — Windsurf");
+    println!("has no non-blocking channel the model sees, so a warn never blocks the command).");
+    println!();
+    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    println!("Verify with: portzilla --version");
+    println!();
+    println!("Note: Windsurf does not currently expose the trajectory id to the shell commands it");
+    println!("runs, only to the hook payload itself, so claims made from a Cascade session cannot");
+    println!(
+        "be tagged with a matching --session. This hook still protects against killing another"
+    );
+    println!("session's live process; it just can't yet recognize a lease as your own.");
+    println!();
+    println!("Note: Cascade hooks do not load or run while a workspace is open in Restricted");
+    println!("Mode — the guard is absent there by design.");
 }
 
 fn print_init_claude_code() {

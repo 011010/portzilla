@@ -82,9 +82,63 @@ Two more hook adapters over the same unchanged `src/guard.rs` core, plus `portzi
 
 **A fresh-context review found the first cut of the universal wrapper's `sh -c` unwrap had a real detection bypass**: the original implementation only matched the exact three-argv-element shape `[shell, "-c", payload]`, so `sh -lc '<kill>'`, `sh -x -c '<kill>'`, `bash --norc -c '<kill>'`, and nested `sh -c "sh -c '<kill>'"` all silently bypassed detection and would have executed a kill that should have been denied. Generalized to: any leading run of dash-prefixed flags (combined short clusters like `-lc`/`-eic`, or separate flags with a long flag like `--norc` correctly NOT mistaken for `-c`) before the payload, unwrapped recursively up to 8 levels of nesting via a minimal quote-aware tokenizer. This is still a targeted `sh -c`-family unwrap, not a shell parser — real, disclosed gaps remain (only `sh`/`bash`/`zsh`/`dash` recognized; no command substitution, variable expansion, or escape handling, so `sh -c "$(echo kill 1234)"` is not detected; a flag that takes its own separate argument other than the payload, e.g. `sh -o pipefail -c '...'`, is not modeled) — see `src/guard_cmd.rs`'s module doc comment for the complete list. "Fixed entirely" was the wrong way to describe this the first time it was written here; it is a substantially wider net with known, bounded, disclosed remaining gaps, in the same spirit as `src/guard.rs`'s own documented approximation.
 
+## v0.2.y — Multi-harness: Codex CLI, Kimi CLI — Implemented
+
+Two more hook adapters over the same unchanged `src/guard.rs` core, both built on wire contracts verified against current live documentation after the v0.2.x release.
+
+| Item | Status |
+|------|--------|
+| `portzilla hook codex` / `portzilla init codex` — Codex CLI `PreToolUse` adapter, schema verified against developers.openai.com/codex/hooks | Implemented |
+| `portzilla hook kimi` / `portzilla init kimi` — Kimi CLI `PreToolUse` adapter (exit-code driven), schema verified against the Kimi CLI hooks docs and `src/kimi_cli/hooks/runner.py` | Implemented |
+
+**Verification corrected an outdated premise**: the roadmap previously listed Codex CLI as blocked because "no official, current hooks documentation" existed at the time of writing. That was true then and is false now — Codex hooks reached general availability in May 2026, with a documented `PreToolUse` event whose wire contract (stdin JSON with `session_id`/`tool_name`/`tool_input.command`; stdout JSON `hookSpecificOutput.permissionDecision`/`permissionDecisionReason`; exit 0 + empty stdout = allow) is deliberately close to Claude Code's. `src/codex.rs` is therefore nearly a mirror of `src/claude_code.rs`, with one material difference: Warns ride `additionalContext` (documented as added to model context) rather than being solely a systemMessage concern.
+
+**Codex has a second shell path, `exec_command`, that is documented as observable but not yet positively verified in shape**: the hooks reference says "Unified exec (`exec_command`)" calls are observable by `PreToolUse`, but does not document which matcher string or `tool_input` shape they carry (only "`Bash` and `apply_patch` use `tool_input.command`"). The adapter is scoped to the verified `Bash` tool name only; `exec_command` handling is an open verification item, documented in the module doc rather than assumed.
+
+**Kimi's contract is exit-code driven, not JSON-response driven**: the first-pass assumption was another Claude Code-shaped stdout JSON response, but Kimi's runner (`src/kimi_cli/hooks/runner.py`) implements the docs' simpler contract — exit 0 allows (non-empty stdout is added to the model's context: the model-visible Warn channel), exit 2 blocks (stderr is fed back to the model as a correction). The adapter therefore returns an exit code in its `HookOutcome`, making `run_hook_kimi` the only hook runner whose success path can exit nonzero — the exit code is Kimi's block signal, not an error. A structured JSON deny is also documented, but the exit-2 path was chosen deliberately: the exit code is the unambiguous channel, with no JSON parse between portzilla's verdict and Kimi's runner.
+
+**Own-lease recognition is again absent, for the same verified reason**: neither Codex's nor Kimi's environment-variable references expose a session id to the agent's own shell commands (only to the hook payload). Claude Code remains the only harness with end-to-end own-lease recognition via `CLAUDE_CODE_SESSION_ID`.
+
+**Kimi's hooks are Beta and its project is transitioning**: the hooks docs carry a Beta banner ("implementation details and configuration definitions may change"), and Kimi CLI is being wound down in favor of Kimi Code CLI. The adapter is built against the currently documented contract; `portzilla init kimi` prints a note to re-verify when adopting the successor.
+
+## v0.2.z — Multi-harness: OpenCode, Windsurf — Implemented
+
+Two more adapters over the same unchanged `src/guard.rs` core, both built on wire contracts verified against current live documentation after the v0.2.y release. One (OpenCode) required a structural first; the other (Windsurf) is the simplest adapter in the fleet.
+
+### OpenCode
+
+An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire contract verified against the current OpenCode plugins hooks reference before implementing. This one required a structural first: OpenCode hooks are in-process JS/TS plugin modules, not external processes invoked with a JSON payload on stdin, so `portzilla` cannot run as the hook directly the way it does for Claude Code/Codex/Kimi.
+
+| Item | Status |
+|------|--------|
+| `src/opencode.rs` — binary-side verdict protocol (`portzilla hook opencode`): stdin JSON `{ "session_id", "command" }`, stdout JSON `{ "action": allow/deny/warn, "reason" }`, always exit 0 (the shim reads the verdict from stdout) | Implemented |
+| `portzilla init opencode` — prints the full source of the `portzilla.js` plugin shim (a `tool.execute.before` hook that shells out to `portzilla hook opencode`, plus a `shell.env` hook and a `tool.execute.after` hook), with save/restart instructions | Implemented |
+| `tests/cli.rs` e2e coverage: the full CLI test-suite pattern red on real `portzilla` binaries — a `portzilla.js` shim-smoke harness driving the shim and the binary's hook protocol both pass / both deny | Implemented |
+
+**The shim is the adapter's second half**: the deny path throws with the reason, which OpenCode surfaces to the model as a tool error; the warn path defers to `tool.execute.after`, appending to the tool result so the model sees it without anything being blocked. The shim enforces its own subprocess timeout (5000 ms) because OpenCode's plugin hooks have no timeout of their own.
+
+**Own-lease recognition finally works outside Claude Code**: the shim's `shell.env` hook injects `PORTZILLA_SESSION` into every bash subprocess the agent runs (verified: bash subprocess env is `{ ...process.env, ...extra.env }`), while `tool.execute.before` gives the shim the session id to pass along — so a claim made with `--session "$PORTZILLA_SESSION"` is recognized as the agent's own by the guard. This is the unique non-Claude harness where end-to-end own-lease recognition resolves.
+
+**Warn delivery is deliberately post-execution**: `tool.execute.before` is binary (return = allow, throw = deny) with no non-blocking model-visible channel; the post-hoc `tool.execute.after` append is the documented tradeoff.
+
+### Windsurf
+
+| Item | Status |
+|------|--------|
+| `src/windsurf.rs` — Windsurf `pre_run_command` adaptador (`portzilla hook windsurf`): stdin JSON `{ trajectory_id, tool_info.command_line }` (payload shape verified against docs.windsurf.com/windsurf/cascade/hooks), verdict via exit code only (0 allow, 2 block + stderr, any other exit = allow) | Implemented |
+| `portzilla init windsurf` — prints the `.windsurf/hooks.json` snippet (workspace-level `pre_run_command` hook) plus alternative user-level paths and the Restricted Mode caveat | Implemented |
+| e2e + in-process coverage mirroring the Kimi adapter (twice the same exit-code contract), plus the no-model-visible-warn path (stderr on exit 0) | Implemented |
+
+**Windsurf is the simplest contract in the fleet**: no stdout-JSON response protocol at all — exit 2 + stderr is the block channel (the Cascade agent sees the stderr message), exit 0 allows, and Windsurf documents every other exit code as allow. The adapter is nearly a mirror of `src/kimi.rs`, down to the shared `HookOutcome` shape, differing only in input field names and the warn channel.
+
+**No model-visible warn channel**: `show_output: true` only prints hook stdout/stderr to the user-facing Cascade UI — never to the model. `Verdict::Warn` therefore rides stderr on exit 0: it never blocks, and a human watching Cascade sees it. Same documented tradeoff as Gemini CLI's adapter.
+
+**Own-lease recognition is again absent, for the same verified reason**: `trajectory_id` (the conversation id) reaches the hook payload, but per the Cascade Hooks docs no environment variable exposes it to the shell commands Cascade itself spawns — so claims made from a Cascade session can't be tagged with the id this hook receives. Foreign-lease protection only.
+
+**Restricted Mode**: Cascade hooks do not load or run while a workspace is open in Restricted Mode — the guard is absent there by Windsurf's own design.
+
 ## Later — Planned, not yet scheduled
 
-- **Adapters for Windsurf, OpenCode, and Codex CLI**, pending verification of each harness's own hook wire contract before implementing (not assumed from any of the three built so far): specifically, whether each exposes a non-blocking, agent-visible feedback channel — Claude Code's `additionalContext` is confirmed; Cursor's `agent_message`-on-`allow` is a reasoned-but-unconfirmed inference (see above); Gemini CLI's `BeforeTool` has no such channel at all — needed for `Verdict::Warn` to actually reach the model rather than only the human, and the exact JSON field carrying a deny reason to the model. Codex CLI in particular has no official, current hooks documentation as of this writing — that adapter additionally depends on such documentation existing at all, not just being verified.
 - **Optional daemon with active lease expiry and orphan cleanup.** A background process that watches leased PIDs directly (rather than checking on demand) and can expire or reap leases as soon as their owner exits, closing the PID-reuse gap described in the README's Limitations section. Kept optional so the core tool remains daemon-less by default — this only activates for users who want stronger liveness guarantees.
 - **TUI dashboard.** A live view of `ls`-equivalent data for interactive human monitoring of a machine with many concurrent sessions, built once there is enough real usage to know what a human actually wants to see at a glance versus what `ls`/`who` already cover.
 - **Session flight-recorder journal.** A log of what each session/agent started and stopped over time (not just current state), to answer "what did agent X do to my ports during this session" retrospectively. Depends on session identifiers (`--session`, already in v0.1, now load-bearing for the kill guard too) being used consistently in practice before the journal format is worth committing to.

@@ -873,6 +873,574 @@ fn init_gemini_prints_the_settings_snippet() {
         .stdout(predicate::str::contains("portzilla hook gemini"));
 }
 
+// ---- hook codex / kimi, init codex / kimi ----
+
+fn codex_pretooluse_bash_json(command: &str, session_id: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "call_01",
+        "permission_mode": "default"
+    })
+    .to_string()
+}
+
+#[test]
+fn hook_codex_denies_kill_of_a_foreign_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "other-session",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(dir.path())
+        .args(["hook", "codex"])
+        .write_stdin(codex_pretooluse_bash_json(
+            &format!("kill {own_pid}"),
+            "my-session",
+        ))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("permissionDecisionReason must be a string");
+    assert!(reason.contains("3000"));
+    assert!(reason.contains("dev-server"));
+}
+
+#[test]
+fn hook_codex_allows_kill_of_an_own_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "shared-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "codex"])
+        .write_stdin(codex_pretooluse_bash_json(
+            &format!("kill {own_pid}"),
+            "shared-session",
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_codex_allows_kill_of_an_unleased_pid() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["hook", "codex"])
+        .write_stdin(codex_pretooluse_bash_json("kill 999999", "abc123"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_codex_malformed_json_fails_open_with_a_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["hook", "codex"])
+        .write_stdin("{ not valid json")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("failing open"));
+}
+
+#[test]
+fn hook_codex_warns_on_process_name_kill() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "codex"])
+        .write_stdin(codex_pretooluse_bash_json("pkill node", "abc123"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert!(
+        json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("node")
+    );
+    assert!(json["systemMessage"].as_str().unwrap().contains("node"));
+}
+
+#[test]
+fn init_codex_prints_the_hooks_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"PreToolUse\""))
+        .stdout(predicate::str::contains("\"matcher\": \"Bash\""))
+        .stdout(predicate::str::contains("portzilla hook codex"));
+}
+
+fn kimi_pretooluse_shell_json(command: &str, session_id: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Shell",
+        "tool_input": { "command": command },
+        "tool_call_id": "call_01"
+    })
+    .to_string()
+}
+
+#[test]
+fn hook_kimi_denies_kill_of_a_foreign_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "other-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "kimi"])
+        .write_stdin(kimi_pretooluse_shell_json(
+            &format!("kill {own_pid}"),
+            "my-session",
+        ))
+        .assert()
+        .code(2) // Kimi's block exit code
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+}
+
+#[test]
+fn hook_kimi_allows_kill_of_an_own_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "shared-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "kimi"])
+        .write_stdin(kimi_pretooluse_shell_json(
+            &format!("kill {own_pid}"),
+            "shared-session",
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_kimi_allows_kill_of_an_unleased_pid() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["hook", "kimi"])
+        .write_stdin(kimi_pretooluse_shell_json("kill 999999", "abc123"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_kimi_malformed_json_fails_open_with_a_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["hook", "kimi"])
+        .write_stdin("{ not valid json")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("failing open"));
+}
+
+#[test]
+fn hook_kimi_warns_on_process_name_kill_with_plain_text_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "kimi"])
+        .write_stdin(kimi_pretooluse_shell_json("pkill node", "abc123"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("stdout must be UTF-8");
+    assert!(
+        stdout.contains("node"),
+        "warn must reach the model as plain-text stdout, got: {stdout}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "warn output must be plain text, not parseable JSON"
+    );
+}
+
+#[test]
+fn init_kimi_prints_the_config_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "kimi"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[[hooks]]"))
+        .stdout(predicate::str::contains(r#"event = "PreToolUse""#))
+        .stdout(predicate::str::contains(r#"matcher = "Shell""#))
+        .stdout(predicate::str::contains("portzilla hook kimi"));
+}
+
+// ---- hook opencode / init opencode ----
+
+fn opencode_shim_json(command: &str, session_id: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "command": command
+    })
+    .to_string()
+}
+
+#[test]
+fn hook_opencode_denies_kill_of_a_foreign_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "other-session",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(dir.path())
+        .args(["hook", "opencode"])
+        .write_stdin(opencode_shim_json(&format!("kill {own_pid}"), "my-session"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["action"], "deny");
+    let reason = json["reason"].as_str().expect("reason must be a string");
+    assert!(reason.contains("3000"));
+    assert!(reason.contains("dev-server"));
+}
+
+#[test]
+fn hook_opencode_allows_kill_of_an_own_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "shared-session",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(dir.path())
+        .args(["hook", "opencode"])
+        .write_stdin(opencode_shim_json(
+            &format!("kill {own_pid}"),
+            "shared-session",
+        ))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["action"], "allow", "own-session kill must be allowed");
+}
+
+#[test]
+fn hook_opencode_allows_kill_of_an_unleased_pid() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "opencode"])
+        .write_stdin(opencode_shim_json("kill 999999", "abc123"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["action"], "allow");
+}
+
+#[test]
+fn hook_opencode_malformed_json_fails_open_with_allow_action() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "opencode"])
+        .write_stdin("{ not valid json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["action"], "allow", "malformed input must fail open");
+}
+
+#[test]
+fn hook_opencode_warns_on_process_name_kill() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["hook", "opencode"])
+        .write_stdin(opencode_shim_json("pkill node", "abc123"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["action"], "warn");
+    assert!(json["reason"].as_str().unwrap().contains("node"));
+}
+
+#[test]
+fn init_opencode_prints_the_plugin_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "opencode"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tool.execute.before"))
+        .stdout(predicate::str::contains("tool.execute.after"))
+        .stdout(predicate::str::contains("shell.env"))
+        .stdout(predicate::str::contains("portzilla hook opencode"))
+        .stdout(predicate::str::contains("PORTZILLA_SESSION"));
+}
+
+// ---- hook windsurf / init windsurf ----
+
+fn windsurf_pre_run_command_json(command: &str, trajectory_id: &str) -> String {
+    serde_json::json!({
+        "agent_action_name": "pre_run_command",
+        "trajectory_id": trajectory_id,
+        "execution_id": "exec_01",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "tool_info": {
+            "command_line": command,
+            "cwd": "/tmp"
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn hook_windsurf_denies_kill_of_a_foreign_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "other-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin(windsurf_pre_run_command_json(
+            &format!("kill {own_pid}"),
+            "my-session",
+        ))
+        .assert()
+        .code(2) // Windsurf's block exit code
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+}
+
+#[test]
+fn hook_windsurf_allows_kill_of_an_own_session_live_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    cmd(dir.path())
+        .args([
+            "claim",
+            "3000",
+            "--tag",
+            "dev-server",
+            "--pid",
+            &own_pid.to_string(),
+            "--session",
+            "shared-session",
+        ])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin(windsurf_pre_run_command_json(
+            &format!("kill {own_pid}"),
+            "shared-session",
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_windsurf_allows_kill_of_an_unleased_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin(windsurf_pre_run_command_json("kill 999999", "abc123"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_windsurf_malformed_json_fails_open_with_exit_0_and_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin("{ not valid json")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("failing open"));
+}
+
+#[test]
+fn hook_windsurf_warns_on_process_name_kill_exit_0_with_stderr_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    // Windsurf has no model-visible warn channel: the warning rides stderr
+    // on exit 0 (visible to a human when `show_output` is on), and it never
+    // blocks — that is the documented tradeoff for this harness.
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin(windsurf_pre_run_command_json("pkill node", "abc123"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("node"));
+}
+
+#[test]
+fn hook_windsurf_missing_command_fails_open_with_exit_0_and_stderr_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = serde_json::json!({
+        "agent_action_name": "pre_run_command",
+        "trajectory_id": "abc123",
+        "tool_info": { "cwd": "/tmp" }
+    })
+    .to_string();
+
+    cmd(dir.path())
+        .args(["hook", "windsurf"])
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("command_line"));
+}
+
+#[test]
+fn init_windsurf_prints_the_hooks_json_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "windsurf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pre_run_command"))
+        .stdout(predicate::str::contains("portzilla hook windsurf"))
+        .stdout(predicate::str::contains(".windsurf/hooks.json"));
+}
+
 // ---- guard ----
 //
 // These tests spawn the real binary with `guard -- <fake script>` instead of

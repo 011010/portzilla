@@ -163,7 +163,7 @@ The MCP server reads and writes the exact same locked `leases.json` the CLI does
 
 MCP tool access (above) makes it *possible* for an agent to check ownership before acting. The kill guard is what makes checking the *default*: it intercepts kill-shaped commands before they run and blocks the ones that would kill another session's live, leased process — instead of relying on the agent to remember to run `who` first.
 
-The guard itself (`src/guard.rs`) is harness-agnostic: it takes a shell command string and the current lease list and returns a verdict, with no knowledge of Claude Code, Cursor, Gemini CLI, or any other tool. Each harness gets a thin adapter over the same core (`src/claude_code.rs`, `src/cursor.rs`, `src/gemini.rs`) that only translates the harness's hook payload in and its response shape out — adding a new harness means writing another adapter like these, never touching the guard itself.
+The guard itself (`src/guard.rs`) is harness-agnostic: it takes a shell command string and the current lease list and returns a verdict, with no knowledge of Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, Windsurf, or any other tool. Each harness gets a thin adapter over the same core (`src/claude_code.rs`, `src/cursor.rs`, `src/gemini.rs`, `src/codex.rs`, `src/kimi.rs`, `src/opencode.rs`, `src/windsurf.rs`) that only translates the harness's hook payload in and its response shape out — adding a new harness means writing another adapter like these, never touching the guard itself.
 
 It recognizes:
 
@@ -190,6 +190,10 @@ This is intentionally not a real shell parser — see the module doc comment in 
 | **Claude Code** | `PreToolUse` hook, `portzilla hook claude-code` | Yes — `permissionDecisionReason` | **Yes** — `--session "$CLAUDE_CODE_SESSION_ID"` |
 | **Cursor** | `beforeShellExecution` hook, `portzilla hook cursor` | Likely — `agent_message` is documented for this event without a deny-only qualifier (unlike some other Cursor hook events' docs); delivery on `permission: "allow"` is not positively confirmed, only not ruled out — needs a live Cursor smoke test | No — `conversation_id` isn't exposed to the agent's shell commands |
 | **Gemini CLI** | `BeforeTool` hook on `run_shell_command`, `portzilla hook gemini` | Yes for Deny (`reason`); **no non-blocking channel for Warn** (human-only, `systemMessage`) | No — the shell tool only sets `GEMINI_CLI=1`, not a session id |
+| **Codex CLI** | `PreToolUse` hook, `portzilla hook codex` | Yes — `permissionDecisionReason` on deny; **yes for Warn** — `additionalContext` is added as extra developer context the model sees | No — `session_id` reaches the hook payload but not the agent's shell commands |
+| **Kimi CLI** | `PreToolUse` hook, `portzilla hook kimi` | Yes — stderr on exit 2 is fed back to the model; **yes for Warn** — exit-0 stdout is added to the model's context | No — `session_id` reaches the hook payload but not the agent's shell commands |
+| **OpenCode** | Plugin shim (`portzilla init opencode` prints `portzilla.js`) shelling out to `portzilla hook opencode` | Yes for Deny — throwing surfaces the reason as a tool error; **yes for Warn** — appended to the tool result via `tool.execute.after` | **Yes** — the shim injects `PORTZILLA_SESSION` into bash subprocess env via `shell.env`, and the guard gets the session id from `tool.execute.before` |
+| **Windsurf** | `pre_run_command` hook, `portzilla hook windsurf` | Yes for Deny — stderr on exit 2 is shown to the Cascade agent; **no non-blocking channel for Warn** (stderr on exit 0 is human-visible only; with `show_output: true`) | No — `trajectory_id` reaches the hook payload but not the agent's shell commands |
 | **Anything else** (Aider, scripts, a human) | `portzilla guard -- <command...>` | N/A — the command is simply not run (exit 2); there's no model in the loop to explain to | **Yes** — `--session <S>` or `PORTZILLA_SESSION` |
 
 "Own-lease recognition" means: a lease claimed with the right session identifier is recognized as *yours*, so the guard lets you kill/restart your own process. Without it, the guard still protects you from killing *other* sessions' processes — it just can't yet tell your own process apart from a stranger's, so it protects everyone equally, including you.
@@ -227,6 +231,48 @@ $ portzilla init gemini
 prints the `.gemini/settings.json` snippet (project `.gemini/settings.json`, user `~/.gemini/settings.json`, or system `/etc/gemini-cli/settings.json`), registering `portzilla hook gemini` as a `BeforeTool` hook matched on the `run_shell_command` tool.
 
 Two things are worth knowing here, both found during verification rather than assumed: first, hook registration lives in `settings.json`, not a standalone `hooks/hooks.json` file inside an extension directory — the current reference documents only the `settings.json`-based mechanism. Second, `run_shell_command`'s own subprocess (the agent's actual shell commands) is only ever given `GEMINI_CLI=1` — a bare presence flag, not a session id (`GEMINI_SESSION_ID` exists, but is documented as available to hook script subprocesses, not shell-tool subprocesses) — so, same as Cursor, own-lease recognition isn't available yet.
+
+### Codex CLI setup
+
+```console
+$ portzilla init codex
+```
+
+prints the exact `.codex/hooks.json` snippet to add (project-level `.codex/hooks.json` or user-level `~/.codex/hooks.json`), registering `portzilla hook codex` as a `PreToolUse` hook matched on `Bash`. Codex's hooks are [generally available](https://developers.openai.com/codex/hooks); project-level hooks are only loaded once the project's `.codex/` layer is trusted (Codex asks you to review/trust new hooks — see its `/hooks` command).
+
+Codex's own env-vars reference does not expose the session id to the shell commands the agent runs — only to the hook payload itself — so, same as Cursor and Gemini CLI, own-lease recognition isn't available yet. Deny reasons do reach the model (`permissionDecisionReason`), and `Warn` verdicts ride the `additionalContext` field Codex adds to the model's context.
+
+### Kimi CLI setup
+
+```console
+$ portzilla init kimi
+```
+
+prints the exact `~/.kimi/config.toml` snippet to add, registering `portzilla hook kimi` as a `[[hooks]]` entry on `PreToolUse` matched on `Shell`. Kimi's hooks are Beta (implementation details may change), and Kimi CLI is being [wound down in favor of Kimi Code CLI](https://github.com/MoonshotAI/kimi-cli) — re-verify this integration when adopting the successor.
+
+Kimi's `PreToolUse` contract is exit-code driven rather than JSON-response driven: `portzilla hook kimi` exits 2 (with the reason on stderr, which Kimi feeds back to the model) to deny, and prints `Warn` explanations as plain text on stdout, which Kimi adds to the model's context on allow. As with Cursor/Gemini/Codex, the session id reaches the hook payload but not the agent's own shell commands, so own-lease recognition isn't available yet.
+
+### OpenCode setup
+
+```console
+$ portzilla init opencode
+```
+
+prints the full source of the `portzilla.js` plugin shim to save as `.opencode/plugin/portzilla.js` (project) or `~/.config/opencode/plugin/portzilla.js` (user), then restart OpenCode — plugins load once at startup, not hot-reloaded. Your editor needs `portzilla` on PATH. OpenCode hooks run in-process as JS/TS plugin modules, which is why this harness uses a shim instead of running `portzilla` as the hook directly.
+
+The shim hooks `tool.execute.before` for the `bash` tool, shells out to `portzilla hook opencode`, and throws with the deny reason (OpenCode surfaces it to the model as a tool error) or defers a warn to `tool.execute.after` so the model sees it on the tool result without blocking. Because the shim also adds a `shell.env` hook that injects `PORTZILLA_SESSION` into every bash subprocess, this is the only non-Claude harness where end-to-end own-lease recognition works:
+
+```console
+$ portzilla claim 3000 --tag "vite dev" --session "$PORTZILLA_SESSION"
+```
+
+### Windsurf setup
+
+```console
+$ portzilla init windsurf
+```
+
+prints the exact `.windsurf/hooks.json` snippet to add, registering `portzilla hook windsurf` as a `pre_run_command` hook. Cascade Hooks' contract is exit-code driven: exit 2 blocks and the message on stderr reaches the agent, exit 0 allows, and Windsurf treats any other exit code as allow (fail-open). Windsurf has no non-blocking model-visible warn channel, so `Verdict::Warn` rides stderr on exit 0 — never blocks, and is visible to a human when `show_output: true` is set. `trajectory_id` reaches the hook payload but not the agent's own shell commands, so own-lease recognition isn't available yet. Note that Cascade hooks don't load at all while a workspace is open in Restricted Mode.
 
 ### Anything else: `portzilla guard`
 
@@ -285,7 +331,7 @@ Set `PORTZILLA_DATA_DIR` to isolate tests, CI runs, or throwaway experiments fro
 
 ## Roadmap
 
-v0.1 covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state. v0.1.x adds the MCP server (`serve --mcp`, documented above) so agents can call `portzilla` natively instead of shelling out. v0.2 adds the kill guard: a harness-agnostic core plus adapters for Claude Code, Cursor, and Gemini CLI, plus a universal `portzilla guard` wrapper for everything else (all documented above). Planned next: adapters for Windsurf, OpenCode, and Codex CLI, pending verification of their own hook wire contracts. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
+v0.1 covers `claim`, `ls`, `who`, `release`, `prune`, JSON output, and locked local state. v0.1.x adds the MCP server (`serve --mcp`, documented above) so agents can call `portzilla` natively instead of shelling out. v0.2 adds the kill guard: a harness-agnostic core plus adapters for Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, and Windsurf, plus a universal `portzilla guard` wrapper for everything else (all documented above). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full versioned plan.
 
 ## License
 
