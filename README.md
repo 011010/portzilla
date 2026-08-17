@@ -1,10 +1,12 @@
 # portzilla
 
-[![CI](https://github.com/portzilla/portzilla/actions/workflows/ci.yml/badge.svg)](https://github.com/portzilla/portzilla/actions/workflows/ci.yml)
+[![CI](https://github.com/011010/portzilla/actions/workflows/ci.yml/badge.svg)](https://github.com/011010/portzilla/actions/workflows/ci.yml)
 
 `portzilla` is a lease registry for localhost ports. It exists because AI coding agents (Claude Code, Cursor, and similar tools) increasingly run several parallel sessions on one machine — each in its own git worktree, each starting its own dev server — and today those sessions have no way to coordinate. An agent that finds port 3000 busy typically just kills whatever is on it, which can be a sibling session's dev server. `portzilla` gives processes a way to claim a port with an owner PID and a purpose tag, gives conflicting claims the next free port instead of stealing, lets anyone ask who owns a port before killing it, and prunes leases whose owning process has died. All output is available as JSON so agents can consume it directly, and the tool works the same way for a human typing commands in a terminal.
 
 This is coordination, not diagnostics: existing tools like `witr`, `kill-port`, and ServerSlayer tell you what is on a port or kill it after the fact. `portzilla` is the layer that prevents the conflict in the first place.
+
+For maintainers, the complete release procedure is documented in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## 30-second demo
 
@@ -48,15 +50,43 @@ The output above is real: it was captured by running the built binary with `PORT
 
 ## Install
 
+### Cargo
+
 ```console
 $ cargo install portzilla
 ```
 
-Not yet published to crates.io — until then, build from source:
+To install from a local checkout:
 
 ```console
 $ cargo install --path .
 ```
+
+### curl
+
+Downloads a prebuilt binary from GitHub Releases into `~/.local/bin`:
+
+```console
+$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | sh
+```
+
+To install a specific version or directory:
+
+```console
+$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | PORTZILLA_VERSION=0.1.0 PORTZILLA_INSTALL_DIR=/usr/local/bin sh
+```
+
+If a release asset is unavailable, the installer falls back to `cargo install portzilla`.
+
+### npm
+
+```console
+$ npm install -g portzilla
+```
+
+The npm package installs the same native `portzilla` binary. It downloads a GitHub Release asset when available and falls back to Cargo when needed.
+
+Release binaries are currently available for Linux x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64/ARM64. Each release asset includes a `.sha256` checksum file.
 
 ## Command reference
 

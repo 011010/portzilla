@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes
+
+  build:
+    name: Build release assets
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Unix asset
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/portzilla" dist/portzilla
+          tar -C dist -czf "portzilla-${{ matrix.target }}.tar.gz" portzilla
+
+      - name: Package Windows asset
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/portzilla.exe" "dist/portzilla.exe"
+          Compress-Archive -Path "dist/portzilla.exe" -DestinationPath "portzilla-${{ matrix.target }}.zip" -Force
+
+      - name: Generate Unix checksum
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: shasum -a 256 "portzilla-${{ matrix.target }}.tar.gz" > "portzilla-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Generate Windows checksum
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $asset = "portzilla-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Set-Content "$asset.sha256" -NoNewline
+
+      - name: Smoke test Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/portzilla --help >/dev/null
+
+      - name: Smoke test Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: .\target\${{ matrix.target }}\release\portzilla.exe --help | Out-Null
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "${{ github.ref_name }}" "portzilla-${{ matrix.target }}.${{ matrix.archive }}" "portzilla-${{ matrix.target }}.${{ matrix.archive }}.sha256" --repo "${{ github.repository }}" --clobber
+
+  publish-npm:
+    name: Publish npm package
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ vars.PORTZILLA_PUBLISH_NPM == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify package version matches tag
+        shell: bash
+        run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
+
+      - name: Publish package
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

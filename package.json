@@ -1,0 +1,36 @@
+{
+  "name": "portzilla",
+  "version": "0.1.0",
+  "description": "Port and process lease coordinator for parallel AI coding-agent sessions",
+  "license": "MIT",
+  "homepage": "https://github.com/011010/portzilla",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/011010/portzilla.git"
+  },
+  "bugs": {
+    "url": "https://github.com/011010/portzilla/issues"
+  },
+  "bin": {
+    "portzilla": "npm/bin.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js"
+  },
+  "files": [
+    "npm/bin.js",
+    "npm/install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "port",
+    "cli",
+    "agent",
+    "dev-tools",
+    "process"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
