@@ -75,7 +75,7 @@ jobs:
       - name: Verify release package versions match tag
         shell: bash
         run: |
-          cargo_version="$(cargo pkgid -p portzilla | sed 's/.*@//')"
+          cargo_version="$(cargo pkgid -p portzilla | sed 's/.*[#@]//')"
           package_version="$(node -p "require('./package.json').version")"
           tag_version="${RELEASE_TAG#v}"
           printf 'Release versions: cargo=%s package=%s tag=%s\n' \
