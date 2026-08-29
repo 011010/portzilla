@@ -4,7 +4,7 @@ Status legend: **Implemented** (shipped in the current codebase) / **Planned** (
 
 ## v0.1 — Local lease registry — Implemented
 
-The current release. A daemon-less CLI that tracks port ownership in a locked local JSON file.
+The current release. A daemon-less CLI that tracks port ownership in a locked local JSON file, with an optional foreground watcher for repeated liveness-based pruning.
 
 | Item | Status |
 |------|--------|
@@ -13,15 +13,16 @@ The current release. A daemon-less CLI that tracks port ownership in a locked lo
 | `who` — show the lease on one port | Implemented |
 | `release` — remove a lease | Implemented |
 | `prune` — remove all leases whose owning PID is dead | Implemented |
+| `watch` — optional foreground watcher with configurable interval and Ctrl-C shutdown | Implemented |
 | `--json` on every command | Implemented |
 | `PORTZILLA_DATA_DIR` override, `$XDG_DATA_HOME`/`$HOME` fallback | Implemented |
 | Atomic, file-locked JSON state (`leases.json` + `leases.json.lock`) | Implemented |
 | PID liveness via `sysinfo` process-table lookup | Implemented |
 | Exit codes: `0` success, `1` error, `2` lease not found | Implemented |
 
-**Rationale**: ship the smallest possible tool that solves the core coordination problem — declare, query, release, prune — without any long-running process to install, configure, or keep alive. A CLI that only touches a local file is trivially safe to adopt: no daemon to trust, no network port of its own, no background resource usage. This is the "small sharp tool" bar, in the spirit of `ripgrep` or `witr`: do one thing, do it with a stable JSON contract, and let other tools (including agents) build on top of it.
+**Rationale**: ship the smallest possible tool that solves the core coordination problem — declare, query, release, prune — without requiring a central daemon. A CLI that only touches a local file is trivially safe to adopt: no daemon to trust, no network port of its own, no background resource usage. The optional `watch` command adds repeated foreground sweeps for users who want automatic cleanup while preserving that daemon-less default. This is the "small sharp tool" bar, in the spirit of `ripgrep` or `witr`: do one thing, do it with a stable JSON contract, and let other tools (including agents) build on top of it.
 
-**Known limitation carried forward**: liveness is a point-in-time PID-table check, not an actively monitored subscription. PID reuse can produce false "alive" reports for a lease whose real owner has already exited. See the [README limitations section](../README.md#limitations). This tradeoff is accepted for v0.1 in exchange for having no daemon; it is revisited in the optional daemon phase below.
+**Known limitation carried forward**: new claims record `process_start_time` when the checker resolves it and require both PID and start time to match for liveness. Claims from a checker that cannot resolve identity are treated as unverified and not alive; legacy JSON without the identity marker retains PID-only fallback. `sysinfo` reports start times at one-second resolution, so PID reuse within the same second cannot be distinguished perfectly. The implemented `watch` command repeats point-in-time checks in the foreground; it is not an active process monitor. See the [README limitations section](../README.md#limitations). A future active daemon remains optional and is the stronger supervision mechanism described below.
 
 ## v0.1.x — MCP server — Implemented
 
@@ -56,7 +57,7 @@ A harness-agnostic kill-guard core (`src/guard.rs`) plus a Claude Code adapter (
 
 **Rationale**: this is identified as the key adoption feature. MCP tool access (v0.1.x) makes querying *possible*; a hook makes the safe path the *default* path by intervening at the exact moment an agent is about to do the destructive thing it would otherwise do unprompted. This directly targets the adoption risk described in the PRD: value only accrues if agents check before killing, and a hook is the mechanism most likely to make that happen without relying on every agent's system prompt independently deciding to use `portzilla`.
 
-**Design decision — harness-agnostic core, thin adapter**: the roadmap beyond this release is "Claude Code first, then any harness." All detection and lease-resolution logic lives in `guard::check`, a pure function that has never heard of Claude Code, hooks, or JSON-RPC. `claude_code.rs` only translates a `PreToolUse` payload into a `guard::check` call and translates the `Verdict` back into Claude Code's hook response shape. A second harness means writing a second thin adapter module against the same `guard::check`, not touching the detection logic itself — proven out in v0.2.x below.
+**Design decision — harness-agnostic core, thin adapter**: the roadmap beyond this release is "Claude Code first, then any harness." All detection and lease-resolution logic lives in `guard::check`, a pure function that has never heard of Claude Code, hooks, or JSON-RPC. Each adapter translates its harness payload into a normalized request for `hook_common::evaluate`, which delegates to the harness-agnostic `guard::check`, then translates the `Verdict` back into that harness's response shape. A second harness means writing a second thin adapter module against the same evaluation path, not touching the detection logic itself — proven out in v0.2.x below.
 
 **Design decision — ownership is session-based, not PID-based**: the first cut of ownership compared the caller's own PID to the lease's PID, but that's structurally unreachable for a `PreToolUse`-style hook — the hook fires *before* the command's process exists, so there is never a real "caller PID" to offer. Ownership was reworked to also accept a session identifier, matched against the lease's `session` field, with PID kept as a fallback for callers that do have one (e.g. a future harness that checks after the fact). See the Kill guard section in the README for exactly which harnesses can supply a session id today.
 
@@ -139,7 +140,8 @@ An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire
 
 ## Later — Planned, not yet scheduled
 
-- **Optional daemon with active lease expiry and orphan cleanup.** A background process that watches leased PIDs directly (rather than checking on demand) and can expire or reap leases as soon as their owner exits, closing the PID-reuse gap described in the README's Limitations section. Kept optional so the core tool remains daemon-less by default — this only activates for users who want stronger liveness guarantees.
+- **Optional daemon with active lease expiry and stale-lease cleanup.** A background process that watches leased PIDs directly (rather than checking on demand) may attempt prompt lease expiry while it is running. It does not kill orphaned server processes, and it cannot guarantee cleanup if it is stopped or crashes. Kept optional so the core tool remains daemon-less by default — this only activates for users who want stronger supervision.
+- **Advanced supervision remains distinct from `watch`.** The implemented watcher is a foreground polling convenience: it does not provide active PID monitoring, central IPC, or daemon lifecycle management. The future daemon above is a separate supervision mechanism with no cleanup guarantee when it is not running.
 - **TUI dashboard.** A live view of `ls`-equivalent data for interactive human monitoring of a machine with many concurrent sessions, built once there is enough real usage to know what a human actually wants to see at a glance versus what `ls`/`who` already cover.
 - **Session flight-recorder journal.** A log of what each session/agent started and stopped over time (not just current state), to answer "what did agent X do to my ports during this session" retrospectively. Depends on session identifiers (`--session`, already in v0.1, now load-bearing for the kill guard too) being used consistently in practice before the journal format is worth committing to.
 

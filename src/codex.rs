@@ -1,9 +1,11 @@
 //! Codex CLI adapter for the kill-guard.
 //!
-//! Translates a Codex CLI `PreToolUse` hook payload into a call to the
-//! harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the JSON shape Codex expects on
-//! stdout. Thin by design — see `src/guard.rs`'s module doc for why.
+//! Owns parsing of Codex CLI's `PreToolUse` hook payload and rendering of the
+//! resulting [`crate::guard::Verdict`] into the JSON shape Codex expects on
+//! stdout. `hook_common::evaluate` delegates normalized command evaluation to
+//! the harness-agnostic guard core; payload parsing and wire rendering stay
+//! local to this adapter. Thin by design — see `src/guard.rs`'s module doc for
+//! why.
 //!
 //! Schema verified against the current Codex hooks reference
 //! (<https://developers.openai.com/codex/hooks>, GA since May 2026 per
@@ -52,7 +54,8 @@
 //! [`fail_closed_response`] and the same `permissionDecisionReason` field
 //! Codex forwards to the model on a deny.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -182,14 +185,16 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
 }
 
 /// Handles one `PreToolUse` hook invocation: parses `raw_input`, and if
-/// it's a `Bash` tool call, runs its command through [`guard::check`]
+/// it's a `Bash` tool call, runs its command through
+/// [`crate::hook_common::evaluate`]
 /// against `leases`.
 ///
-/// `self_pid` is always `None` when calling into `guard`: `PreToolUse`
-/// fires *before* the tool runs, so there is no process yet whose PID this
-/// adapter could pass as "the process about to run this." Ownership
-/// therefore resolves entirely through `self_session` — see the module doc
-/// comment for why that only ever protects against foreign kills today.
+/// The adapter passes `self_pid` through `hook_common::evaluate`, which
+/// delegates to the guard core. It is always `None`: `PreToolUse` fires
+/// *before* the tool runs, so there is no process yet whose PID this adapter
+/// could pass as "the process about to run this." Ownership therefore resolves
+/// entirely through `self_session` — see the module doc comment for why that
+/// only ever protects against foreign kills today.
 ///
 /// When `fail_closed` is `true`, every portzilla-side failure (unparseable
 /// JSON, missing command, …) returns a deny shape on stdout instead of
@@ -237,7 +242,12 @@ pub fn handle_with_policy(
         );
     };
 
-    match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookOutcome::allow_silent(),
         Verdict::Deny { explanation, .. } => {
             let response = HookResponse {

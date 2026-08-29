@@ -5,9 +5,10 @@
 //! hooks are in-process JavaScript/TypeScript plugin modules
 //! (<https://opencode.ai/docs/plugins/>), not external processes invoked
 //! with a JSON payload on stdin. The other adapters (`claude_code.rs`,
-//! `cursor.rs`, `gemini.rs`, `codex.rs`, `kimi.rs`) each translate a
-//! harness-owned JSON contract to and from [`crate::guard`]; OpenCode cannot
-//! run `portzilla` as the hook directly, so:
+//! `codex.rs`, `cursor.rs`, `gemini.rs`, `kimi.rs`, `windsurf.rs`) each own
+//! their harness payload parsing and wire rendering. All seven use
+//! `hook_common::evaluate`, which delegates normalized command evaluation to
+//! the guard core; OpenCode cannot run `portzilla` as the hook directly, so:
 //!
 //! 1. **The shim** — a small JS plugin (`portzilla init opencode` prints
 //!    its full source) that hooks `tool.execute.before`, and shells out to
@@ -62,7 +63,8 @@
 //! existing throw-on-deny path then blocks the tool call exactly as a real
 //! deny would.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -121,15 +123,16 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
 }
 
 /// Handles one shim invocation: parses `raw_input`, and runs the command
-/// through [`guard::check`] against `leases`.
+/// through the shared guard evaluation path against `leases`.
 ///
-/// `self_pid` is always `None` when calling into `guard`: OpenCode's hook
-/// fires *before* the tool runs, so there is no process yet whose PID this
-/// adapter could pass. Ownership resolves through `self_session`, taken
-/// from the shim's `session_id` — which the shim receives from OpenCode's
-/// `tool.execute.before` input — and, end to end, requires claims tagged
-/// with the same session (`PORTZILLA_SESSION` injected by the shim's
-/// `shell.env` hook — see the module doc).
+/// The adapter passes `self_pid` through `hook_common::evaluate`, which
+/// delegates to the guard core. It is always `None`: OpenCode's hook fires
+/// *before* the tool runs, so there is no process yet whose PID this adapter
+/// could pass. Ownership resolves through `self_session`, taken from the
+/// shim's `session_id` — which the shim receives from OpenCode's
+/// `tool.execute.before` input — and, end to end, requires claims tagged with
+/// the same session (`PORTZILLA_SESSION` injected by the shim's `shell.env`
+/// hook — see the module doc).
 ///
 /// When `fail_closed` is `true`, every portzilla-side failure (unparseable
 /// JSON, missing command, …) returns a deny JSON on stdout instead of
@@ -174,7 +177,12 @@ pub fn handle_with_policy(
         };
     };
 
-    match guard::check(&command, leases, None, input.session_id.as_deref(), checker) {
+    match evaluate(EvaluationRequest {
+        command: &command,
+        session: input.session_id.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookOutcome {
             stdout_json: verdict_json("allow", None),
             stderr_note: None,

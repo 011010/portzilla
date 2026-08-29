@@ -1,6 +1,6 @@
 [package]
 name = "portzilla"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Port and process lease coordinator for parallel AI coding-agent sessions"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/011010/portzilla"
 homepage = "https://github.com/011010/portzilla"
 keywords = ["port", "cli", "agent", "dev-tools", "process"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".atl/", ".github/", "npm/", "package.json", "scripts/"]
+exclude = [".atl/", ".github/", "docs/plans/", "npm/", "package.json", "scripts/"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -20,7 +20,7 @@ schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sysinfo = "0.39.6"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "signal", "time"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

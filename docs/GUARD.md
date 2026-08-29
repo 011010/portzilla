@@ -8,6 +8,17 @@ For a high-level overview and support matrix, see [`README.md`](../README.md#kil
 
 The guard itself (`src/guard.rs`) is harness-agnostic: it takes a shell command string and the current lease list and returns a verdict, with no knowledge of Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, Windsurf, or any other tool. Each harness gets a thin adapter over the same core (`src/claude_code.rs`, `src/cursor.rs`, `src/gemini.rs`, `src/codex.rs`, `src/kimi.rs`, `src/opencode.rs`, `src/windsurf.rs`) that only translates the harness's hook payload in and its response shape out — adding a new harness means writing another adapter like these, never touching the guard itself.
 
+### Adapter boundary
+
+All seven adapters own their harness payload parsing and wire-compatible
+response rendering. Claude Code, Codex, Cursor, and Gemini CLI use JSON
+contracts; Kimi CLI and Windsurf use exit-code contracts; OpenCode uses its
+`{ action, reason }` JSON protocol. This includes each harness's stdout/stderr
+behavior and exit codes. The shared `hook_common::evaluate` path delegates
+normalized command evaluation to the guard core. External contracts remain
+harness-specific: adapters do not share a response schema or impose one
+harness's failure and exit semantics on another.
+
 It recognizes:
 
 - `kill <pid>` / `kill -9 <pid>` — explicit PIDs, including `sudo kill ...`, `FOO=1 kill ...` (leading env-var assignments), and `/usr/bin/kill ...` (matched by basename)
@@ -127,10 +138,10 @@ $ echo $?
 
   `portzilla guard` recognizes an `sh`/`bash`/`zsh`/`dash` invocation with a `-c`-family flag (combined, like `-lc`, or separate, like `-x -c` or `--norc -c`) ahead of the payload, and analyzes the raw payload directly instead of the literal `sh -c ...` text — including recursively through a nested `sh -c "sh -c '...'"`, up to 8 levels deep. This is a targeted unwrap for that specific shape, not a shell parser: it does not follow `$(...)` command substitution, variable expansion, or backslash escaping inside the payload, and only recognizes `sh`/`bash`/`zsh`/`dash` by name (not `ksh`, `fish`, `python3 -c`, PowerShell's `-Command`, etc.) — see `src/guard_cmd.rs`'s module doc comment for the complete, current list of what it does and doesn't catch.
 
-## Fail-open, always
+## Failure modes
 
-A guard that can crash or hang and take the user's session down with it is worse than no guard. Every adapter (`hook claude-code`, `hook cursor`, `hook gemini`) and `guard` fails open at every step: unreadable stdin, malformed hook JSON, an unreadable lease store, even an internal panic — all of it is caught and turned into "allow, note it on stderr" rather than ever blocking or crashing. For the hook adapters this means the harness's own normal permission flow applies unmodified, exactly as if the hook weren't installed; a portzilla-side problem never denies a command, only the command itself looking unsafe does.
+By default, portzilla-side failures in every adapter (`hook claude-code`, `hook codex`, `hook cursor`, `hook gemini`, `hook kimi`, `hook opencode`, and `hook windsurf`) and `guard` fail open: unreadable stdin, malformed hook JSON, an unreadable lease store, and internal panics are handled through the harness's allow path with a diagnostic where supported. The harness's normal permission flow then applies as if the hook were not installed.
 
 ## Fail-closed mode (opt-in)
 
-Set `PORTZILLA_FAIL_CLOSED=1` to flip the tradeoff: when portzilla can't verify a command's safety (corrupt store, oversized payload, unparseable input, missing command, internal panic), the hook adapters emit their harness's deny shape with the reason going to the model, and `portzilla guard` exits 2 without running the command. Default is fail-open; this is for users who specifically prefer "block when unverified" over "let it through." The shape and channel of each deny match the harness's own conventions (Claude Code's `permissionDecisionReason`, Cursor's `agent_message`, Gemini's `reason`).
+Set `PORTZILLA_FAIL_CLOSED=1` to convert those portzilla-side failures to a deny according to each adapter's contract. The JSON adapters use their documented deny fields, Kimi CLI and Windsurf use exit 2 with stderr, and OpenCode returns an `action: "deny"` JSON verdict. `portzilla guard` exits 2 without running the command. Default mode remains fail-open; this opt-in is for users who prefer blocking when safety cannot be verified.

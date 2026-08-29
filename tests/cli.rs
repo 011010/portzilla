@@ -6,6 +6,15 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read};
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::process::{Child, Output, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 fn cmd(data_dir: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("portzilla").unwrap();
@@ -24,7 +33,178 @@ fn claim_on_a_free_port_succeeds_and_reports_the_port() {
         .stdout(predicate::str::contains("4000"));
 }
 
+fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
+    for _ in 0..100 {
+        let requested = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = requested.local_addr().unwrap().port();
+        if let Some(successor) = base
+            .checked_add(1)
+            .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        {
+            return (requested, successor, base);
+        }
+    }
+    panic!("could not reserve adjacent test ports");
+}
+
+fn free_test_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn claim_live_lease(data_dir: &std::path::Path, pid: u32, session: Option<&str>) -> u16 {
+    let port = free_test_port();
+    let port_arg = port.to_string();
+    let pid_arg = pid.to_string();
+    let mut command = cmd(data_dir);
+    command.args(["claim", &port_arg, "--tag", "dev-server", "--pid", &pid_arg]);
+    if let Some(session) = session {
+        command.args(["--session", session]);
+    }
+    let output = command
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    json["port"].as_u64().unwrap() as u16
+}
+
+#[cfg(unix)]
+fn terminate_and_reap(child: &mut Child) -> std::process::ExitStatus {
+    const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let poll_until = |child: &mut Child, deadline: Instant| loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    if let Some(status) = poll_until(child, Instant::now() + EXIT_TIMEOUT) {
+        return status;
+    }
+
+    let sigkill_sent = match child.kill() {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("failed to terminate watch process: {error}"),
+    };
+
+    if let Some(status) = poll_until(child, Instant::now() + EXIT_TIMEOUT) {
+        return status;
+    }
+
+    // A successful Child::kill sends SIGKILL on Unix. It cannot be caught or
+    // ignored, so this final reap cannot leave the child running.
+    if sigkill_sent {
+        return child.wait().unwrap();
+    }
+
+    // NotFound means the process exited between the last poll and kill; wait
+    // still reaps its already-terminated child entry.
+    child.wait().unwrap()
+}
+
+#[cfg(unix)]
+fn run_watch_once(data_dir: &std::path::Path, json: bool) -> Output {
+    let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
+    let mut command = std::process::Command::new(binary);
+    command
+        .env("PORTZILLA_DATA_DIR", data_dir)
+        .args(["watch", "--interval", "60"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if json {
+        command.arg("--json");
+    }
+
+    let mut child = command.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (output_tx, output_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut remaining = String::new();
+        reader.read_to_string(&mut remaining).unwrap();
+        output_tx.send(first_line + &remaining).unwrap();
+    });
+    if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        terminate_and_reap(&mut child);
+        panic!("watch process did not emit its first cycle before timeout");
+    }
+    let signal_result = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status();
+    if !signal_result
+        .as_ref()
+        .is_ok_and(std::process::ExitStatus::success)
+        && child.try_wait().unwrap().is_none()
+    {
+        let detail = match signal_result {
+            Ok(status) => format!("kill -INT exited with {status}"),
+            Err(error) => format!("could not run kill -INT: {error}"),
+        };
+        terminate_and_reap(&mut child);
+        panic!("failed to send SIGINT to watch process: {detail}");
+    }
+    let status = terminate_and_reap(&mut child);
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    let stdout = output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    Output {
+        status,
+        stdout: stdout.into_bytes(),
+        stderr,
+    }
+}
+
 #[test]
+#[cfg(unix)]
+fn watch_human_mode_reports_pruned_lease_details() {
+    let dir = tempfile::tempdir().unwrap();
+    claim_live_lease(dir.path(), u32::MAX, None);
+
+    let output = run_watch_once(dir.path(), false);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("pruned port"));
+    assert!(stdout.contains("pid"));
+    assert!(stdout.contains("dev-server"));
+}
+
+#[test]
+#[cfg(unix)]
+fn watch_json_mode_keeps_stdout_machine_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    claim_live_lease(dir.path(), u32::MAX, None);
+
+    let output = run_watch_once(dir.path(), true);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let event: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(event["event"], "watch_cycle");
+    assert_eq!(event["pruned"][0]["tag"], "dev-server");
+}
+
+#[test]
+#[cfg(unix)]
 fn claim_conflict_with_a_live_pid_reassigns_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -59,7 +239,78 @@ fn claim_conflict_with_a_live_pid_reassigns_and_says_so() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("4101"));
+        .stdout(predicate::str::contains("4101"))
+        .stdout(predicate::str::contains("lease conflict"));
+}
+
+#[test]
+#[cfg(unix)]
+fn claim_json_reports_lease_conflict_reason_when_reassigned() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    let parent_pid = std::os::unix::process::parent_id();
+
+    cmd(dir.path())
+        .args([
+            "claim",
+            "4150",
+            "--tag",
+            "first",
+            "--pid",
+            &own_pid.to_string(),
+        ])
+        .assert()
+        .success();
+    let output = cmd(dir.path())
+        .args([
+            "claim",
+            "4150",
+            "--tag",
+            "second",
+            "--pid",
+            &parent_pid.to_string(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["reassigned"], true);
+    assert_eq!(json["reassignment_reason"], "lease_conflict");
+}
+
+#[test]
+fn claim_json_reports_os_occupied_reason_for_an_unregistered_bound_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_listener, successor, base) = reserve_adjacent_ports();
+
+    let output = cmd(dir.path())
+        .args([
+            "claim",
+            &base.to_string(),
+            "--tag",
+            "second",
+            "--pid",
+            "222",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert!(
+        json["port"].as_u64().unwrap() > u64::from(base),
+        "occupied port must be reassigned forward"
+    );
+    assert_eq!(json["reassigned"], true);
+    assert_eq!(json["reassignment_reason"], "os_occupied");
+    drop(successor);
 }
 
 #[test]
@@ -82,15 +333,67 @@ fn claim_json_output_is_valid_json_with_expected_fields() {
 }
 
 #[test]
+fn claim_and_ls_json_persist_process_start_time_for_the_real_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+
+    let claim_output = cmd(dir.path())
+        .args([
+            "claim",
+            "4250",
+            "--tag",
+            "api",
+            "--pid",
+            &own_pid.to_string(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let claim_json: Value = serde_json::from_slice(&claim_output).unwrap();
+    let start_time = claim_json["process_start_time"]
+        .as_u64()
+        .expect("claim JSON should include process_start_time");
+
+    let ls_output = cmd(dir.path())
+        .args(["ls", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let leases: Value = serde_json::from_slice(&ls_output).unwrap();
+    assert_eq!(leases[0]["pid"], own_pid);
+    assert_eq!(leases[0]["process_start_time"], start_time);
+}
+
+#[test]
 fn idempotent_reclaim_by_the_same_pid_does_not_duplicate_the_lease() {
     let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
 
     cmd(dir.path())
-        .args(["claim", "4300", "--tag", "v1", "--pid", "333"])
+        .args([
+            "claim",
+            "4300",
+            "--tag",
+            "v1",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
     cmd(dir.path())
-        .args(["claim", "4300", "--tag", "v2", "--pid", "333"])
+        .args([
+            "claim",
+            "4300",
+            "--tag",
+            "v2",
+            "--pid",
+            &own_pid.to_string(),
+        ])
         .assert()
         .success();
 
@@ -410,6 +713,7 @@ fn prune_json_reports_an_array_of_pruned_lease_objects() {
 // ---- security regressions found by adversarial review ----
 
 #[test]
+#[cfg(unix)]
 fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
@@ -617,19 +921,7 @@ fn hook_claude_code_denies_kill_of_a_foreign_session_live_lease() {
     // session "other-session", while the hook payload declares
     // "my-session" — genuinely different sessions, not a same-PID coincidence.
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-            "--session",
-            "other-session",
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
 
     let output = cmd(dir.path())
         .args(["hook", "claude-code"])
@@ -649,7 +941,7 @@ fn hook_claude_code_denies_kill_of_a_foreign_session_live_lease() {
     let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .expect("permissionDecisionReason must be a string");
-    assert!(reason.contains("3000"));
+    assert!(reason.contains(&port.to_string()));
     assert!(reason.contains("dev-server"));
 }
 
@@ -778,17 +1070,7 @@ fn init_claude_code_prints_the_settings_snippet() {
 fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, None);
 
     let input = serde_json::json!({
         "command": format!("kill {own_pid}"),
@@ -809,24 +1091,19 @@ fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
 
     let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
     assert_eq!(json["permission"], "deny");
-    assert!(json["agent_message"].as_str().unwrap().contains("3000"));
+    assert!(
+        json["agent_message"]
+            .as_str()
+            .unwrap()
+            .contains(&port.to_string())
+    );
 }
 
 #[test]
 fn hook_gemini_denies_kill_of_a_foreign_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, None);
 
     let input = serde_json::json!({
         "session_id": "sess-unrelated",
@@ -847,7 +1124,7 @@ fn hook_gemini_denies_kill_of_a_foreign_live_lease() {
 
     let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
     assert_eq!(json["decision"], "deny");
-    assert!(json["reason"].as_str().unwrap().contains("3000"));
+    assert!(json["reason"].as_str().unwrap().contains(&port.to_string()));
 }
 
 #[test]
@@ -892,19 +1169,7 @@ fn codex_pretooluse_bash_json(command: &str, session_id: &str) -> String {
 fn hook_codex_denies_kill_of_a_foreign_session_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-            "--session",
-            "other-session",
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
 
     let output = cmd(dir.path())
         .args(["hook", "codex"])
@@ -924,7 +1189,7 @@ fn hook_codex_denies_kill_of_a_foreign_session_live_lease() {
     let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .expect("permissionDecisionReason must be a string");
-    assert!(reason.contains("3000"));
+    assert!(reason.contains(&port.to_string()));
     assert!(reason.contains("dev-server"));
 }
 
@@ -1034,19 +1299,7 @@ fn kimi_pretooluse_shell_json(command: &str, session_id: &str) -> String {
 fn hook_kimi_denies_kill_of_a_foreign_session_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-            "--session",
-            "other-session",
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
 
     cmd(dir.path())
         .args(["hook", "kimi"])
@@ -1057,7 +1310,9 @@ fn hook_kimi_denies_kill_of_a_foreign_session_live_lease() {
         .assert()
         .code(2) // Kimi's block exit code
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+        .stderr(
+            predicate::str::contains(port.to_string()).and(predicate::str::contains("dev-server")),
+        );
 }
 
 #[test]
@@ -1166,19 +1421,7 @@ fn opencode_shim_json(command: &str, session_id: &str) -> String {
 fn hook_opencode_denies_kill_of_a_foreign_session_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-            "--session",
-            "other-session",
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
 
     let output = cmd(dir.path())
         .args(["hook", "opencode"])
@@ -1192,7 +1435,7 @@ fn hook_opencode_denies_kill_of_a_foreign_session_live_lease() {
     let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
     assert_eq!(json["action"], "deny");
     let reason = json["reason"].as_str().expect("reason must be a string");
-    assert!(reason.contains("3000"));
+    assert!(reason.contains(&port.to_string()));
     assert!(reason.contains("dev-server"));
 }
 
@@ -1316,19 +1559,7 @@ fn windsurf_pre_run_command_json(command: &str, trajectory_id: &str) -> String {
 fn hook_windsurf_denies_kill_of_a_foreign_session_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-            "--session",
-            "other-session",
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
 
     cmd(dir.path())
         .args(["hook", "windsurf"])
@@ -1339,7 +1570,9 @@ fn hook_windsurf_denies_kill_of_a_foreign_session_live_lease() {
         .assert()
         .code(2) // Windsurf's block exit code
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+        .stderr(
+            predicate::str::contains(port.to_string()).and(predicate::str::contains("dev-server")),
+        );
 }
 
 #[test]
@@ -1462,17 +1695,7 @@ fn write_fake_command(path: &std::path::Path, body: &str) {
 fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    let port = claim_live_lease(dir.path(), own_pid, None);
 
     // Named "kill" so guard's basename-based verb matching recognizes it —
     // but it is our own harmless script, not the real system `kill`.
@@ -1489,7 +1712,9 @@ fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("3000").and(predicate::str::contains("dev-server")));
+        .stderr(
+            predicate::str::contains(port.to_string()).and(predicate::str::contains("dev-server")),
+        );
 
     assert!(
         !dir.path().join("marker").exists(),
@@ -1544,17 +1769,7 @@ fn guard_warn_executes_with_stderr_warning() {
 fn guard_analyzes_the_sh_c_payload_and_denies() {
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
-    cmd(dir.path())
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    claim_live_lease(dir.path(), own_pid, None);
 
     let script = dir.path().join("kill");
     write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
@@ -1581,17 +1796,7 @@ fn guard_analyzes_the_sh_c_payload_and_denies() {
 #[cfg(unix)]
 fn setup_foreign_live_lease_and_kill_script(dir: &std::path::Path) -> (u32, std::path::PathBuf) {
     let own_pid = std::process::id();
-    cmd(dir)
-        .args([
-            "claim",
-            "3000",
-            "--tag",
-            "dev-server",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    claim_live_lease(dir, own_pid, None);
 
     let script = dir.join("kill");
     write_fake_command(&script, &format!("touch '{}/marker'", dir.display()));

@@ -1,9 +1,10 @@
 //! Kimi CLI adapter for the kill-guard.
 //!
-//! Translates a Kimi CLI `PreToolUse` hook payload into a call to the
-//! harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the exit-code/stream contract Kimi
-//! expects. Thin by design — see `src/guard.rs`'s module doc for why.
+//! Owns parsing of Kimi CLI's `PreToolUse` hook payload and rendering of the
+//! resulting [`crate::guard::Verdict`] into Kimi's exit-code/stream contract.
+//! `hook_common::evaluate` delegates normalized command evaluation to the
+//! harness-agnostic guard core; payload parsing and wire rendering stay local
+//! to this adapter. Thin by design — see `src/guard.rs`'s module doc for why.
 //!
 //! Schema verified against the current Kimi CLI hooks documentation
 //! (<https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/customization/hooks.md>,
@@ -61,7 +62,8 @@
 //! flips from "allow + note" to exit 2 with the reason on stderr (Kimi's
 //! own block channel) instead.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::Deserialize;
 
@@ -154,14 +156,15 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
 }
 
 /// Handles one `PreToolUse` hook invocation: parses `raw_input`, and if
-/// it's a [`SHELL_TOOL_NAME`] tool call, runs its command through
-/// [`guard::check`] against `leases`.
+/// it's a [`SHELL_TOOL_NAME`] tool call, passes the normalized request through
+/// `hook_common::evaluate` against `leases`.
 ///
-/// `self_pid` is always `None` when calling into `guard`: `PreToolUse`
-/// fires *before* the tool runs, so there is no process yet whose PID this
-/// adapter could pass as "the process about to run this." Ownership
-/// therefore resolves entirely through `self_session` — see the module doc
-/// comment for why that only ever protects against foreign kills today.
+/// The adapter passes `self_pid` through `hook_common::evaluate`, which
+/// delegates to the guard core. It is always `None`: `PreToolUse` fires
+/// *before* the tool runs, so there is no process yet whose PID this adapter
+/// could pass as "the process about to run this." Ownership therefore resolves
+/// entirely through `self_session` — see the module doc comment for why that
+/// only ever protects against foreign kills today.
 ///
 /// When `fail_closed` is `true`, every portzilla-side failure (unparseable
 /// JSON, missing command, …) returns exit 2 with the reason on stderr
@@ -207,7 +210,12 @@ pub fn handle_with_policy(
         );
     };
 
-    match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookOutcome::allow_silent(),
         Verdict::Deny { explanation, .. } => HookOutcome::deny_with_reason(explanation),
         Verdict::Warn { explanation } => {

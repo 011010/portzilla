@@ -46,12 +46,12 @@ struct ClaimParams {
     port: u16,
     /// Human-readable description of what this port is for (e.g. "next-dev", "vite-preview").
     tag: String,
-    /// PID of the process that owns this port. If omitted, defaults to the
-    /// portzilla MCP server's own PID — which is almost never the right
-    /// owner, since the server process is not the process actually bound to
-    /// the port. Prefer passing the PID of the process you started (or are
-    /// about to start) on this port so other tools/agents can see the real
-    /// owner. The result includes a `note` field when this default was used.
+    /// PID of an already-running process that owns this port. If omitted,
+    /// defaults to the portzilla MCP server's own PID — which is almost never
+    /// the right owner, since the server process is not the process actually
+    /// bound to the port. A future or nonexistent PID is recorded as an
+    /// unverified, dead lease and must not be treated as ownership. The result
+    /// includes a `note` field when this default was used.
     #[serde(default)]
     pid: Option<u32>,
     /// Optional session identifier grouping related leases together.
@@ -76,7 +76,9 @@ impl PortzillaMcpServer {
 
     #[tool(
         description = "Claim a local port for a process, recording who owns it and why. Use \
-        this INSTEAD of killing whatever occupies a port. If the port is free (or its \
+         this INSTEAD of killing whatever occupies a port. Pass the PID of an already-running \
+         process; a future or nonexistent PID creates an unverified, dead lease and does not \
+         establish ownership. If the port is free (or its \
         previous owner has already exited), you get it directly. If it's genuinely held by a \
         live process, you are NOT allowed to steal it — you are given the next free port \
         instead, and the result says so. Call `who` first if you need to know who currently \
@@ -124,8 +126,8 @@ impl PortzillaMcpServer {
         if !pid_was_given {
             value["note"] = json!(
                 "pid was not provided; defaulted to the portzilla MCP server's own PID, which \
-                 is almost never the right owner. Pass the PID of the process you started (or \
-                 are about to start) on this port instead."
+                  is almost never the right owner. Pass the PID of an already-running process \
+                  that owns this port instead; a future or nonexistent PID is unverified/dead."
             );
         }
         Ok(CallToolResult::structured(value))
@@ -327,6 +329,14 @@ mod tests {
             .expect("expected structured_content on the tool result")
     }
 
+    fn unused_test_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     // ---- tool descriptions ----
 
     #[test]
@@ -372,9 +382,10 @@ mod tests {
     #[tokio::test]
     async fn claim_on_a_free_port_returns_success_with_the_ls_plus_reassigned_shape() {
         let (server, _dir) = server_with_tempdir();
+        let port = unused_test_port();
         let result = server
             .claim(Parameters(ClaimParams {
-                port: 4000,
+                port,
                 tag: "server".to_string(),
                 pid: Some(100),
                 session: None,
@@ -384,10 +395,10 @@ mod tests {
 
         assert_eq!(result.is_error, Some(false));
         let value = structured(&result);
-        assert_eq!(value["port"], 4000);
+        assert_eq!(value["port"], port);
         assert_eq!(value["pid"], 100);
         assert_eq!(value["tag"], "server");
-        assert_eq!(value["requested_port"], 4000);
+        assert_eq!(value["requested_port"], port);
         assert_eq!(value["reassigned"], false);
         assert!(value.get("created_at").is_some());
     }
@@ -395,9 +406,10 @@ mod tests {
     #[tokio::test]
     async fn claim_without_pid_defaults_to_the_server_pid_and_adds_a_note() {
         let (server, _dir) = server_with_tempdir();
+        let port = unused_test_port();
         let result = server
             .claim(Parameters(ClaimParams {
-                port: 4001,
+                port,
                 tag: "server".to_string(),
                 pid: None,
                 session: None,
@@ -416,9 +428,10 @@ mod tests {
     #[tokio::test]
     async fn claim_with_explicit_pid_has_no_note_field() {
         let (server, _dir) = server_with_tempdir();
+        let port = unused_test_port();
         let result = server
             .claim(Parameters(ClaimParams {
-                port: 4002,
+                port,
                 tag: "server".to_string(),
                 pid: Some(100),
                 session: None,
@@ -436,10 +449,11 @@ mod tests {
     #[tokio::test]
     async fn claim_conflicting_with_a_live_pid_reassigns() {
         let (server, _dir) = server_with_tempdir();
+        let port = unused_test_port();
         let own_pid = std::process::id();
         server
             .claim(Parameters(ClaimParams {
-                port: 4003,
+                port,
                 tag: "first".to_string(),
                 pid: Some(own_pid),
                 session: None,
@@ -449,7 +463,7 @@ mod tests {
 
         let result = server
             .claim(Parameters(ClaimParams {
-                port: 4003,
+                port,
                 tag: "second".to_string(),
                 pid: Some(own_pid + 1),
                 session: None,
@@ -459,8 +473,33 @@ mod tests {
 
         let value = structured(&result);
         assert_eq!(value["reassigned"], true);
-        assert_eq!(value["port"], 4004);
-        assert_eq!(value["requested_port"], 4003);
+        assert!(value["port"].as_u64().unwrap() > port as u64);
+        assert_eq!(value["requested_port"], port);
+        assert_eq!(value["reassignment_reason"], "lease_conflict");
+    }
+
+    #[tokio::test]
+    async fn claim_on_an_os_occupied_unregistered_port_reports_os_occupied() {
+        let (server, _dir) = server_with_tempdir();
+        let base = unused_test_port();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", base)).unwrap();
+
+        let result = server
+            .claim(Parameters(ClaimParams {
+                port: base,
+                tag: "server".to_string(),
+                pid: Some(100),
+                session: None,
+            }))
+            .await
+            .unwrap();
+
+        drop(listener);
+
+        let value = structured(&result);
+        assert!(value["port"].as_u64().unwrap() > base as u64);
+        assert_eq!(value["reassigned"], true);
+        assert_eq!(value["reassignment_reason"], "os_occupied");
     }
 
     #[tokio::test]

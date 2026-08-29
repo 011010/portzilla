@@ -9,31 +9,42 @@ Leave the variable unset or set it to `false` while testing release builds. The 
 ## Release checklist
 
 1. Update the version in `Cargo.toml` and `package.json` to the same value.
-2. Run the local checks:
+2. Confirm that both manifests declare exactly version `0.2.0`:
+
+   ```console
+   $ cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "portzilla") | .version')" && npm_version="$(node -p "require('./package.json').version")" && test "$cargo_version" = "0.2.0" && test "$npm_version" = "0.2.0"
+   ```
+
+   The release tag must be exactly `v0.2.0`, the `v`-prefixed form of both manifest versions.
+
+3. Run the local checks:
 
    ```console
    $ cargo fmt --all -- --check
    $ cargo clippy --all-targets --all-features -- -D warnings
-   $ cargo test --all-targets
+   $ cargo test --all-targets --all-features
    $ cargo publish --dry-run
    $ npm pack --dry-run
    ```
 
-3. Publish the crate:
+4. Inspect the file lists reported by both dry-runs. They should contain only the expected source, manifest, documentation, and package files. Confirm that they exclude `target/` and other build artifacts, local state, credentials, and release-plan artifacts.
+
+5. After all validation passes, manually publish the crate:
 
    ```console
    $ cargo publish
    ```
 
-4. Create and push the matching tag:
+6. After publication succeeds, manually create and push the matching tag:
 
    ```console
-   $ git tag v0.1.0
+   $ git tag v0.2.0
+   $ test "$(git describe --tags --exact-match)" = "v0.2.0"
    $ git push origin main --tags
    ```
 
-5. The release workflow builds and smoke-tests Linux x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64/ARM64. It uploads each archive together with its SHA-256 checksum.
-6. If `PORTZILLA_PUBLISH_NPM=true`, npm is published automatically after every release asset succeeds.
+7. The release workflow builds and smoke-tests Linux x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64/ARM64. It uploads each archive together with its SHA-256 checksum.
+8. If `PORTZILLA_PUBLISH_NPM=true`, the release workflow automatically publishes npm after the release assets succeed, using the required `NPM_TOKEN` repository secret.
 
 ## Manual verification
 

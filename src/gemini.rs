@@ -1,9 +1,11 @@
 //! Gemini CLI adapter for the kill-guard.
 //!
-//! Translates a Gemini CLI `BeforeTool` hook payload into a call to the
-//! harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the JSON shape Gemini CLI expects on
-//! stdout. Thin by design — see `src/guard.rs`'s module doc for why.
+//! Owns parsing of Gemini CLI's `BeforeTool` hook payload and rendering of the
+//! resulting [`crate::guard::Verdict`] into the JSON shape Gemini CLI expects
+//! on stdout. `hook_common::evaluate` delegates normalized command evaluation
+//! to the harness-agnostic guard core; payload parsing and wire rendering stay
+//! local to this adapter. Thin by design — see `src/guard.rs`'s module doc for
+//! why.
 //!
 //! Schema verified against the current Gemini CLI hooks reference
 //! (<https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md>,
@@ -57,7 +59,8 @@
 //! `decision` field (Gemini's own docs: "Pollution = Failure ... defaults
 //! to Allow") plus a stderr diagnostic, never a crash or a `deny`.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -121,7 +124,8 @@ struct HookResponse {
 }
 
 /// Handles one `BeforeTool` hook invocation: parses `raw_input`, and if the
-/// tool is [`SHELL_TOOL_NAME`], runs its command through [`guard::check`]
+/// tool is [`SHELL_TOOL_NAME`], runs its command through
+/// [`crate::hook_common::evaluate`]
 /// against `leases`.
 ///
 /// `self_pid` is always `None`: `BeforeTool` fires before the tool runs, so
@@ -189,7 +193,12 @@ pub fn handle_with_policy(
         };
     };
 
-    let response = match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    let response = match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookResponse::default(),
         Verdict::Deny { explanation, .. } => HookResponse {
             decision: Some("deny"),
@@ -365,6 +374,30 @@ mod tests {
             .as_str()
             .expect("systemMessage must be present");
         assert!(system_message.contains("node"));
+    }
+
+    #[test]
+    fn forwards_session_id_when_serializing_a_foreign_lease_deny() {
+        let leases = vec![lease_with_session(3000, 1234, "dev-server", "sess-theirs")];
+        let outcome = handle(
+            &shell_input_with_session("kill 1234", "sess-mine"),
+            &leases,
+            &AlwaysAlive,
+        );
+
+        let json = response_json(&outcome);
+        assert_eq!(json["decision"], "deny");
+        assert!(json["reason"].as_str().unwrap().contains("3000"));
+    }
+
+    #[test]
+    fn serializes_warning_as_system_message_without_a_decision() {
+        let outcome = handle(&shell_input("pkill node"), &[], &AlwaysAlive);
+
+        let json = response_json(&outcome);
+        assert!(json.get("decision").is_none());
+        assert!(json.get("reason").is_none());
+        assert!(json["systemMessage"].as_str().unwrap().contains("node"));
     }
 
     #[test]

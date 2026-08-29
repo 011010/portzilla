@@ -1,11 +1,11 @@
 //! Cursor adapter for the kill-guard.
 //!
-//! Translates a Cursor `beforeShellExecution` hook payload into a call to
-//! the harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the JSON shape Cursor expects on
-//! stdout. Thin by design — see `src/guard.rs`'s module doc for why: all
-//! detection/lease-resolution logic lives there, this module only
-//! translates.
+//! Owns parsing of Cursor's `beforeShellExecution` hook payload and rendering
+//! of the resulting [`crate::guard::Verdict`] into the JSON shape Cursor
+//! expects on stdout. `hook_common::evaluate` delegates normalized command
+//! evaluation to the harness-agnostic guard core; payload parsing and wire
+//! rendering stay local to this adapter. Thin by design — see `src/guard.rs`'s
+//! module doc for why.
 //!
 //! Schema verified against the current Cursor hooks documentation
 //! (<https://cursor.com/docs/agent/hooks>, "Common schema" and
@@ -23,8 +23,8 @@
 //! `conversation_id`, and no other documented mechanism exposes it to the
 //! shell commands Cursor's agent actually executes. This means a claim made
 //! from inside a Cursor session cannot currently be tagged with the
-//! conversation id that would later let `guard::check` recognize it as
-//! "your own" — Cursor gets foreign-lease protection (deny) but not
+//! conversation id that would later let `hook_common::evaluate` recognize it
+//! as "your own" — Cursor gets foreign-lease protection (deny) but not
 //! own-lease recognition (allow), until Cursor documents such a variable.
 //! See the README's Kill guard section for the user-facing version of this.
 //!
@@ -40,7 +40,8 @@
 //! internal fail-open handling is defense in depth on top of that, not a
 //! substitute for it (we never ask users to set `failClosed`).
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -104,7 +105,8 @@ struct HookResponse {
 }
 
 /// Handles one `beforeShellExecution` hook invocation: parses `raw_input`
-/// and runs the command through [`guard::check`] against `leases`.
+/// and runs the command through [`crate::hook_common::evaluate`] against
+/// `leases`.
 ///
 /// `self_pid` is always `None`: `beforeShellExecution` fires before the
 /// command runs, so there is no process yet whose PID this adapter could
@@ -163,7 +165,12 @@ pub fn handle_with_policy(
         };
     };
 
-    let response = match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    let response = match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookResponse {
             permission: "allow",
             user_message: None,
@@ -342,6 +349,30 @@ mod tests {
         let agent_message = json["agent_message"].as_str().unwrap();
         assert!(agent_message.contains("node"));
         assert!(!json["user_message"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forwards_conversation_id_when_serializing_a_foreign_lease_deny() {
+        let leases = vec![lease_with_session(3000, 1234, "dev-server", "conv-theirs")];
+        let outcome = handle(
+            &shell_input_with_conversation("kill 1234", "conv-mine"),
+            &leases,
+            &AlwaysAlive,
+        );
+
+        let json = response_json(&outcome);
+        assert_eq!(json["permission"], "deny");
+        assert!(json["agent_message"].as_str().unwrap().contains("3000"));
+    }
+
+    #[test]
+    fn serializes_warning_as_an_allow_with_both_messages() {
+        let outcome = handle(&shell_input("pkill node"), &[], &AlwaysAlive);
+
+        let json = response_json(&outcome);
+        assert_eq!(json["permission"], "allow");
+        assert!(json["user_message"].as_str().is_some());
+        assert!(json["agent_message"].as_str().unwrap().contains("node"));
     }
 
     #[test]
