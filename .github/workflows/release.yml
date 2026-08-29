@@ -16,7 +16,7 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref_name }}
+  SOURCE_REF: ${{ github.ref }}
 
 jobs:
   create-release:
@@ -78,6 +78,8 @@ jobs:
           cargo_version="$(cargo pkgid -p portzilla | sed 's/.*@//')"
           package_version="$(node -p "require('./package.json').version")"
           tag_version="${RELEASE_TAG#v}"
+          printf 'Release versions: cargo=%s package=%s tag=%s\n' \
+            "$cargo_version" "$package_version" "$tag_version"
           test -n "$cargo_version"
           test -n "$package_version"
           test "$cargo_version" = "$tag_version"
