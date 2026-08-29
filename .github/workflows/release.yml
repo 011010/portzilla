@@ -72,6 +72,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Verify release package versions match tag
+        shell: bash
+        run: |
+          cargo_version="$(cargo pkgid -p portzilla | sed 's/.*@//')"
+          package_version="$(node -p "require('./package.json').version")"
+          tag_version="${RELEASE_TAG#v}"
+          test -n "$cargo_version"
+          test -n "$package_version"
+          test "$cargo_version" = "$tag_version"
+          test "$package_version" = "$tag_version"
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -138,7 +149,7 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Verify package version matches tag
+      - name: Re-verify package version before publish
         shell: bash
         run: test "v$(node -p "require('./package.json').version")" = "$RELEASE_TAG"
 

@@ -4,22 +4,24 @@ Complete command reference for `portzilla`. For a high-level overview, see [`REA
 
 ## Commands
 
-Every command accepts `--json` to print a single JSON value on stdout instead of human-readable text. Every command reads and writes the same file-locked JSON state file, so concurrent invocations from different processes are serialized safely.
+Data-producing commands accept `--json` to print machine-readable output on stdout instead of human-readable text. Store-backed commands read and write the same file-locked JSON state file, so concurrent invocations from different processes are serialized safely.
 
 ### `portzilla claim <PORT> --tag <TAG> [--pid <PID>] [--session <SESSION>] [--json]`
 
 Claims `<PORT>` for the given (or default) PID and tag.
 
 - `--tag <TAG>` — required. Human-readable description of what the port is for.
-- `--pid <PID>` — optional. Defaults to the PID of the parent process (the shell or agent invoking `portzilla`); falls back to `portzilla`'s own PID if the parent cannot be determined.
+- `--pid <PID>` — optional. Defaults to the PID of the live parent process (the shell or agent invoking `portzilla`); falls back to `portzilla`'s own PID if the parent cannot be determined. An explicit PID does not need to exist: a nonexistent PID, or one whose process identity cannot be resolved, is accepted and recorded as an unverified, dead lease. It does not promise future ownership.
 - `--session <SESSION>` — optional. Groups related leases under a session identifier.
 - `--json` — print the outcome as JSON instead of a one-line summary.
 
 Conflict resolution:
 
-- No lease on the requested port, or the existing lease's owning PID is dead: the port is claimed (or re-taken) directly. Not reassigned.
+- No live lease on the requested port: `portzilla` probes the OS too. If an unregistered process has bound it, the next port with neither a live lease nor an OS bind is claimed instead (`reassigned: true`, `reassignment_reason: "os_occupied"`). Otherwise the requested port is claimed directly.
 - A live lease on the requested port already owned by the same PID: the lease is updated in place (idempotent re-claim — tag and session can change, the port does not). Not reassigned.
-- A live lease on the requested port owned by a different PID: `portzilla` finds the next free port at or after `requested_port + 1` (skipping ports with a live lease and ports the OS reports as bound) and claims that instead. Reassigned.
+- A live lease on the requested port owned by a different PID: `portzilla` finds the next free port at or after `requested_port + 1` (skipping ports with a live lease and ports the OS reports as bound) and claims that instead (`reassigned: true`, `reassignment_reason: "lease_conflict"`).
+
+OS occupancy probing attempts wildcard and loopback addresses in both families: `0.0.0.0`/`127.0.0.1` and `::`/`::1`. A port is considered OS-free only when all usable probes succeed, which covers listeners bound to any local IPv4 or IPv6 interface, including localhost. Some platforms allow a wildcard bind alongside a loopback-only listener, so both IPv4 addresses and both IPv6 addresses are probed. On a platform where IPv6 is unavailable or unsupported, the IPv6 probes are ignored and the IPv4 results are used; this avoids treating every port as occupied on IPv4-only systems. Other IPv6 bind failures are treated as occupancy.
 
 ### `portzilla ls [--json]`
 
@@ -37,6 +39,49 @@ Removes the lease recorded on `<PORT>` and prints the removed lease. Exits with 
 
 Removes every lease whose owning PID is no longer alive and prints each one that was removed. Human output prints `no dead leases to prune` if nothing was pruned; JSON output prints `[]`.
 
+### `portzilla watch [--interval <SECONDS>] [--json]`
+
+Runs an optional foreground watcher that repeatedly performs the same
+process-liveness-based cleanup as `prune`. It is not a central daemon or IPC
+service: it uses the existing locked `leases.json`, and claims and queries
+continue to use the normal CLI or MCP interfaces.
+
+- `--interval <SECONDS>` — positive number of seconds between cycles. Defaults
+  to `60`.
+- `--json` — print one machine-readable cycle event per completed cycle.
+
+The watcher runs one cycle immediately, then waits for the configured interval
+before each subsequent cycle, and continues until Ctrl-C. It checks whether
+the recorded server PID is alive; it does not expire leases based on their
+age. Dead leases are removed. For a new lease, preservation requires a
+verified process identity: the current process must match both the recorded
+PID and `process_start_time`. A new lease whose identity could not be resolved
+is intentionally unverified/dead and may be pruned even if that numeric PID
+currently exists. Legacy leases without identity metadata retain PID-only
+liveness behavior. If an agent exits while a new lease's verified recorded
+server process remains alive, that lease is preserved.
+
+The initial store-open failure is fatal and exits with the normal unexpected
+error status. Errors from ordinary cycles are printed to stderr and retried on
+the next interval. Ctrl-C prints a shutdown message to stderr and exits
+successfully. Human stdout prints `no leases pruned` for an empty cycle, or
+one line per removed lease in the form `pruned port <PORT> (pid <PID>, tag:
+<TAG>)`.
+
+JSON mode prints one event object per completed cycle, including empty cycles:
+
+```json
+{"event":"watch_cycle","pruned":[]}
+```
+
+When leases are removed, `pruned` contains lease views with the same fields as
+the `Lease object` shape below. The views describe leases that were dead and
+removed, so their `alive` value is `false`:
+
+```json
+{"event":"watch_cycle","pruned":[{"port":3000,"pid":57107,"tag":"next-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"age_secs":3,"alive":false}]}
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -47,7 +92,7 @@ Removes every lease whose owning PID is no longer alive and prints each one that
 
 ## JSON output shapes
 
-### Lease object (`ls`, `who`, `release`, `prune`)
+### Lease object (`ls`, `who`, `release`, `prune`, `watch`)
 
 Used as a single object by `who` and `release`, and as an array of these objects by `ls` and `prune`:
 
@@ -58,12 +103,13 @@ Used as a single object by `who` and `release`, and as an array of these objects
   "tag": "vite-dev",
   "created_at": 1785959877,
   "session": null,
+  "process_start_time": 1785959876,
   "age_secs": 3,
   "alive": true
 }
 ```
 
-`created_at` is a Unix timestamp in seconds. `session` is `null` unless `--session` was given at claim time. `alive` reflects a live PID-table check at the moment of the query, not a cached value.
+`created_at` and `process_start_time` are Unix timestamps in seconds. `process_start_time` is omitted for legacy leases or when the platform cannot resolve it. New leases with an unresolved start time are marked internally as unverified and do not count as alive; legacy leases without identity metadata retain PID-only compatibility. `session` is `null` unless `--session` was given at claim time. `alive` reflects a PID and process-start-time check at the moment of the query, not a cached value.
 
 ### Claim outcome (`claim --json`)
 
@@ -74,12 +120,16 @@ Used as a single object by `who` and `release`, and as an array of these objects
   "tag": "vite-dev",
   "created_at": 1785959898,
   "session": null,
+  "process_start_time": 1785959897,
   "requested_port": 3000,
-  "reassigned": true
+  "reassigned": true,
+  "reassignment_reason": "lease_conflict"
 }
 ```
 
-`requested_port` is the port that was originally asked for; `port` is the port actually leased. `reassigned` is `true` only when `port != requested_port` because of a live conflicting claim.
+`requested_port` is the port that was originally asked for; `port` is the port actually leased. `reassigned` is `true` only when `port != requested_port`. When reassigned, `reassignment_reason` is the stable machine-readable value `lease_conflict` or `os_occupied`; it is omitted otherwise.
+
+The persisted `leases.json` records an internal `process_identity_verified` boolean for new claims: `true` when `process_start_time` was resolved and `false` when it was unavailable. The field is omitted for legacy lease records and is not exposed in CLI or MCP JSON views.
 
 ## MCP server
 
@@ -94,6 +144,8 @@ $ claude mcp add portzilla -- portzilla serve --mcp
 Every tool's description is written to make the intended behavior explicit to the calling agent — the `claim` tool description, for example, says outright to use it *instead of* killing whatever occupies a port. Tool results use the exact same flat JSON shapes documented above for `--json` output (see JSON output shapes), so anything already written against the CLI's JSON recognizes MCP results too.
 
 - **`claim(port, tag, pid?, session?)`** — same semantics as `portzilla claim`. `pid` is optional here for a different reason than on the CLI: there is no meaningful "parent process" to default to (the MCP client, not a shell, owns the session), so an omitted `pid` falls back to the portzilla server process's own PID — almost never what you want — and the result carries an extra `note` field saying so. Always pass the PID of the process you started (or are about to start) on that port when you have it.
+
+  Reassigned claims include `reassignment_reason` in the structured result: `lease_conflict` when a live lease caused the reassignment, or `os_occupied` when an unregistered process had the requested port bound.
 - **`who(port)`** — same semantics as `portzilla who`.
 - **`ls()`** — same semantics as `portzilla ls`, no arguments.
 - **`release(port)`** — same semantics as `portzilla release`, including the still-alive warning (surfaced as a `was_alive` field on the result instead of a stderr line).
@@ -117,6 +169,12 @@ The MCP server reads and writes the exact same locked `leases.json` the CLI does
 2. `$XDG_DATA_HOME/portzilla`.
 3. `$HOME/.local/share/portzilla`.
 
-The state lives at `<data_dir>/leases.json`, a pretty-printed JSON array of lease objects, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation.
+The state lives at `<data_dir>/leases.json`, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation. New writes use this envelope:
+
+```json
+{"format_version":2,"leases":[{"port":3001,"pid":57108,"tag":"vite-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"process_identity_verified":true}]}
+```
+
+Legacy bare arrays remain readable and are upgraded when the new binary writes. Unknown or future format versions are refused without modifying the file. Do not point an older portzilla binary at a v2 state file: it does not understand the envelope and must be upgraded first. This guard prevents an older writer from dropping process identity fields.
 
 Set `PORTZILLA_DATA_DIR` to isolate tests, CI runs, or throwaway experiments from your real lease store.

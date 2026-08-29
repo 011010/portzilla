@@ -2,7 +2,7 @@
 
 ## Status
 
-Version 0.1.0 implemented (`claim`, `ls`, `who`, `release`, `prune`). This document describes the product as a whole, including work not yet built — see [`ROADMAP.md`](ROADMAP.md) for what is implemented versus planned.
+Version 0.2.0 release preparation. The implemented feature set includes the local lease registry (`claim`, `ls`, `who`, `release`, `prune`, `watch`), JSON and locked state, the MCP server, the kill guard with Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, and Windsurf adapters, and the universal `guard` wrapper. This document describes the product as a whole, including work not yet built — see [`ROADMAP.md`](ROADMAP.md) for what is implemented versus planned.
 
 ## Problem statement
 

@@ -18,6 +18,8 @@ pub struct LeaseView {
     pub tag: String,
     pub created_at: u64,
     pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
     pub age_secs: u64,
     pub alive: bool,
 }
@@ -32,6 +34,7 @@ pub fn to_view(lease: &Lease, checker: &dyn PidChecker) -> LeaseView {
         tag: lease.tag.clone(),
         created_at: lease.created_at,
         session: lease.session.clone(),
+        process_start_time: lease.process_start_time,
         age_secs: now.saturating_sub(lease.created_at),
         alive: lease.is_alive(checker),
     }
@@ -45,8 +48,12 @@ pub struct ClaimView {
     pub tag: String,
     pub created_at: u64,
     pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
     pub requested_port: u16,
     pub reassigned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reassignment_reason: Option<crate::store::ReassignmentReason>,
 }
 
 /// Builds a [`ClaimView`] for `outcome`, given the port that was originally
@@ -58,8 +65,10 @@ pub fn to_claim_view(outcome: &ClaimOutcome, requested_port: u16) -> ClaimView {
         tag: outcome.lease.tag.clone(),
         created_at: outcome.lease.created_at,
         session: outcome.lease.session.clone(),
+        process_start_time: outcome.lease.process_start_time,
         requested_port,
         reassigned: outcome.reassigned,
+        reassignment_reason: outcome.reassignment_reason,
     }
 }
 
@@ -110,16 +119,33 @@ mod tests {
     }
 
     #[test]
+    fn to_view_exposes_process_start_time_when_recorded() {
+        let lease = Lease::new_with_process_start_time(3000, 100, "server", None, Some(123));
+        let view = to_view(&lease, &AlwaysAlive);
+
+        assert_eq!(view.process_start_time, Some(123));
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["process_start_time"],
+            123
+        );
+    }
+
+    #[test]
     fn to_claim_view_reports_the_requested_port_and_reassignment_flag() {
         let outcome = ClaimOutcome {
             lease: Lease::new(3001, 100, "server", None),
             reassigned: true,
+            reassignment_reason: Some(crate::store::ReassignmentReason::LeaseConflict),
         };
 
         let view = to_claim_view(&outcome, 3000);
         assert_eq!(view.requested_port, 3000);
         assert_eq!(view.port, 3001);
         assert!(view.reassigned);
+        assert_eq!(
+            view.reassignment_reason,
+            Some(crate::store::ReassignmentReason::LeaseConflict)
+        );
     }
 
     #[test]
@@ -127,6 +153,7 @@ mod tests {
         let outcome = ClaimOutcome {
             lease: Lease::new(3000, 100, "server", None),
             reassigned: false,
+            reassignment_reason: None,
         };
         let view = to_claim_view(&outcome, 3000);
 
@@ -145,5 +172,21 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn to_claim_view_exposes_process_start_time_when_recorded() {
+        let outcome = ClaimOutcome {
+            lease: Lease::new_with_process_start_time(3000, 100, "server", None, Some(123)),
+            reassigned: false,
+            reassignment_reason: None,
+        };
+        let view = to_claim_view(&outcome, 3000);
+
+        assert_eq!(view.process_start_time, Some(123));
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["process_start_time"],
+            123
+        );
     }
 }

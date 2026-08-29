@@ -1,6 +1,6 @@
 {
   "name": "portzilla",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Port and process lease coordinator for parallel AI coding-agent sessions",
   "license": "MIT",
   "homepage": "https://github.com/011010/portzilla",

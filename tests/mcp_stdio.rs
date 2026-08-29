@@ -7,8 +7,23 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
+    for _ in 0..100 {
+        let requested = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = requested.local_addr().unwrap().port();
+        if let Some(successor) = base
+            .checked_add(1)
+            .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        {
+            return (requested, successor, base);
+        }
+    }
+    panic!("could not reserve adjacent test ports");
+}
 
 struct McpSession {
     // `stdin` is dropped first (struct fields drop in declaration order),
@@ -165,9 +180,12 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
         "claim tool description must be visible over the real wire protocol"
     );
 
+    let (listener, successor, port) = reserve_adjacent_ports();
+    drop(listener);
+    drop(successor);
     let claim_response = session.call_tool(
         "claim",
-        json!({"port": 9600, "tag": "wire-test", "pid": 42}),
+        json!({"port": port, "tag": "wire-test", "pid": 42}),
     );
     assert!(
         claim_response.get("error").is_none(),
@@ -175,14 +193,41 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
     );
     let claim_result = &claim_response["result"];
     assert_eq!(claim_result["isError"], false);
-    assert_eq!(claim_result["structuredContent"]["port"], 9600);
+    let structured = &claim_result["structuredContent"];
+    let requested_port = structured["requested_port"]
+        .as_u64()
+        .expect("claim must return requested_port as a number");
+    assert_eq!(requested_port, u64::from(port));
+    assert!(
+        (1..=u64::from(u16::MAX)).contains(&requested_port),
+        "claim must return a valid requested port"
+    );
+    let returned_port = structured["port"]
+        .as_u64()
+        .expect("claim must return port as a number");
+    assert!(
+        (1..=u64::from(u16::MAX)).contains(&returned_port),
+        "claim must return a valid port"
+    );
+    assert!(
+        returned_port >= requested_port,
+        "claim must return the requested port or a forward reassignment"
+    );
     assert_eq!(claim_result["structuredContent"]["pid"], 42);
-    assert_eq!(claim_result["structuredContent"]["reassigned"], false);
+
+    // The claim may be reassigned if another process wins the race after the
+    // reservation listeners above are dropped. Query a different dynamic port
+    // so the not-found assertion remains about the wire-level tool result.
+    let not_found_port = if returned_port < u64::from(u16::MAX) {
+        returned_port + 1
+    } else {
+        returned_port - 1
+    };
 
     // A missing lease must come back as a JSON-RPC *success* envelope whose
     // tool result is flagged `isError: true` — a tool-level error, not a
     // protocol-level one. Confirmed here at the actual wire level.
-    let who_response = session.call_tool("who", json!({"port": 9601}));
+    let who_response = session.call_tool("who", json!({"port": not_found_port}));
     assert!(
         who_response.get("error").is_none(),
         "not-found must not be a protocol error: {who_response}"
@@ -190,7 +235,60 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
     let who_result = &who_response["result"];
     assert_eq!(who_result["isError"], true);
     assert_eq!(who_result["structuredContent"]["error"], "not_found");
-    assert_eq!(who_result["structuredContent"]["port"], 9601);
+    assert_eq!(who_result["structuredContent"]["port"], not_found_port);
+}
+
+#[test]
+#[cfg(unix)]
+fn claim_reassignment_reason_is_exposed_over_real_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = McpSession::start(dir.path());
+    session.initialize();
+
+    let (listener, successor, port) = reserve_adjacent_ports();
+    drop(listener);
+    let own_pid = std::process::id();
+    let parent_pid = std::os::unix::process::parent_id();
+
+    let first = session.call_tool(
+        "claim",
+        json!({"port": port, "tag": "first", "pid": own_pid}),
+    );
+    assert_eq!(first["result"]["structuredContent"]["reassigned"], false);
+
+    let second = session.call_tool(
+        "claim",
+        json!({"port": port, "tag": "second", "pid": parent_pid}),
+    );
+    assert_eq!(second["result"]["structuredContent"]["reassigned"], true);
+    assert_eq!(
+        second["result"]["structuredContent"]["reassignment_reason"],
+        "lease_conflict"
+    );
+    drop(successor);
+}
+
+#[test]
+fn os_occupied_reassignment_reason_is_exposed_over_real_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = McpSession::start(dir.path());
+    session.initialize();
+
+    let (listener, successor, port) = reserve_adjacent_ports();
+    let response = session.call_tool(
+        "claim",
+        json!({"port": port, "tag": "os-occupied", "pid": 42}),
+    );
+
+    let structured = &response["result"]["structuredContent"];
+    assert!(
+        structured["port"].as_u64().unwrap() > u64::from(port),
+        "occupied port must be reassigned forward"
+    );
+    assert_eq!(structured["reassigned"], true);
+    assert_eq!(structured["reassignment_reason"], "os_occupied");
+    drop(successor);
+    drop(listener);
 }
 
 /// A store failure (corrupt state file) must surface as a real JSON-RPC

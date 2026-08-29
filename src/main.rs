@@ -4,12 +4,14 @@ mod cursor;
 mod gemini;
 mod guard;
 mod guard_cmd;
+mod hook_common;
 mod kimi;
 mod lease;
 mod mcp;
 mod opencode;
 mod store;
 mod view;
+mod watch;
 mod windsurf;
 
 use anyhow::{Context, Result};
@@ -121,6 +123,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Periodically remove leases whose owning processes have exited.
+    Watch {
+        /// Seconds between lease-pruning cycles (default: 60).
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = watch::DEFAULT_INTERVAL_SECS,
+            value_parser = watch::parse_interval_secs
+        )]
+        interval: u64,
+        /// Print machine-readable JSON cycle events.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run portzilla as a long-lived server process.
     Serve {
         /// Run the MCP (Model Context Protocol) server over stdio, exposing
@@ -163,38 +179,42 @@ enum Commands {
 enum HookHarness {
     /// Run as a Claude Code `PreToolUse` hook: reads the hook payload JSON
     /// from stdin, evaluates any Bash command against the lease registry,
-    /// and writes the hook response JSON to stdout. Never blocks or fails
-    /// the tool call because of a portzilla-side error (fails open).
+    /// and writes the hook response JSON to stdout. By default, portzilla-side
+    /// errors fail open; `PORTZILLA_FAIL_CLOSED=1` enables fail-closed behavior
+    /// using Claude Code's hook contract.
     ClaudeCode,
     /// Run as a Cursor `beforeShellExecution` hook: reads the hook payload
     /// JSON from stdin, evaluates the command against the lease registry,
-    /// and writes the hook response JSON to stdout. Never blocks or fails
-    /// the command because of a portzilla-side error (fails open).
+    /// and writes the hook response JSON to stdout. By default, portzilla-side
+    /// errors fail open; `PORTZILLA_FAIL_CLOSED=1` enables fail-closed behavior
+    /// using Cursor's hook contract.
     Cursor,
     /// Run as a Gemini CLI `BeforeTool` hook (scoped to the
     /// `run_shell_command` tool): reads the hook payload JSON from stdin
-    /// and writes the hook response JSON to stdout. Never blocks or fails
-    /// the tool call because of a portzilla-side error (fails open).
+    /// and writes the hook response JSON to stdout. By default, portzilla-side
+    /// errors fail open; `PORTZILLA_FAIL_CLOSED=1` enables fail-closed behavior
+    /// using Gemini CLI's hook contract.
     Gemini,
     /// Run as a Codex CLI `PreToolUse` hook (scoped to the `Bash` tool):
     /// reads the hook payload JSON from stdin, evaluates the command
     /// against the lease registry, and writes the hook response JSON to
-    /// stdout. Never blocks or fails the tool call because of a
-    /// portzilla-side error (fails open).
+    /// stdout. By default, portzilla-side errors fail open;
+    /// `PORTZILLA_FAIL_CLOSED=1` enables fail-closed behavior using Codex's
+    /// hook contract.
     Codex,
     /// Run as a Kimi CLI `PreToolUse` hook (scoped to the `Shell` tool):
     /// reads the hook payload JSON from stdin, evaluates the command
     /// against the lease registry, and signals the verdict through Kimi's
-    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). Never
-    /// blocks the tool call because of a portzilla-side error (fails
-    /// open — always exit 0 in that case).
+    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). By default,
+    /// portzilla-side errors fail open; `PORTZILLA_FAIL_CLOSED=1` enables
+    /// fail-closed behavior using Kimi's exit-code contract.
     Kimi,
     /// Run as a Windsurf (Cascade) `pre_run_command` hook: reads the hook
     /// payload JSON from stdin, evaluates `tool_info.command_line` against
     /// the lease registry, and signals the verdict through Windsurf's
-    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). Never
-    /// blocks the command because of a portzilla-side error (fails open —
-    /// always exit 0 in that case).
+    /// exit-code contract (exit 2 + stderr blocks, exit 0 allows). By default,
+    /// portzilla-side errors fail open; `PORTZILLA_FAIL_CLOSED=1` enables
+    /// fail-closed behavior using Windsurf's exit-code contract.
     #[command(name = "windsurf")]
     Windsurf,
     /// Run the binary side of OpenCode's kill-guard: called by the
@@ -202,7 +222,9 @@ enum HookHarness {
     /// reads the shim's verdict-request JSON from stdin, evaluates the
     /// command against the lease registry, and writes the verdict JSON to
     /// stdout. Always exits 0 — the verdict is the JSON, never the exit
-    /// code. Never denies because of a portzilla-side error (fails open).
+    /// code. By default, portzilla-side errors produce an allow verdict;
+    /// `PORTZILLA_FAIL_CLOSED=1` produces a deny verdict using OpenCode's
+    /// action JSON protocol.
     #[command(name = "opencode")]
     OpenCode,
 }
@@ -285,6 +307,19 @@ fn run() -> Result<(), RunError> {
             let runtime = tokio::runtime::Runtime::new()
                 .context("failed to start the async runtime for the MCP server")?;
             runtime.block_on(mcp::run_stdio())?;
+        }
+
+        Commands::Watch { interval, json } => {
+            // Validate the data directory before entering the retrying loop:
+            // a startup failure is a normal command error, not a cycle error.
+            Store::open(None).context("failed to open store for watch")?;
+            let runtime = tokio::runtime::Runtime::new()
+                .context("failed to start the async runtime for the watch command")?;
+            let result = runtime.block_on(watch::run_loop(None, interval, json));
+            // A running spawn_blocking closure cannot be aborted. Do not wait
+            // indefinitely for it after Ctrl-C; the process owns its lifetime.
+            runtime.shutdown_timeout(std::time::Duration::ZERO);
+            result?;
         }
 
         // Pure output, no store needed.
@@ -1164,7 +1199,7 @@ fn default_pid() -> u32 {
 /// claim forge fake table rows or terminal control sequences in `ls`/`who`/
 /// `release`/`prune` output. JSON output is unaffected (JSON already escapes
 /// control characters) and is not passed through this function.
-fn sanitize_for_display(s: &str) -> String {
+pub(crate) fn sanitize_for_display(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -1178,8 +1213,13 @@ fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) 
             serde_json::to_string(&view).expect("ClaimView always serializes")
         );
     } else if outcome.reassigned {
+        let cause = match outcome.reassignment_reason {
+            Some(store::ReassignmentReason::LeaseConflict) => "lease conflict",
+            Some(store::ReassignmentReason::OsOccupied) => "OS occupied",
+            None => "port conflict",
+        };
         println!(
-            "port {requested_port} is busy; claimed port {} instead for pid {} (tag: {})",
+            "port {requested_port} is busy ({cause}); claimed port {} instead for pid {} (tag: {})",
             outcome.lease.port,
             outcome.lease.pid,
             sanitize_for_display(&outcome.lease.tag)

@@ -1,9 +1,11 @@
 //! Windsurf (Cascade) adapter for the kill-guard.
 //!
-//! Translates a Windsurf `pre_run_command` hook payload into a call to the
-//! harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the exit-code contract Windsurf
-//! expects. Thin by design — see `src/guard.rs`'s module doc for why.
+//! Owns parsing of Windsurf's `pre_run_command` hook payload and rendering of
+//! the resulting [`crate::guard::Verdict`] into the exit-code contract
+//! Windsurf expects. `hook_common::evaluate` delegates normalized command
+//! evaluation to the harness-agnostic guard core; payload parsing and wire
+//! rendering stay local to this adapter. Thin by design — see `src/guard.rs`'s
+//! module doc for why.
 //!
 //! Schema verified against the current Cascade Hooks documentation
 //! (<https://docs.windsurf.com/windsurf/cascade/hooks>, now De
@@ -57,7 +59,8 @@
 //! flips from "allow + note" to exit 2 with the reason on stderr (Windsurf's
 //! own block channel) instead.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::Deserialize;
 
@@ -140,13 +143,14 @@ pub fn handle(raw_input: &str, leases: &[Lease], checker: &dyn PidChecker) -> Ho
 
 /// Handles one `pre_run_command` hook invocation: parses `raw_input`, and
 /// if it's a [`PRE_RUN_COMMAND_EVENT`], runs `tool_info.command_line`
-/// through [`guard::check`] against `leases`.
+/// through the shared guard evaluation path against `leases`.
 ///
-/// `self_pid` is always `None` when calling into `guard`: the hook fires
-/// *before* the command runs, so there is no process yet whose PID this
-/// adapter could pass as "the process about to run this." Ownership
-/// therefore resolves entirely through `self_session` — see the module doc
-/// comment for why that only ever protects against foreign kills today.
+/// The adapter passes `self_pid` through `hook_common::evaluate`, which
+/// delegates to the guard core. It is always `None`: the hook fires *before*
+/// the command runs, so there is no process yet whose PID this adapter could
+/// pass as "the process about to run this." Ownership therefore resolves
+/// entirely through `self_session` — see the module doc comment for why that
+/// only ever protects against foreign kills today.
 ///
 /// When `fail_closed` is `true`, every portzilla-side failure (unparseable
 /// JSON, missing command, …) returns exit 2 with the reason on stderr
@@ -194,7 +198,12 @@ pub fn handle_with_policy(
         );
     };
 
-    match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookOutcome::allow_silent(),
         Verdict::Deny { explanation, .. } => HookOutcome::deny_with_reason(explanation),
         Verdict::Warn { explanation } => {

@@ -2,6 +2,7 @@
 
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,13 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 const DATA_DIR_ENV_VAR: &str = "PORTZILLA_DATA_DIR";
 const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 const HOME_ENV_VAR: &str = "HOME";
+const STATE_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VersionedState {
+    format_version: u32,
+    leases: Vec<Lease>,
+}
 
 /// Maximum allowed length of a lease `tag`, in CHARACTERS (not bytes).
 /// Tags are arbitrary caller-supplied text persisted to `leases.json` and
@@ -82,10 +90,18 @@ pub(crate) fn validate_claim_inputs(port: u16, tag: &str, session: Option<&str>)
 
 /// Result of a `claim` operation: the lease that was actually created/updated,
 /// and whether it landed on a different port than the one requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReassignmentReason {
+    LeaseConflict,
+    OsOccupied,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimOutcome {
     pub lease: Lease,
     pub reassigned: bool,
+    pub reassignment_reason: Option<ReassignmentReason>,
 }
 
 /// Result of a `release` operation: the lease that was removed, and whether
@@ -272,12 +288,54 @@ impl Store {
         if bytes.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(Vec::new());
         }
-        serde_json::from_slice(&bytes).with_context(|| {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
             format!(
                 "state file at {} contains invalid JSON and was not modified",
                 path.display()
             )
-        })
+        })?;
+
+        match value {
+            serde_json::Value::Array(_) => {
+                let leases: Vec<Lease> = serde_json::from_value(value).with_context(|| {
+                    format!(
+                        "state file at {} contains invalid legacy lease data and was not modified",
+                        path.display()
+                    )
+                })?;
+                validate_unique_ports(&leases, &path)?;
+                Ok(leases)
+            }
+            serde_json::Value::Object(ref object) => {
+                let version = object
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "state file at {} is an object without a numeric format_version and was not modified",
+                            path.display()
+                        )
+                    })?;
+                if version != STATE_FORMAT_VERSION as u64 {
+                    bail!(
+                        "unsupported state file format version {version} at {}; upgrade portzilla before using this state file",
+                        path.display()
+                    );
+                }
+                let state: VersionedState = serde_json::from_value(value).with_context(|| {
+                    format!(
+                        "state file at {} contains invalid versioned lease data and was not modified",
+                        path.display()
+                    )
+                })?;
+                validate_unique_ports(&state.leases, &path)?;
+                Ok(state.leases)
+            }
+            _ => bail!(
+                "state file at {} must be a legacy lease array or a versioned object and was not modified",
+                path.display()
+            ),
+        }
     }
 
     fn write_leases(&self, leases: &[Lease]) -> Result<()> {
@@ -285,8 +343,11 @@ impl Store {
         let tmp_path = self
             .data_dir
             .join(format!(".leases.json.tmp.{}", std::process::id()));
-        let json =
-            serde_json::to_vec_pretty(leases).context("failed to serialize leases to JSON")?;
+        let json = serde_json::to_vec_pretty(&VersionedState {
+            format_version: STATE_FORMAT_VERSION,
+            leases: leases.to_vec(),
+        })
+        .context("failed to serialize leases to JSON")?;
         fs::write(&tmp_path, json).with_context(|| {
             format!(
                 "failed to write temporary state file at {}",
@@ -343,35 +404,47 @@ pub(crate) fn claim_in_place(
     session: Option<String>,
     checker: &dyn PidChecker,
 ) -> Result<ClaimOutcome> {
+    let process_start_time = checker.process_start_time(pid);
     let existing_index = leases.iter().position(|l| l.port == requested_port);
 
     match existing_index {
         None => {
-            let lease = Lease::new(requested_port, pid, tag, session);
+            let (port, reassignment_reason) =
+                resolve_claim_port(requested_port, leases, checker, false)?;
+            let lease =
+                Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
             Ok(ClaimOutcome {
                 lease,
-                reassigned: false,
+                reassigned: port != requested_port,
+                reassignment_reason,
             })
         }
-        Some(index) if leases[index].pid == pid => {
-            let lease = Lease::new(requested_port, pid, tag, session);
+        Some(index) if leases[index].pid == pid && leases[index].is_alive(checker) => {
+            let lease = Lease::new_with_process_start_time(
+                requested_port,
+                pid,
+                tag,
+                session,
+                process_start_time,
+            );
             upsert_lease(leases, lease.clone());
             Ok(ClaimOutcome {
                 lease,
                 reassigned: false,
+                reassignment_reason: None,
             })
         }
         Some(index) if leases[index].is_alive(checker) => {
-            let next_port = find_next_available_port(
-                requested_port
-                    .checked_add(1)
-                    .context("no available port: requested port is already at the maximum")?,
-                leases,
-                checker,
-            )
-            .context("no available port found while resolving a port conflict")?;
-            let lease = Lease::new(next_port, pid, tag, session);
+            let (next_port, reassignment_reason) =
+                resolve_claim_port(requested_port, leases, checker, true)?;
+            let lease = Lease::new_with_process_start_time(
+                next_port,
+                pid,
+                tag,
+                session,
+                process_start_time,
+            );
             // `next_port` may carry a stale (dead) lease that made it look
             // "available" to find_next_available_port: upsert, don't push
             // blindly, or the dead entry and the new one both survive on the
@@ -380,18 +453,73 @@ pub(crate) fn claim_in_place(
             Ok(ClaimOutcome {
                 lease,
                 reassigned: true,
+                reassignment_reason,
             })
         }
         Some(_) => {
             // Dead lease on the requested port: prune it and take over the port.
-            let lease = Lease::new(requested_port, pid, tag, session);
+            let (port, reassignment_reason) =
+                resolve_claim_port(requested_port, leases, checker, false)?;
+            if port != requested_port {
+                // The requested port is occupied by an unregistered process,
+                // so the dead declaration can no longer be reused. Remove it
+                // rather than leaving stale ownership behind.
+                leases.retain(|lease| lease.port != requested_port);
+            }
+            let lease =
+                Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
             Ok(ClaimOutcome {
                 lease,
-                reassigned: false,
+                reassigned: port != requested_port,
+                reassignment_reason,
             })
         }
     }
+}
+
+fn resolve_claim_port(
+    requested_port: u16,
+    leases: &[Lease],
+    checker: &dyn PidChecker,
+    lease_conflict: bool,
+) -> Result<(u16, Option<ReassignmentReason>)> {
+    if !lease_conflict && is_os_port_free(requested_port) {
+        return Ok((requested_port, None));
+    }
+
+    let next_port = find_next_available_port(
+        requested_port
+            .checked_add(1)
+            .context("no available port: requested port is already at the maximum")?,
+        leases,
+        checker,
+    )
+    .context(if lease_conflict {
+        "no available port found while resolving a port conflict"
+    } else {
+        "no available port found while resolving an OS port conflict"
+    })?;
+    let reason = if lease_conflict {
+        ReassignmentReason::LeaseConflict
+    } else {
+        ReassignmentReason::OsOccupied
+    };
+    Ok((next_port, Some(reason)))
+}
+
+fn validate_unique_ports(leases: &[Lease], path: &Path) -> Result<()> {
+    let mut ports = std::collections::HashSet::with_capacity(leases.len());
+    for lease in leases {
+        if !ports.insert(lease.port) {
+            bail!(
+                "state file at {} contains duplicate lease port {} and was not modified",
+                path.display(),
+                lease.port
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inserts or replaces the lease for `lease.port` in `leases`, so a given
@@ -423,9 +551,32 @@ pub(crate) fn find_next_available_port(
     }
 }
 
-/// Probes whether a port is currently free by attempting to bind it.
+/// Probes whether a port is currently free by attempting to bind local
+/// wildcard and loopback addresses in both families. Some platforms allow a
+/// wildcard bind alongside a loopback-only listener, so both are needed for
+/// reliable localhost coordination. IPv6 is optional on some platforms, so
+/// unavailable IPv6 addresses are treated as unprobeable rather than occupied.
 pub(crate) fn is_os_port_free(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_ok()
+    if TcpListener::bind(("0.0.0.0", port)).is_err()
+        || TcpListener::bind(("127.0.0.1", port)).is_err()
+    {
+        return false;
+    }
+
+    ["::", "::1"]
+        .into_iter()
+        .all(|address| match TcpListener::bind((address, port)) {
+            Ok(_) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                true
+            }
+            Err(_) => false,
+        })
 }
 
 /// Removes the lease on `port` from `leases`, if any, and reports whether
@@ -459,12 +610,39 @@ pub(crate) fn prune_in_place(leases: &mut Vec<Lease>, checker: &dyn PidChecker) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::test_support::{AlivePids, AlwaysAlive, AlwaysDead};
+    use crate::lease::{
+        SystemPidChecker,
+        test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
+    };
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
+
+    fn unused_test_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn unused_adjacent_test_ports() -> (u16, u16) {
+        for _ in 0..100 {
+            let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let base = first.local_addr().unwrap().port();
+            if let Some(second) = base
+                .checked_add(1)
+                .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            {
+                drop(second);
+                drop(first);
+                return (base, base + 1);
+            }
+        }
+        panic!("could not select adjacent test ports");
+    }
 
     // ---- resolve_data_dir ----
 
@@ -541,16 +719,204 @@ mod tests {
     #[test]
     fn claim_persists_and_is_visible_from_a_new_store_instance() {
         let dir = tempfile::tempdir().unwrap();
+        let port = unused_test_port();
         let store_a = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        store_a
-            .claim(4000, 111, "svc".to_string(), None, &AlwaysAlive)
+        let outcome = store_a
+            .claim(port, 111, "svc".to_string(), None, &AlwaysAlive)
             .unwrap();
 
         let store_b = Store::open(Some(dir.path().to_path_buf())).unwrap();
         let leases = store_b.list().unwrap();
         assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].port, 4000);
+        assert_eq!(leases[0].port, outcome.lease.port);
         assert_eq!(leases[0].pid, 111);
+    }
+
+    #[test]
+    fn state_file_writes_a_versioned_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = unused_test_port();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .claim(port, 111, "svc".to_string(), None, &AlwaysAlive)
+            .unwrap();
+
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.state_file_path()).unwrap())
+                .unwrap();
+        assert_eq!(state["format_version"], 2);
+        assert_eq!(state["leases"][0]["port"], port);
+    }
+
+    #[test]
+    fn unknown_state_format_is_rejected_without_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"{"format_version":99,"leases":[]}"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+
+        let error = store.list().unwrap_err().to_string();
+        assert!(error.contains("unsupported state file format version 99"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_ports_in_a_versioned_state_file_are_rejected_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"{"format_version":2,"leases":[{"port":32001,"pid":101,"tag":"one","created_at":1,"session":null},{"port":32001,"pid":102,"tag":"two","created_at":1,"session":null}]}"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+
+        let error = store.list().unwrap_err().to_string();
+        assert!(error.contains("duplicate lease port 32001"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_ports_in_a_legacy_state_file_are_rejected_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"[{"port":32002,"pid":101,"tag":"one","created_at":1,"session":null},{"port":32002,"pid":102,"tag":"two","created_at":1,"session":null}]"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+
+        let error = store.list().unwrap_err().to_string();
+        assert!(error.contains("duplicate lease port 32002"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn verified_identity_persists_and_remains_alive_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = ProcessIdentity {
+            pid: 100,
+            start_time: Some(123),
+        };
+        let port = unused_test_port();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .claim(port, checker.pid, "svc".to_string(), None, &checker)
+            .unwrap();
+
+        let reloaded = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = reloaded.list().unwrap().pop().unwrap();
+        assert_eq!(lease.process_start_time, Some(123));
+        assert!(lease.is_alive(&checker));
+        assert!(
+            std::fs::read_to_string(reloaded.state_file_path())
+                .unwrap()
+                .contains("process_identity_verified")
+        );
+    }
+
+    #[test]
+    fn unresolved_identity_persists_as_unverified_and_is_not_alive_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = unused_test_port();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .claim(port, 100, "svc".to_string(), None, &AliveWithoutIdentity)
+            .unwrap();
+
+        let reloaded = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = reloaded.list().unwrap().pop().unwrap();
+        assert_eq!(lease.process_start_time, None);
+        assert!(!lease.is_alive(&AliveWithoutIdentity));
+        assert!(
+            std::fs::read_to_string(reloaded.state_file_path())
+                .unwrap()
+                .contains("process_identity_verified")
+        );
+    }
+
+    #[test]
+    fn nonexistent_pid_claim_is_persisted_as_unverified_and_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = unused_test_port();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+
+        let outcome = store
+            .claim(
+                port,
+                4_000_000_000,
+                "pre-start".to_string(),
+                None,
+                &SystemPidChecker,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.lease.process_start_time, None);
+        assert!(!outcome.lease.is_alive(&SystemPidChecker));
+        let persisted = store.list().unwrap().pop().unwrap();
+        assert_eq!(persisted.process_start_time, None);
+        assert!(!persisted.is_alive(&SystemPidChecker));
+    }
+
+    #[test]
+    fn dead_requested_lease_is_removed_when_its_port_is_os_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested_port = unused_test_port();
+        let listener = TcpListener::bind(("127.0.0.1", requested_port)).unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .write_leases(&[Lease::new(requested_port, 4_000_000_000, "stale", None)])
+            .unwrap();
+
+        let outcome = store
+            .claim(
+                requested_port,
+                4_000_000_001,
+                "replacement".to_string(),
+                None,
+                &AlwaysDead,
+            )
+            .unwrap();
+        drop(listener);
+
+        assert!(outcome.reassigned);
+        let leases = store.list().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].port, outcome.lease.port);
+        assert_ne!(leases[0].port, requested_port);
+        assert_eq!(leases[0].pid, 4_000_000_001);
+    }
+
+    #[test]
+    fn legacy_lease_keeps_pid_only_liveness_after_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(
+            store.state_file_path(),
+            r#"[{"port":4000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#,
+        )
+        .unwrap();
+
+        assert!(store.list().unwrap()[0].is_alive(&AlwaysAlive));
+        store
+            .claim(
+                4001,
+                101,
+                "new".to_string(),
+                None,
+                &ProcessIdentity {
+                    pid: 101,
+                    start_time: Some(456),
+                },
+            )
+            .unwrap();
+
+        let reloaded = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let leases = reloaded.list().unwrap();
+        let legacy = leases.iter().find(|lease| lease.port == 4000).unwrap();
+        assert!(legacy.is_alive(&AlwaysAlive));
+        assert!(
+            !std::fs::read_to_string(reloaded.state_file_path())
+                .unwrap()
+                .contains(r#""process_identity_verified":null"#)
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(reloaded.state_file_path()).unwrap())
+                .unwrap();
+        assert_eq!(state["format_version"], STATE_FORMAT_VERSION);
     }
 
     #[test]
@@ -594,8 +960,60 @@ mod tests {
     // ---- is_os_port_free ----
 
     #[test]
-    fn is_os_port_free_reports_bound_port_as_taken() {
+    fn is_os_port_free_reports_ipv4_loopback_listener_as_taken() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!is_os_port_free(port));
+        drop(listener);
+        assert!(is_os_port_free(port));
+    }
+
+    #[test]
+    fn is_os_port_free_reports_ipv4_wildcard_listener_as_taken() {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!is_os_port_free(port));
+        drop(listener);
+        assert!(is_os_port_free(port));
+    }
+
+    #[test]
+    fn is_os_port_free_reports_ipv6_wildcard_listener_as_taken() {
+        let listener = match std::net::TcpListener::bind(("::", 0)) {
+            Ok(listener) => listener,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind IPv6 wildcard test listener: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!is_os_port_free(port));
+        drop(listener);
+        assert!(is_os_port_free(port));
+    }
+
+    #[test]
+    fn is_os_port_free_reports_ipv6_loopback_listener_as_taken() {
+        let listener = match std::net::TcpListener::bind(("::1", 0)) {
+            Ok(listener) => listener,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind IPv6 loopback test listener: {error}"),
+        };
         let port = listener.local_addr().unwrap().port();
 
         assert!(!is_os_port_free(port));
@@ -658,9 +1076,10 @@ mod tests {
     #[test]
     fn claim_free_port_creates_a_lease() {
         let mut leases = vec![];
+        let port = unused_test_port();
         let outcome = claim_in_place(
             &mut leases,
-            3000,
+            port,
             100,
             "server".to_string(),
             None,
@@ -669,17 +1088,101 @@ mod tests {
         .unwrap();
 
         assert!(!outcome.reassigned);
-        assert_eq!(outcome.lease.port, 3000);
+        assert_eq!(outcome.lease.port, port);
         assert_eq!(outcome.lease.pid, 100);
         assert_eq!(leases.len(), 1);
     }
 
     #[test]
-    fn claim_replaces_a_dead_lease_on_the_same_port() {
-        let mut leases = vec![Lease::new(3000, 999, "stale-owner", None)];
+    fn claim_os_occupied_port_reassigns_and_reports_os_occupancy() {
+        let base = unused_test_port();
+        let listener = TcpListener::bind(("127.0.0.1", base)).unwrap();
+        let mut leases = vec![];
+
         let outcome = claim_in_place(
             &mut leases,
-            3000,
+            base,
+            100,
+            "server".to_string(),
+            None,
+            &AlwaysAlive,
+        )
+        .unwrap();
+
+        drop(listener);
+
+        assert!(outcome.reassigned);
+        assert_eq!(
+            outcome.reassignment_reason,
+            Some(ReassignmentReason::OsOccupied)
+        );
+        assert!(outcome.lease.port > base);
+    }
+
+    #[test]
+    fn claim_live_lease_conflict_reports_lease_conflict() {
+        let base: u16 = 25100;
+        let mut leases = vec![Lease::new(base, 999, "other-owner", None)];
+        let outcome = claim_in_place(
+            &mut leases,
+            base,
+            100,
+            "server".to_string(),
+            None,
+            &AlivePids(vec![999]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.reassignment_reason,
+            Some(ReassignmentReason::LeaseConflict)
+        );
+    }
+
+    #[test]
+    fn claim_records_the_target_process_identity() {
+        let mut leases = vec![];
+        let port = unused_test_port();
+        let outcome = claim_in_place(
+            &mut leases,
+            port,
+            100,
+            "server".to_string(),
+            None,
+            &ProcessIdentity {
+                pid: 100,
+                start_time: Some(123),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.lease.process_start_time, Some(123));
+    }
+
+    #[test]
+    fn claim_without_resolved_process_identity_is_not_alive() {
+        let mut leases = vec![];
+        let port = unused_test_port();
+        let outcome = claim_in_place(
+            &mut leases,
+            port,
+            100,
+            "server".to_string(),
+            None,
+            &AliveWithoutIdentity,
+        )
+        .unwrap();
+
+        assert!(!outcome.lease.is_alive(&AliveWithoutIdentity));
+    }
+
+    #[test]
+    fn claim_replaces_a_dead_lease_on_the_same_port() {
+        let port = unused_test_port();
+        let mut leases = vec![Lease::new(port, 999, "stale-owner", None)];
+        let outcome = claim_in_place(
+            &mut leases,
+            port,
             100,
             "server".to_string(),
             None,
@@ -688,7 +1191,7 @@ mod tests {
         .unwrap();
 
         assert!(!outcome.reassigned);
-        assert_eq!(outcome.lease.port, 3000);
+        assert_eq!(outcome.lease.port, port);
         assert_eq!(outcome.lease.pid, 100);
         assert_eq!(
             leases.len(),
@@ -708,7 +1211,7 @@ mod tests {
             claim_in_place(&mut leases, base, 100, "server".to_string(), None, &checker).unwrap();
 
         assert!(outcome.reassigned);
-        assert_eq!(outcome.lease.port, base + 1);
+        assert!(outcome.lease.port > base);
         assert_eq!(outcome.lease.pid, 100);
         // Original lease on the requested port is left untouched for its live owner.
         assert!(leases.iter().any(|l| l.port == base && l.pid == 999));
@@ -735,13 +1238,42 @@ mod tests {
     }
 
     #[test]
+    fn claim_with_recycled_pid_replaces_stale_same_pid_lease() {
+        let port = unused_test_port();
+        let mut leases = vec![Lease::new_with_process_start_time(
+            port,
+            100,
+            "old-server",
+            None,
+            Some(123),
+        )];
+        let outcome = claim_in_place(
+            &mut leases,
+            port,
+            100,
+            "new-server".to_string(),
+            None,
+            &ProcessIdentity {
+                pid: 100,
+                start_time: Some(456),
+            },
+        )
+        .unwrap();
+
+        assert!(!outcome.reassigned);
+        assert_eq!(outcome.lease.tag, "new-server");
+        assert_eq!(outcome.lease.process_start_time, Some(456));
+        assert_eq!(leases.len(), 1);
+    }
+
+    #[test]
     fn claim_reassignment_skips_both_live_leased_and_os_bound_ports() {
         // Dedicated port range, isolated from other tests that also probe real
         // OS ports concurrently.
         let base: u16 = 22000;
         // base:     live lease owned by someone else (conflict, triggers scan).
         // base + 1: no lease, but OS has it bound.
-        // base + 2: free -> should be picked.
+        // A forward port without an OS bind should be picked.
         let listener = TcpListener::bind(("127.0.0.1", base + 1)).unwrap();
 
         let mut leases = vec![Lease::new(base, 999, "other-owner", None)];
@@ -752,16 +1284,14 @@ mod tests {
         drop(listener);
 
         assert!(outcome.reassigned);
-        assert_eq!(outcome.lease.port, base + 2);
+        assert!(outcome.lease.port > base + 1);
     }
 
     #[test]
     fn claim_reassignment_reuses_a_port_whose_lease_is_dead() {
-        // Dedicated port range, isolated from other tests that also probe real
-        // OS ports concurrently.
-        let base: u16 = 23000;
-        // base:     live lease owned by someone else (conflict).
-        // base + 1: dead lease -> should be reused.
+        let base = unused_test_port();
+        // base: live lease owned by someone else (conflict).
+        // base + 1: dead lease candidate; OS occupancy may move the claim farther.
         let mut leases = vec![
             Lease::new(base, 999, "other-owner", None),
             Lease::new(base + 1, 998, "stale", None),
@@ -771,21 +1301,24 @@ mod tests {
             claim_in_place(&mut leases, base, 100, "server".to_string(), None, &checker).unwrap();
 
         assert!(outcome.reassigned);
-        assert_eq!(outcome.lease.port, base + 1);
+        assert!(outcome.lease.port > base);
         assert_eq!(outcome.lease.pid, 100);
 
         // Regression guard: reassigning onto a port that had a stale (dead)
         // lease must upsert, not leave the old dead entry AND a new one
         // sitting on the same port. Exactly one entry per port, and the
-        // survivor on base+1 must be the new claim, not the stale one.
-        assert_eq!(
-            leases.len(),
-            2,
-            "must not duplicate the lease on the reused port"
-        );
+        // survivor carrying the new PID must be the new claim, not the stale one.
         let ports: std::collections::HashSet<u16> = leases.iter().map(|l| l.port).collect();
         assert_eq!(ports.len(), leases.len(), "no two leases may share a port");
-        let survivor = leases.iter().find(|l| l.port == base + 1).unwrap();
+        assert_eq!(
+            leases
+                .iter()
+                .filter(|lease| lease.port == outcome.lease.port)
+                .count(),
+            1,
+            "the reassigned port must have exactly one lease"
+        );
+        let survivor = leases.iter().find(|l| l.pid == 100).unwrap();
         assert_eq!(
             survivor.pid, 100,
             "the new owner must replace the stale lease"
@@ -889,26 +1422,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .claim(3000, 100, "server".to_string(), None, &AlwaysAlive)
+            .claim(27010, 100, "server".to_string(), None, &AlwaysAlive)
             .unwrap();
 
-        let lease = store.get(3000).unwrap().unwrap();
-        assert_eq!(lease.port, 3000);
+        let lease = store.get(27010).unwrap().unwrap();
+        assert_eq!(lease.port, 27010);
         assert_eq!(lease.pid, 100);
     }
 
     #[test]
     fn store_release_persists_the_removal() {
         let dir = tempfile::tempdir().unwrap();
+        let port = unused_test_port();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        store
-            .claim(3000, 100, "server".to_string(), None, &AlwaysAlive)
+        let outcome = store
+            .claim(port, 100, "server".to_string(), None, &AlwaysAlive)
             .unwrap();
 
-        let outcome = store.release(3000, &AlwaysAlive).unwrap().unwrap();
-        assert_eq!(outcome.lease.port, 3000);
+        let outcome = store
+            .release(outcome.lease.port, &AlwaysAlive)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.lease.port, port);
         assert!(outcome.was_alive);
-        assert!(store.get(3000).unwrap().is_none());
+        assert!(store.get(port).unwrap().is_none());
     }
 
     #[test]
@@ -921,21 +1458,34 @@ mod tests {
     #[test]
     fn store_prune_persists_removal_of_dead_leases_only() {
         let dir = tempfile::tempdir().unwrap();
+        let (alive_port, dead_port) = unused_adjacent_test_ports();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .claim(3000, 100, "alive".to_string(), None, &AlivePids(vec![100]))
+            .claim(
+                alive_port,
+                100,
+                "alive".to_string(),
+                None,
+                &AlivePids(vec![100]),
+            )
             .unwrap();
         store
-            .claim(3001, 200, "dead".to_string(), None, &AlivePids(vec![100]))
+            .claim(
+                dead_port,
+                200,
+                "dead".to_string(),
+                None,
+                &AlivePids(vec![100]),
+            )
             .unwrap();
 
         let pruned = store.prune(&AlivePids(vec![100])).unwrap();
         assert_eq!(pruned.len(), 1);
-        assert_eq!(pruned[0].port, 3001);
+        assert_eq!(pruned[0].pid, 200);
 
         let remaining = store.list().unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].port, 3000);
+        assert_eq!(remaining[0].pid, 100);
     }
 
     #[test]
@@ -943,7 +1493,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .claim(3000, 100, "alive".to_string(), None, &AlwaysAlive)
+            .claim(
+                unused_test_port(),
+                100,
+                "alive".to_string(),
+                None,
+                &AlwaysAlive,
+            )
             .unwrap();
 
         let pruned = store.prune(&AlwaysAlive).unwrap();
@@ -977,7 +1533,13 @@ mod tests {
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
 
         let outcome = store
-            .claim(3000, 100, "a".repeat(MAX_TAG_CHARS), None, &AlwaysAlive)
+            .claim(
+                unused_test_port(),
+                100,
+                "a".repeat(MAX_TAG_CHARS),
+                None,
+                &AlwaysAlive,
+            )
             .unwrap();
         assert_eq!(outcome.lease.tag.chars().count(), MAX_TAG_CHARS);
     }
@@ -1007,7 +1569,7 @@ mod tests {
 
         let outcome = store
             .claim(
-                3000,
+                unused_test_port(),
                 100,
                 "server".to_string(),
                 Some("s".repeat(MAX_SESSION_CHARS)),
@@ -1052,7 +1614,13 @@ mod tests {
         // MAX_TAG_CHARS multibyte characters: far more bytes than the limit,
         // but exactly the limit in characters, so it must be accepted.
         let outcome = store
-            .claim(3000, 100, "é".repeat(MAX_TAG_CHARS), None, &AlwaysAlive)
+            .claim(
+                unused_test_port(),
+                100,
+                "é".repeat(MAX_TAG_CHARS),
+                None,
+                &AlwaysAlive,
+            )
             .unwrap();
         assert_eq!(outcome.lease.tag.chars().count(), MAX_TAG_CHARS);
     }
@@ -1067,7 +1635,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .claim(3000, 100, "server".to_string(), None, &AlwaysAlive)
+            .claim(
+                unused_test_port(),
+                100,
+                "server".to_string(),
+                None,
+                &AlwaysAlive,
+            )
             .unwrap();
 
         let dir_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;

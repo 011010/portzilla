@@ -1,12 +1,11 @@
 //! Claude Code adapter for the kill-guard.
 //!
-//! Translates a Claude Code `PreToolUse` hook payload into a call to the
-//! harness-agnostic [`crate::guard`], and translates the resulting
-//! [`crate::guard::Verdict`] back into the JSON shape Claude Code expects on
-//! stdout. This module is intentionally thin: all detection and
-//! lease-resolution logic lives in `guard`, which knows nothing about Claude
-//! Code. Adding a second harness later means writing a second module like
-//! this one, not touching `guard`.
+//! Owns parsing of Claude Code's `PreToolUse` hook payload and rendering of the
+//! resulting [`crate::guard::Verdict`] into the JSON shape Claude Code expects
+//! on stdout. `hook_common::evaluate` delegates normalized command evaluation
+//! to the harness-agnostic guard core; payload parsing and wire rendering stay
+//! local to this adapter. Adding a second harness later means writing a second
+//! module like this one, not touching `guard`.
 //!
 //! Schema verified against the current Claude Code hooks documentation
 //! (<https://code.claude.com/docs/en/hooks>, redirected from
@@ -37,7 +36,8 @@
 //! is through the policy flag set by `main.rs` based on the environment
 //! variable.
 
-use crate::guard::{self, Verdict};
+use crate::guard::Verdict;
+use crate::hook_common::{EvaluationRequest, evaluate};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -159,12 +159,13 @@ struct HookSpecificOutput {
 
 /// Handles one `PreToolUse` hook invocation: parses `raw_input` (the JSON
 /// Claude Code writes to the hook's stdin), and if it's a `Bash` tool call,
-/// runs it through [`guard::check`] against `leases`.
+/// runs it through [`crate::hook_common::evaluate`] against `leases`.
 ///
-/// `self_pid` is always `None` when calling into `guard`: `PreToolUse`
-/// fires *before* the tool runs, so there is no process yet whose PID this
-/// adapter could pass as "the process about to run this." Ownership
-/// therefore resolves entirely through `self_session`, taken from the hook
+/// The adapter passes `self_pid` through `hook_common::evaluate`, which
+/// delegates to the guard core. It is always `None`: `PreToolUse` fires
+/// *before* the tool runs, so there is no process yet whose PID this adapter
+/// could pass as "the process about to run this." Ownership therefore
+/// resolves entirely through `self_session`, taken from the hook
 /// payload's `session_id` field. For that to actually recognize anything as
 /// "your own," the lease must have been claimed with a matching `--session`
 /// — see the README's Kill guard section for exactly how an agent should
@@ -225,7 +226,12 @@ pub fn handle_with_policy(
         );
     };
 
-    match guard::check(&command, leases, None, self_session.as_deref(), checker) {
+    match evaluate(EvaluationRequest {
+        command: &command,
+        session: self_session.as_deref(),
+        leases,
+        checker,
+    }) {
         Verdict::Allow => HookOutcome::allow_silent(),
         Verdict::Deny { explanation, .. } => {
             let response = HookResponse {
