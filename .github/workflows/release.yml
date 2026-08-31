@@ -159,3 +159,32 @@ jobs:
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-cargo:
+    name: Publish crates.io package
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ vars.PORTZILLA_PUBLISH_CARGO == 'true' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Cargo package version before publish
+        shell: bash
+        run: |
+          cargo_version="$(cargo pkgid -p portzilla | sed 's/.*[#@]//')"
+          tag_version="${RELEASE_TAG#v}"
+          test "$cargo_version" = "$tag_version"
+
+      - name: Publish package
+        run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
