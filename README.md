@@ -31,6 +31,7 @@ Existing tools (`witr`, `kill-port`, ServerSlayer) tell you what's on a port *af
 - [Demo](#demo)
 - [Install](#install)
 - [Commands](#commands)
+- [Agent skill](#agent-skill)
 - [Watch mode](#watch-mode)
 - [MCP server](#mcp-server)
 - [Kill guard](#kill-guard)
@@ -55,6 +56,15 @@ PORT    PID      STATUS AGE        TAG
 ```
 
 Data-producing commands accept `--json` for agent consumption. See [CLI reference](docs/CLI.md).
+
+Prefer `run` when starting a server — it claims the port and holds the lease for the real server process:
+
+```console
+$ portzilla run 3000 --tag "vite dev" -- sh -c 'npm run dev -- --port "$PORTZILLA_PORT"'
+running on port 3000
+```
+
+The exact child command is framework-specific: whatever starts your server must read the assigned port from `$PORTZILLA_PORT`. On conflict `run` reassigns to the next free port and reports it on stderr; the server child's stdout stays untouched.
 
 ## Demo
 
@@ -113,9 +123,21 @@ Binaries for Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows x86_64/ARM64
 | `portzilla who <PORT>` | Show lease on a port (exit `2` if none) |
 | `portzilla release <PORT>` | Remove lease (always wins; warns if PID still alive) |
 | `portzilla prune` | Remove all leases whose PID is dead |
+| `portzilla run <PORT> --tag <TAG> [--session <S>] -- <cmd...>` | Claim a port and run a server with it; the lease follows the child PID |
 | `portzilla watch [--interval <SECONDS>]` | Repeatedly prune leases whose recorded PID is dead |
 
 Data-producing commands are file-locked and support `--json`. Full flags, conflict semantics, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md)**.
+
+## Agent skill
+
+For OpenCode agents, install the checked-in `portzilla` skill explicitly:
+
+```console
+$ mkdir -p .opencode/skills/portzilla
+$ portzilla init skill > .opencode/skills/portzilla/SKILL.md
+```
+
+`init skill` only prints the skill file to stdout — it never writes configuration for you; the redirect above is what saves it. The skill teaches the agent to start servers with `portzilla run` and `$PORTZILLA_PORT`. Kill-guard setup stays separate: `portzilla init opencode` prints the `portzilla.js` plugin shim (see [Kill guard](#kill-guard)).
 
 ## Watch mode
 

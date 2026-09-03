@@ -107,6 +107,8 @@ The shim hooks `tool.execute.before` for the `bash` tool, shells out to `portzil
 $ portzilla claim 3000 --tag "vite dev" --session "$PORTZILLA_SESSION"
 ```
 
+This section covers kill-guard setup only. The `portzilla` agent skill (starting servers with `portzilla run`) is installed separately and explicitly — `mkdir -p .opencode/skills/portzilla && portzilla init skill > .opencode/skills/portzilla/SKILL.md` — because `init skill` prints the skill file to stdout instead of writing configuration. The skill never sets up kill protection; explicit kill-guard requests go through `portzilla init opencode` on this page.
+
 ### Windsurf
 
 ```console

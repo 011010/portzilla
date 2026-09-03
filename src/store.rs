@@ -238,6 +238,59 @@ impl Store {
         Ok(pruned)
     }
 
+    /// Transfers the lease on `port` from the expected wrapper identity to a
+    /// verified child PID, preserving port, tag, and session.
+    ///
+    /// The transfer only succeeds when the recorded lease still carries the
+    /// expected wrapper PID and start time and is alive, and when the child
+    /// PID is alive with a resolvable start time. Only the PID, process-start
+    /// identity, verification marker, and renewal timestamp change. The lease
+    /// is left untouched on any rejection.
+    pub(crate) fn transfer(
+        &self,
+        port: u16,
+        expected_owner_pid: u32,
+        expected_owner_start_time: u64,
+        new_owner_pid: u32,
+        checker: &dyn PidChecker,
+    ) -> Result<Lease> {
+        let _guard = self.lock_exclusive()?;
+        let mut leases = self.read_leases()?;
+        let index = leases
+            .iter()
+            .position(|lease| lease.port == port)
+            .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
+        let existing = leases[index].clone();
+
+        if existing.pid != expected_owner_pid
+            || existing.process_start_time != Some(expected_owner_start_time)
+        {
+            bail!(
+                "lease on port {port} is not owned by expected owner {expected_owner_pid}: transfer rejected"
+            );
+        }
+        if !existing.is_alive(checker) {
+            bail!("lease on port {port} owner is no longer alive: transfer rejected");
+        }
+        if !checker.is_alive(new_owner_pid) {
+            bail!("child pid {new_owner_pid} is not alive: transfer rejected");
+        }
+        let Some(child_start_time) = checker.process_start_time(new_owner_pid) else {
+            bail!("child pid {new_owner_pid} has no resolvable start time: transfer rejected");
+        };
+
+        let transferred = Lease::new_with_process_start_time(
+            existing.port,
+            new_owner_pid,
+            existing.tag.clone(),
+            existing.session.clone(),
+            Some(child_start_time),
+        );
+        leases[index] = transferred.clone();
+        self.write_leases(&leases)?;
+        Ok(transferred)
+    }
+
     /// Ensures the data directory exists and is restricted to owner-only
     /// access (`0700` on Unix). Leases can carry PIDs and tags that reveal
     /// what a user is running, so the store directory is not world-readable.
@@ -1660,5 +1713,192 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(lock_mode, 0o600, "lock file must be owner-only (0600)");
+    }
+
+    // ---- transfer ----
+
+    struct TransferChecker {
+        entries: std::collections::HashMap<u32, Option<u64>>,
+    }
+
+    impl TransferChecker {
+        fn new(pairs: Vec<(u32, Option<u64>)>) -> Self {
+            Self {
+                entries: pairs.into_iter().collect(),
+            }
+        }
+
+        fn wrapper_and_child(
+            wrapper_pid: u32,
+            wrapper_start: u64,
+            child_pid: u32,
+            child_start: Option<u64>,
+        ) -> Self {
+            let mut entries = std::collections::HashMap::new();
+            entries.insert(wrapper_pid, Some(wrapper_start));
+            // `None` means the PID is alive but has no resolvable start time.
+            // Absence from the map means dead.
+            entries.insert(child_pid, child_start);
+            Self { entries }
+        }
+    }
+
+    impl PidChecker for TransferChecker {
+        fn is_alive(&self, pid: u32) -> bool {
+            self.entries.contains_key(&pid)
+        }
+
+        fn process_start_time(&self, pid: u32) -> Option<u64> {
+            self.entries.get(&pid).copied().flatten()
+        }
+    }
+
+    fn seed_wrapper_lease(store: &Store, port: u16, wrapper_pid: u32, wrapper_start: u64) -> Lease {
+        // Seed directly instead of claiming: `transfer` never probes the OS,
+        // so these tests use no sockets at all and cannot perturb the shared
+        // ephemeral-port pool that other tests draw from.
+        let lease = Lease::new_with_process_start_time(
+            port,
+            wrapper_pid,
+            "svc",
+            Some("sess-1".to_string()),
+            Some(wrapper_start),
+        );
+        store.write_leases(std::slice::from_ref(&lease)).unwrap();
+        lease
+    }
+
+    #[test]
+    fn transfer_replaces_wrapper_pid_with_verified_child_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23200;
+        let (wrapper_pid, wrapper_start) = (100u32, 111u64);
+        let (child_pid, child_start) = (200u32, 222u64);
+        let checker = TransferChecker::wrapper_and_child(
+            wrapper_pid,
+            wrapper_start,
+            child_pid,
+            Some(child_start),
+        );
+        let original = seed_wrapper_lease(&store, port, wrapper_pid, wrapper_start);
+
+        let transferred = store
+            .transfer(port, wrapper_pid, wrapper_start, child_pid, &checker)
+            .unwrap();
+
+        assert_eq!(transferred.port, port);
+        assert_eq!(transferred.pid, child_pid);
+        assert_eq!(transferred.process_start_time, Some(child_start));
+        assert_eq!(transferred.tag, original.tag);
+        assert_eq!(transferred.session, original.session);
+        assert!(transferred.is_alive(&checker));
+
+        let persisted = store.get(port).unwrap().unwrap();
+        assert_eq!(persisted, transferred);
+    }
+
+    #[test]
+    fn transfer_rejects_missing_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23201;
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+
+        let err = store.transfer(port, 100, 111, 200, &checker).unwrap_err();
+        assert!(
+            err.to_string().contains("no lease"),
+            "unexpected error: {err:#}"
+        );
+        assert!(store.get(port).unwrap().is_none());
+    }
+
+    #[test]
+    fn transfer_rejects_changed_wrapper_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23202;
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        let original = seed_wrapper_lease(&store, port, 100, 111);
+
+        let err = store.transfer(port, 101, 111, 200, &checker).unwrap_err();
+        assert!(
+            err.to_string().contains("expected owner"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn transfer_rejects_stale_wrapper_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23203;
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        let original = seed_wrapper_lease(&store, port, 100, 111);
+
+        let err = store.transfer(port, 100, 999, 200, &checker).unwrap_err();
+        assert!(
+            err.to_string().contains("expected owner"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn transfer_rejects_recycled_wrapper_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23204;
+        let original = seed_wrapper_lease(&store, port, 100, 111);
+        // Wrapper PID was recycled: same PID, different start time now.
+        let recycled_checker = TransferChecker::wrapper_and_child(100, 333, 200, Some(222));
+
+        let err = store
+            .transfer(port, 100, 111, 200, &recycled_checker)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no longer alive"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn transfer_rejects_dead_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23205;
+        let original = seed_wrapper_lease(&store, port, 100, 111);
+        // Child PID absent from the map => dead.
+        let dead_child_checker = TransferChecker::new(vec![(100, Some(111))]);
+
+        let err = store
+            .transfer(port, 100, 111, 200, &dead_child_checker)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("child"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn transfer_rejects_child_without_start_time_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = 23206;
+        let original = seed_wrapper_lease(&store, port, 100, 111);
+        // Child alive (present) but start time unresolvable (None).
+        let no_identity_checker = TransferChecker::wrapper_and_child(100, 111, 200, None);
+
+        let err = store
+            .transfer(port, 100, 111, 200, &no_identity_checker)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("child"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(store.get(port).unwrap().unwrap(), original);
     }
 }
