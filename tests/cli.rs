@@ -2000,3 +2000,364 @@ fn guard_allowed_non_executable_file_exits_126() {
         .assert()
         .code(126);
 }
+
+// ---- run ----
+//
+// The child fixtures below are plain binaries (`printenv`, `sleep`, `false`)
+// executed directly — no shell is assumed by the implementation under test.
+
+#[test]
+fn run_rejects_absent_command_after_dash() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd(dir.path())
+        .args(["run", "4600", "--tag", "svc", "--"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_free_port_sets_portzilla_port_for_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+
+    cmd(dir.path())
+        .args([
+            "run",
+            &port.to_string(),
+            "--tag",
+            "svc",
+            "--",
+            "printenv",
+            "PORTZILLA_PORT",
+        ])
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"))
+        .stderr(predicate::str::contains(port.to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_conflicting_port_reassigns_and_sets_actual_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let own_pid = std::process::id();
+    let requested = claim_live_lease(dir.path(), own_pid, None);
+
+    let output = cmd(dir.path())
+        .args([
+            "run",
+            &requested.to_string(),
+            "--tag",
+            "svc",
+            "--",
+            "printenv",
+            "PORTZILLA_PORT",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("instead"))
+        .get_output()
+        .stdout
+        .clone();
+
+    let actual: u16 = String::from_utf8(output)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("child must print the assigned port");
+    assert_ne!(
+        actual, requested,
+        "a conflicting requested port must be reassigned"
+    );
+
+    // The pre-existing lease on the requested port is left untouched.
+    let who_output = cmd(dir.path())
+        .args(["who", &requested.to_string(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let who_json: Value = serde_json::from_slice(&who_output).unwrap();
+    assert_eq!(who_json["pid"], own_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_propagates_child_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+
+    // `false` exits 1 without needing a shell.
+    cmd(dir.path())
+        .args(["run", &port.to_string(), "--tag", "svc", "--", "false"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains(port.to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_passes_session_to_child_only_when_supplied() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let with_session = free_test_port();
+    cmd(dir.path())
+        .env("PORTZILLA_SESSION", "parent-leak")
+        .args([
+            "run",
+            &with_session.to_string(),
+            "--tag",
+            "svc",
+            "--session",
+            "run-sess",
+            "--",
+            "printenv",
+            "PORTZILLA_SESSION",
+        ])
+        .assert()
+        .success()
+        .stdout("run-sess\n");
+
+    // Without --session the variable must be absent even when the parent
+    // environment carries a dirty PORTZILLA_SESSION: `printenv` on a missing
+    // variable exits 1, and that child status propagates out of `run`.
+    let without_session = free_test_port();
+    cmd(dir.path())
+        .env("PORTZILLA_SESSION", "parent-leak")
+        .args([
+            "run",
+            &without_session.to_string(),
+            "--tag",
+            "svc",
+            "--",
+            "printenv",
+            "PORTZILLA_SESSION",
+        ])
+        .assert()
+        .code(1);
+}
+
+/// Polls `who` until the lease on `port` names the transferred child rather
+/// than the still-setting-up wrapper: between the wrapper's claim and its
+/// transfer the lease legitimately names the wrapper PID, so returning the
+/// first sighting would race with the transfer.
+#[cfg(unix)]
+fn poll_run_child_lease(
+    data_dir: &std::path::Path,
+    port: u16,
+    wrapper_pid: u32,
+    timeout: Duration,
+) -> Option<Value> {
+    let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = std::process::Command::new(&binary)
+            .env("PORTZILLA_DATA_DIR", data_dir)
+            .args(["who", &port.to_string(), "--json"])
+            .output()
+            .ok()?;
+        if output.status.success()
+            && let Ok(json) = serde_json::from_slice::<Value>(&output.stdout)
+            && json["pid"].as_u64() != Some(u64::from(wrapper_pid))
+        {
+            return Some(json);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_guard_denies_kill_of_run_child_from_foreign_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
+
+    let mut wrapper = std::process::Command::new(binary)
+        .env("PORTZILLA_DATA_DIR", dir.path())
+        .args([
+            "run",
+            &port.to_string(),
+            "--tag",
+            "run-svc",
+            "--session",
+            "run-sess",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id();
+
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+        .expect("the run lease must be visible while the child runs");
+    assert_eq!(lease["tag"], "run-svc");
+    assert_eq!(lease["session"], "run-sess");
+    assert_eq!(lease["alive"], true);
+    let child_pid = lease["pid"].as_u64().unwrap() as u32;
+    assert_ne!(
+        child_pid, wrapper_pid,
+        "the transferred lease must name the child, not the wrapper"
+    );
+
+    // `who` on the actual port reports the same live child PID.
+    let who_output = cmd(dir.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let who_json: Value = serde_json::from_slice(&who_output).unwrap();
+    assert_eq!(who_json["pid"], child_pid);
+    assert_eq!(who_json["alive"], true);
+
+    // Fake "kill" so a guard decision can be observed without signals: a
+    // deny must never run it, an allow must.
+    let script = dir.path().join("kill");
+    write_fake_command(&script, &format!("touch '{}/marker'", dir.path().display()));
+
+    // Foreign session (no session at all): must deny with exit 2.
+    cmd(dir.path())
+        .args([
+            "guard",
+            "--",
+            script.to_str().unwrap(),
+            &child_pid.to_string(),
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(
+            predicate::str::contains(port.to_string()).and(predicate::str::contains("run-svc")),
+        );
+    assert!(
+        !dir.path().join("marker").exists(),
+        "a denied guard kill of a run child must never execute"
+    );
+
+    // Matching session: the owner's own kill must be allowed through.
+    cmd(dir.path())
+        .args([
+            "guard",
+            "--session",
+            "run-sess",
+            "--",
+            script.to_str().unwrap(),
+            &child_pid.to_string(),
+        ])
+        .assert()
+        .success();
+    assert!(
+        dir.path().join("marker").exists(),
+        "an own-session guard kill of a run child must execute"
+    );
+
+    // Condition-based teardown only: signal the child, then reap the
+    // wrapper (it was waiting on the child) with the polling helper.
+    std::process::Command::new("kill")
+        .args(["-KILL", &child_pid.to_string()])
+        .status()
+        .unwrap();
+    let status = terminate_and_reap(&mut wrapper);
+    assert!(!status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_child_lease_is_live_then_dead_then_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
+
+    let mut wrapper = std::process::Command::new(binary)
+        .env("PORTZILLA_DATA_DIR", dir.path())
+        .args([
+            "run",
+            &port.to_string(),
+            "--tag",
+            "run-svc",
+            "--session",
+            "run-sess",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id();
+
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+        .expect("the run lease must be visible while the child runs");
+    assert_eq!(lease["tag"], "run-svc");
+    assert_eq!(lease["session"], "run-sess");
+    assert_eq!(lease["alive"], true);
+    let child_pid = lease["pid"].as_u64().unwrap() as u32;
+
+    // Ending the child ends the wrapper (it was waiting on the child); the
+    // signaled child propagates as a nonzero wrapper exit.
+    std::process::Command::new("kill")
+        .args(["-KILL", &child_pid.to_string()])
+        .status()
+        .unwrap();
+    let status = terminate_and_reap(&mut wrapper);
+    assert!(!status.success());
+
+    let output = cmd(dir.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let dead: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(dead["pid"], child_pid);
+    assert_eq!(dead["alive"], false);
+
+    cmd(dir.path())
+        .args(["prune"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(port.to_string()));
+    cmd(dir.path())
+        .args(["who", &port.to_string()])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+// ---- init skill ----
+
+#[test]
+fn init_skill_prints_the_skill_file_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = include_str!("../skills/portzilla/SKILL.md");
+
+    let output = cmd(dir.path())
+        .args(["init", "skill"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        output,
+        expected.as_bytes(),
+        "portzilla init skill must print skills/portzilla/SKILL.md byte-for-byte, so \
+         `portzilla init skill > .opencode/skills/portzilla/SKILL.md` reproduces the file"
+    );
+}

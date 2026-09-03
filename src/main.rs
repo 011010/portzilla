@@ -16,7 +16,7 @@ mod windsurf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lease::{Lease, SystemPidChecker};
+use lease::{Lease, PidChecker, SystemPidChecker};
 use std::io::Read;
 use store::{ClaimOutcome, Store};
 use view::{LeaseView, to_claim_view, to_view};
@@ -173,6 +173,26 @@ enum Commands {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Claim a port and run a command with it: the lease is held by the
+    /// child process while it runs, so `who` names the real server PID and
+    /// `prune` reaps it when the child exits.
+    Run {
+        /// The port to claim (1-65535). On conflict the next free port is
+        /// claimed instead and the child is told the actual port.
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// Human-readable description of what this port is for.
+        #[arg(long)]
+        tag: String,
+        /// Optional session identifier grouping related leases.
+        #[arg(long)]
+        session: Option<String>,
+        /// The command to run, exactly as given after `--`. Executed
+        /// directly (no shell) — for a pipe or compound command, wrap it as
+        /// `-- sh -c '...'`.
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,6 +275,9 @@ enum InitHarness {
     /// `portzilla hook opencode`), plus where to save it.
     #[command(name = "opencode")]
     OpenCode,
+    /// Print the `portzilla` agent skill (`SKILL.md`) for running dev
+    /// servers under `portzilla run`: stdout is the skill file verbatim.
+    Skill,
 }
 
 /// Exit code for "the requested lease does not exist" — distinct from the
@@ -330,6 +353,7 @@ fn run() -> Result<(), RunError> {
             InitHarness::Codex => print_init_codex(),
             InitHarness::Kimi => print_init_kimi(),
             InitHarness::OpenCode => print_init_opencode(),
+            InitHarness::Skill => print_init_skill(),
             InitHarness::Windsurf => print_init_windsurf(),
         },
 
@@ -351,6 +375,17 @@ fn run() -> Result<(), RunError> {
         // success) or exits directly (deny, or a non-unix execution) — it
         // does not fall through to `Ok(())` below in the success path.
         Commands::Guard { session, command } => run_guard_cmd(session, command),
+
+        // `run` spawns the child, transfers the lease to it, and waits for
+        // it. A nonzero child status exits the process directly (see
+        // `run_portzilla_run`); only a zero child status falls through to
+        // `Ok(())` below.
+        Commands::Run {
+            port,
+            tag,
+            session,
+            command,
+        } => run_portzilla_run(port, tag, session, command)?,
 
         Commands::Claim {
             port,
@@ -983,6 +1018,117 @@ fn execute(args: &[String]) -> ! {
     }
 }
 
+/// Runs `portzilla run <port> --tag <tag> [--session <s>] -- <command...>`:
+/// claims the requested port for this wrapper process, spawns the command
+/// directly (no shell) with `PORTZILLA_PORT` set to the actual (possibly
+/// reassigned) port, transfers the live lease to the spawned child, and
+/// waits for it, propagating its exit status.
+///
+/// A zero child status returns `Ok(())`; a nonzero (or signaled) child
+/// exits this process with the same code (or 1 when there is no code to
+/// propagate) so `run` is transparent in scripts. Error paths before the
+/// wait return `Err` normally and never release the wrapper lease — it is
+/// left for `prune` to reap once this short-lived wrapper exits.
+fn run_portzilla_run(
+    port: u16,
+    tag: String,
+    session: Option<String>,
+    command: Vec<String>,
+) -> Result<(), RunError> {
+    let store = Store::open(None)?;
+    let wrapper_pid = std::process::id();
+    let outcome = store.claim(port, wrapper_pid, tag, session.clone(), &SystemPidChecker)?;
+    let assigned = outcome.lease.port;
+
+    // The wrapper lease must carry a verified start time before anything is
+    // spawned: without it the later transfer has no trustworthy wrapper
+    // identity to match against.
+    let wrapper_start_time = SystemPidChecker
+        .process_start_time(wrapper_pid)
+        .context("could not resolve the start time of the run wrapper process")?;
+    if outcome.lease.process_start_time != Some(wrapper_start_time) {
+        return Err(RunError::Other(anyhow::anyhow!(
+            "run wrapper lease on port {assigned} has no verified process identity; refusing to spawn"
+        )));
+    }
+
+    // Human progress only, stderr only: stdout belongs to the child.
+    if outcome.reassigned {
+        eprintln!("port {port} is busy; running on port {assigned} instead");
+    } else {
+        eprintln!("running on port {assigned}");
+    }
+
+    let Some((program, rest)) = command.split_first() else {
+        return Err(RunError::Other(anyhow::anyhow!(
+            "run requires a command to execute"
+        )));
+    };
+    let mut child_cmd = std::process::Command::new(program);
+    child_cmd.args(rest);
+    child_cmd.env("PORTZILLA_PORT", assigned.to_string());
+    if let Some(session) = session.as_deref() {
+        child_cmd.env("PORTZILLA_SESSION", session);
+    } else {
+        child_cmd.env_remove("PORTZILLA_SESSION");
+    }
+    let mut child = child_cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {program}"))?;
+
+    // Transfer BEFORE waiting, retrying while the child is still alive: a
+    // just-spawned (or just-exited zombie) child is not always immediately
+    // visible to the PID checker, so a single attempt races with exec/exit.
+    // A child that already exited before the transfer ran already ran with
+    // the right environment, so reap it and propagate its status instead of
+    // failing the run. Only a child that stays alive yet unresolvable past
+    // the deadline is a genuine failure: stop and reap it, then report —
+    // never touching a lease we did not verify as ours.
+    let child_pid = child.id();
+    let transfer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match store.transfer(
+            assigned,
+            wrapper_pid,
+            wrapper_start_time,
+            child_pid,
+            &SystemPidChecker,
+        ) {
+            Ok(_) => break,
+            Err(err) => {
+                if let Some(status) = child
+                    .try_wait()
+                    .context("failed to poll the run child after a failed lease transfer")?
+                {
+                    exit_with_child_status(status);
+                }
+                if std::time::Instant::now() >= transfer_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RunError::Other(err.context(format!(
+                        "failed to transfer the lease on port {assigned}"
+                    ))));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    let status = child.wait().context("failed to wait for the run child")?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(_) => exit_with_child_status(status),
+        None => exit_with_child_status(status),
+    }
+}
+
+/// Exits this process with the child's status: the same code when the child
+/// exited normally, 1 when the child was signaled and there is no code to
+/// propagate.
+fn exit_with_child_status(status: std::process::ExitStatus) -> ! {
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 fn print_init_cursor() {
     println!("Add the following to your Cursor hooks config (.cursor/hooks.json for a project,");
     println!("or ~/.cursor/hooks.json for your user) to register portzilla's kill-guard as a");
@@ -1154,6 +1300,16 @@ fn print_init_windsurf() {
     println!();
     println!("Note: Cascade hooks do not load or run while a workspace is open in Restricted");
     println!("Mode — the guard is absent there by design.");
+}
+
+/// Prints the `portzilla` agent skill verbatim: stdout is byte-for-byte
+/// `skills/portzilla/SKILL.md`, embedded at compile time with
+/// `include_str!` so there is no runtime file lookup. This enables
+/// `mkdir -p .opencode/skills/portzilla && portzilla init skill >
+/// .opencode/skills/portzilla/SKILL.md` to reproduce the file exactly —
+/// hence `print!`, not `println!`: no extra trailing newline.
+fn print_init_skill() {
+    print!("{}", include_str!("../skills/portzilla/SKILL.md"));
 }
 
 fn print_init_claude_code() {

@@ -20,6 +20,7 @@
   "files": [
     "npm/bin.js",
     "npm/install.js",
+    "skills/portzilla/SKILL.md",
     "README.md",
     "LICENSE"
   ],

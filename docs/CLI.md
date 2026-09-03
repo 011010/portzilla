@@ -39,6 +39,29 @@ Removes the lease recorded on `<PORT>` and prints the removed lease. Exits with 
 
 Removes every lease whose owning PID is no longer alive and prints each one that was removed. Human output prints `no dead leases to prune` if nothing was pruned; JSON output prints `[]`.
 
+### `portzilla run <PORT> --tag <TAG> [--session <SESSION>] -- <COMMAND...>`
+
+Claims `<PORT>` and runs `<COMMAND...>` with the lease held by the child process while it runs, so `who` names the real server PID and `prune` reaps it when the child exits. Do not pre-claim from an ephemeral shell — `run` claims it and holds it for the server in one step.
+
+- `<PORT>` — required, 1-65535 (port 0 rejected, same as `claim`).
+- `--tag <TAG>` — required, same 1024-char cap as `claim`.
+- `--session <SESSION>` — optional, same 512-char cap as `claim`.
+- `-- <COMMAND...>` — required, everything after `--` is executed directly with no shell. For a pipe or compound command, wrap it as `-- sh -c '...'`.
+- No `--json` mode: the child owns stdout, so `run` accepts no JSON flag. Progress and reassignment notes go to stderr; server stdout stays untouched.
+
+Environment passed to the child:
+
+- `PORTZILLA_PORT` — always set to the actual (possibly reassigned) port. The child command must consume this variable; the exact command is framework-specific.
+- `PORTZILLA_SESSION` — set only when `--session` was supplied; otherwise removed from the child's environment.
+
+Lease transfer guarantee: `run` claims the port for its own wrapper PID (requiring a verified process start time — it refuses to spawn without one), spawns the child with inherited stdio, then atomically transfers the live wrapper lease to the spawned child PID, preserving port, tag, and session. The transfer retries while the child is still alive (a just-spawned child is not always immediately visible to the PID checker).
+
+Reassignment: same conflict semantics as `claim` — a live foreign lease or an OS-bound port reassigns to the next free port, and the child is told the actual port. Reassignment is reported on stderr (`port <requested> is busy; running on port <actual> instead`); the non-reassigned case prints `running on port <actual>` to stderr.
+
+Exit-status propagation: `run` waits for the child and exits with its status — the same code on a normal exit, `1` when the child was signaled and there is no code to propagate. A child that already exited before the transfer ran already ran with the right environment, so `run` reaps it and propagates its status instead of failing.
+
+Cleanup: `run` never explicitly releases the lease. The short-lived wrapper lease is left for `prune` to reap if anything fails before the transfer; after a successful transfer the lease follows the child, and the child's exit leaves a dead lease that `prune` (or `watch`) removes. A child that stays alive yet unresolvable past the transfer deadline is stopped and reaped, then reported as an error — never touching a lease not verified as ours.
+
 ### `portzilla watch [--interval <SECONDS>] [--json]`
 
 Runs an optional foreground watcher that repeatedly performs the same
