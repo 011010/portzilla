@@ -196,6 +196,10 @@ impl Store {
         session: Option<String>,
         checker: &dyn PidChecker,
     ) -> Result<ClaimOutcome> {
+        // An empty `--session ""` (e.g. from an unbound `$VAR` expansion)
+        // must behave as no session: otherwise two unrelated empty sessions
+        // would recognize each other's leases as their own in the guard.
+        let session = session.filter(|s| !s.is_empty());
         // Validate before taking the lock / reading state so a rejected
         // claim never touches (or even waits on) the store.
         validate_claim_inputs(requested_port, &tag, session.as_deref())?;
@@ -1489,7 +1493,13 @@ mod tests {
         let port = 27011;
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .write_leases(&[Lease::new(port, 100, "server", None)])
+            .write_leases(&[Lease::new_with_process_start_time(
+                port,
+                100,
+                "server",
+                None,
+                Some(0),
+            )])
             .unwrap();
 
         let outcome = store.release(port, &AlwaysAlive).unwrap().unwrap();

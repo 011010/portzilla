@@ -922,7 +922,9 @@ fn run_hook_opencode() {
 /// the execute paths — see [`execute`].
 fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
     let fail_closed = fail_closed_mode();
-    let self_session = session_flag.or_else(|| std::env::var("PORTZILLA_SESSION").ok());
+    let self_session = session_flag
+        .or_else(|| std::env::var("PORTZILLA_SESSION").ok())
+        .filter(|s| !s.is_empty());
     let command_display = guard_cmd::join_command(&command);
 
     // Fail-open: a store problem is not a reason to block a command a
@@ -1035,6 +1037,9 @@ fn run_portzilla_run(
     session: Option<String>,
     command: Vec<String>,
 ) -> Result<(), RunError> {
+    // Normalize here as well as in `Store::claim` so the child environment
+    // matches the stored lease: empty means absent, never `PORTZILLA_SESSION=""`.
+    let session = session.filter(|s| !s.is_empty());
     let store = Store::open(None)?;
     let wrapper_pid = std::process::id();
     let outcome = store.claim(port, wrapper_pid, tag, session.clone(), &SystemPidChecker)?;

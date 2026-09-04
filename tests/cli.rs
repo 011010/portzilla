@@ -2142,6 +2142,68 @@ fn run_passes_session_to_child_only_when_supplied() {
         .code(1);
 }
 
+#[cfg(unix)]
+#[test]
+fn run_empty_session_is_treated_as_no_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
+
+    let mut wrapper = std::process::Command::new(binary)
+        .env("PORTZILLA_DATA_DIR", dir.path())
+        .args([
+            "run",
+            &port.to_string(),
+            "--tag",
+            "run-svc",
+            "--session",
+            "",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id();
+
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+        .expect("the run lease must be visible while the child runs");
+    assert!(
+        lease["session"].is_null(),
+        "an empty --session must normalize to no session, got {}",
+        lease["session"]
+    );
+    let child_pid = lease["pid"].as_u64().unwrap() as u32;
+
+    std::process::Command::new("kill")
+        .args(["-KILL", &child_pid.to_string()])
+        .status()
+        .unwrap();
+    let status = terminate_and_reap(&mut wrapper);
+    assert!(!status.success());
+
+    // An empty --session must also remove the child variable even when the
+    // parent carries a dirty PORTZILLA_SESSION, exactly like omitting it.
+    let env_port = free_test_port();
+    cmd(dir.path())
+        .env("PORTZILLA_SESSION", "parent-leak")
+        .args([
+            "run",
+            &env_port.to_string(),
+            "--tag",
+            "svc",
+            "--session",
+            "",
+            "--",
+            "printenv",
+            "PORTZILLA_SESSION",
+        ])
+        .assert()
+        .code(1);
+}
+
 /// Polls `who` until the lease on `port` names the transferred child rather
 /// than the still-setting-up wrapper: between the wrapper's claim and its
 /// transfer the lease legitimately names the wrapper PID, so returning the
@@ -2340,6 +2402,37 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
 }
 
 // ---- init skill ----
+
+#[test]
+fn init_skill_forwards_supported_agent_sessions_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = cmd(dir.path())
+        .args(["init", "skill"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let skill = String::from_utf8(output).unwrap();
+
+    assert!(
+        skill.contains("--session \"$PORTZILLA_SESSION\""),
+        "the skill must forward OpenCode's injected session to run"
+    );
+    assert!(
+        skill.contains("--session \"$CLAUDE_CODE_SESSION_ID\""),
+        "the skill must forward Claude Code's session to run"
+    );
+    assert!(
+        skill.contains("Never pass `--session \"\"`"),
+        "the skill must forbid empty --session expansions"
+    );
+    assert!(
+        skill.contains("SESSION_ARGS"),
+        "the skill must show an empty-safe conditional session expansion"
+    );
+}
 
 #[test]
 fn init_skill_prints_the_skill_file_byte_for_byte() {
