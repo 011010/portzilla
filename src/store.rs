@@ -1486,14 +1486,14 @@ mod tests {
     #[test]
     fn store_release_persists_the_removal() {
         let dir = tempfile::tempdir().unwrap();
-        let port = unused_test_port();
+        let port = 27011;
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        let outcome = store
-            .claim(port, 100, "server".to_string(), None, &AlwaysAlive)
+        store
+            .write_leases(&[Lease::new(port, 100, "server", None)])
             .unwrap();
 
         let outcome = store
-            .release(outcome.lease.port, &AlwaysAlive)
+            .release(port, &AlwaysAlive)
             .unwrap()
             .unwrap();
         assert_eq!(outcome.lease.port, port);
