@@ -2,7 +2,7 @@
 
 ## One-time GitHub configuration
 
-Add an npm automation token as the repository secret `NPM_TOKEN` and a crates.io token as `CARGO_REGISTRY_TOKEN`. Set the repository variables `PORTZILLA_PUBLISH_NPM` and `PORTZILLA_PUBLISH_CARGO` to `true` when the workflow should publish both packages.
+Add an npm granular access token scoped to the `portzilla` package with Read and write permission and Bypass two-factor authentication enabled as the repository secret `NPM_TOKEN`, and a crates.io token as `CARGO_REGISTRY_TOKEN`. Use a short expiration with rotation; when available prefer npm trusted publishing (OIDC) over a long-lived bypass token, since npm is deprecating direct publishing with bypass tokens. Set the repository variables `PORTZILLA_PUBLISH_NPM` and `PORTZILLA_PUBLISH_CARGO` to `true` when the workflow should publish both packages.
 
 Leave either variable unset or set it to `false` to skip that registry. The release workflow will still build, smoke-test, and upload all binary assets.
 
