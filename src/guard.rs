@@ -138,8 +138,12 @@ pub fn check(
 }
 
 fn owned_by_self(lease: &Lease, self_pid: Option<u32>, self_session: Option<&str>) -> bool {
-    let session_match =
-        self_session.is_some_and(|session| lease.session.as_deref() == Some(session));
+    // Empty sessions never match: legacy `Some("")` leases and empty caller
+    // identity both behave as no session, so unrelated empties cannot
+    // recognize each other as their own.
+    let self_session = self_session.filter(|s| !s.is_empty());
+    let lease_session = lease.session.as_deref().filter(|s| !s.is_empty());
+    let session_match = self_session.is_some_and(|session| lease_session == Some(session));
     let pid_match = self_pid.is_some_and(|pid| pid == lease.pid);
     session_match || pid_match
 }

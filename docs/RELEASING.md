@@ -2,20 +2,20 @@
 
 ## One-time GitHub configuration
 
-Add an npm automation token as the repository secret `NPM_TOKEN`, then set the repository variable `PORTZILLA_PUBLISH_NPM` to `true`.
+Add an npm granular access token scoped to the `portzilla` package with Read and write permission and Bypass two-factor authentication enabled as the repository secret `NPM_TOKEN`, and a crates.io token as `CARGO_REGISTRY_TOKEN`. Use a short expiration with rotation; when available prefer npm trusted publishing (OIDC) over a long-lived bypass token, since npm is deprecating direct publishing with bypass tokens. Set the repository variables `PORTZILLA_PUBLISH_NPM` and `PORTZILLA_PUBLISH_CARGO` to `true` when the workflow should publish both packages.
 
-Leave the variable unset or set it to `false` while testing release builds. The release workflow will still build and upload all binaries, but it will skip npm publication.
+Leave either variable unset or set it to `false` to skip that registry. The release workflow will still build, smoke-test, and upload all binary assets.
 
 ## Release checklist
 
-1. Update the version in `Cargo.toml` and `package.json` to the same value.
-2. Confirm that both manifests declare exactly version `0.2.0`:
+1. Update the version in `Cargo.toml` and `package.json` to the same value, then let Cargo update the root package entry in `Cargo.lock`.
+2. Confirm that both manifests declare exactly version `0.3.0`:
 
    ```console
-   $ cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "portzilla") | .version')" && npm_version="$(node -p "require('./package.json').version")" && test "$cargo_version" = "0.2.0" && test "$npm_version" = "0.2.0"
+   $ cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "portzilla") | .version')" && npm_version="$(node -p "require('./package.json').version")" && test "$cargo_version" = "0.3.0" && test "$npm_version" = "0.3.0"
    ```
 
-   The release tag must be exactly `v0.2.0`, the `v`-prefixed form of both manifest versions.
+   The release tag must be exactly `v0.3.0`, the `v`-prefixed form of both manifest versions.
 
 3. Run the local checks:
 
@@ -29,22 +29,17 @@ Leave the variable unset or set it to `false` while testing release builds. The 
 
 4. Inspect the file lists reported by both dry-runs. They should contain only the expected source, manifest, documentation, and package files. Confirm that they exclude `target/` and other build artifacts, local state, credentials, and release-plan artifacts.
 
-5. After all validation passes, manually publish the crate:
+5. Commit the release preparation, merge it into `main`, and wait for `main` CI to pass.
+6. Create and push the matching tag from the verified `main` commit:
 
    ```console
-   $ cargo publish
-   ```
-
-6. After publication succeeds, manually create and push the matching tag:
-
-   ```console
-   $ git tag v0.2.0
-   $ test "$(git describe --tags --exact-match)" = "v0.2.0"
-   $ git push origin main --tags
+   $ git tag v0.3.0
+   $ test "$(git describe --tags --exact-match)" = "v0.3.0"
+   $ git push origin v0.3.0
    ```
 
 7. The release workflow builds and smoke-tests Linux x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64/ARM64. It uploads each archive together with its SHA-256 checksum.
-8. If `PORTZILLA_PUBLISH_NPM=true`, the release workflow automatically publishes npm after the release assets succeed, using the required `NPM_TOKEN` repository secret.
+8. When their repository variables are enabled, the workflow publishes npm and crates.io only after every release asset succeeds.
 
 ## Manual verification
 
@@ -55,6 +50,7 @@ $ cargo install portzilla
 $ npm install -g portzilla
 $ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | sh
 $ portzilla --help
+$ portzilla run --help
 ```
 
 The `curl` and npm installers reject a release archive with a missing or invalid checksum and fall back to Cargo.

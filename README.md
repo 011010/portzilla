@@ -21,7 +21,7 @@
 - **Ask before you kill** — `portzilla who 3000` tells you who owns a port. JSON everywhere so agents can consume it directly.
 - **Guard by default** — intercepts `kill`, `lsof | xargs kill`, `fuser -k`, `kill-port` and blocks kills against another session's live lease.
 
-Existing tools (`witr`, `kill-port`, ServerSlayer) tell you what's on a port *after* the fact. `portzilla` prevents the conflict in the first place.
+Port allocators and proxies such as [Portless](https://portless.sh) solve addressability and automatic port selection. `portzilla` focuses on a different boundary: declaring which agent session owns a process and preventing another agent from killing it. It stays daemon-less by default, requires no local proxy or CA, and works with any server command that consumes the assigned port.
 
 ![Portzilla preventing a port conflict](docs/assets/portzilla-demo.gif)
 
@@ -104,7 +104,7 @@ $ cargo install --path .
 ```console
 $ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | sh
 # specific version / directory:
-$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | PORTZILLA_VERSION=0.2.0 PORTZILLA_INSTALL_DIR=/usr/local/bin sh
+$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | PORTZILLA_VERSION=0.3.0 PORTZILLA_INSTALL_DIR=/usr/local/bin sh
 ```
 
 **npm** (same native binary):
@@ -225,11 +225,11 @@ Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.lo
 
 **State-file versions.** New writes use a versioned `leases.json` envelope (`format_version: 2`) so newer identity fields cannot be silently discarded. Legacy bare-array files are read and upgraded on the next write. Older binaries cannot safely read v2 files and must be upgraded before using the same data directory; unknown future versions are rejected without rewriting the file.
 
-`portzilla` does not start/stop servers, enforce firewall/sandbox, or coordinate across machines.
+`portzilla run` starts one server command and waits for it, but Portzilla does not stop, restart, or supervise arbitrary servers. It does not enforce a firewall/sandbox or coordinate across machines.
 
 ## Roadmap
 
-v0.1: `claim`/`ls`/`who`/`release`/`prune` + JSON + locked state. v0.1.x: MCP server. v0.2: kill guard + harness adapters + `portzilla guard`. The optional foreground `watch` command is implemented; an active daemon remains future work. Full plan → [`docs/ROADMAP.md`](docs/ROADMAP.md). Release procedure → [`docs/RELEASING.md`](docs/RELEASING.md).
+v0.1: `claim`/`ls`/`who`/`release`/`prune` + JSON + locked state. v0.1.x: MCP server. v0.2: kill guard + harness adapters + `portzilla guard`. v0.3: `portzilla run` + installable agent skill. The optional foreground `watch` command is implemented; an active daemon remains future work. Full plan → [`docs/ROADMAP.md`](docs/ROADMAP.md). Release procedure → [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## License
 
