@@ -4,7 +4,7 @@ Status legend: **Implemented** (shipped in the current codebase) / **Planned** (
 
 ## v0.1 — Local lease registry — Implemented
 
-The current release. A daemon-less CLI that tracks port ownership in a locked local JSON file, with an optional foreground watcher for repeated liveness-based pruning.
+The original foundation: a daemon-less CLI that tracks port ownership in a locked local JSON file, with an optional foreground watcher for repeated liveness-based pruning.
 
 | Item | Status |
 |------|--------|
@@ -137,6 +137,20 @@ An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire
 **Own-lease recognition is again absent, for the same verified reason**: `trajectory_id` (the conversation id) reaches the hook payload, but per the Cascade Hooks docs no environment variable exposes it to the shell commands Cascade itself spawns — so claims made from a Cascade session can't be tagged with the id this hook receives. Foreign-lease protection only.
 
 **Restricted Mode**: Cascade hooks do not load or run while a workspace is open in Restricted Mode — the guard is absent there by Windsurf's own design.
+
+## v0.3 — Reliable agent server launches — Implemented
+
+`portzilla run` closes the lifecycle gap between claiming a port and starting the process that will actually bind it. A portable agent skill makes that path discoverable without changing the opt-in kill-guard setup.
+
+| Item | Status |
+|------|--------|
+| `portzilla run <PORT> --tag <TAG> [--session <S>] -- <COMMAND...>` | Implemented |
+| Actual assigned port passed to the child as `PORTZILLA_PORT` | Implemented |
+| Identity-checked lease transfer from wrapper PID to child PID | Implemented |
+| Child stdout preservation and exit-status propagation | Implemented |
+| Checked-in `skills/portzilla/SKILL.md` emitted by `portzilla init skill` | Implemented |
+
+**Rationale**: a pre-claim from an agent's ephemeral shell can become dead while the server keeps running, and claiming after the server binds causes valid OS-occupancy reassignment. `run` owns the claim, spawn, and verified transfer as one operation, while the skill teaches agents to make their framework consume the assigned port.
 
 ## Later — Planned, not yet scheduled
 

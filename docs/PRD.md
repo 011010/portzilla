@@ -2,7 +2,7 @@
 
 ## Status
 
-Version 0.2.0 release preparation. The implemented feature set includes the local lease registry (`claim`, `ls`, `who`, `release`, `prune`, `watch`), JSON and locked state, the MCP server, the kill guard with Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, and Windsurf adapters, and the universal `guard` wrapper. This document describes the product as a whole, including work not yet built — see [`ROADMAP.md`](ROADMAP.md) for what is implemented versus planned.
+Version 0.3.0 release preparation. The implemented feature set includes the local lease registry (`claim`, `ls`, `who`, `release`, `prune`, `watch`), `run` with verified child ownership transfer, the installable agent skill, JSON and locked state, the MCP server, the kill guard with Claude Code, Cursor, Gemini CLI, Codex CLI, Kimi CLI, OpenCode, and Windsurf adapters, and the universal `guard` wrapper. This document describes the product as a whole, including work not yet built — see [`ROADMAP.md`](ROADMAP.md) for what is implemented versus planned.
 
 ## Problem statement
 
@@ -12,12 +12,13 @@ When an agent tries to start a server and finds the port occupied, its default b
 
 The result is destructive interference between sessions that are otherwise fully isolated (separate worktrees, separate branches, separate contexts) except for one shared resource: the localhost port space. A second failure mode compounds this: when a session ends (agent process exits, worktree is torn down, terminal is closed) without explicit cleanup, its dev server can be left running as an orphan, occupying a port indefinitely with nothing tracking that it should be stopped.
 
-Existing tools do not address coordination:
+Existing tools address pieces of this problem, but not Portzilla's agent-safety boundary:
 
 - `lsof -i :PORT`, `kill-port`, ServerSlayer, `witr` — all diagnostic or destructive. They tell you what is on a port, or they kill it. None of them let a process declare "I am using this port for this reason" before a conflict happens, and none of them let another process check that declaration before acting.
+- Portless — assigns ports, launches development servers, and exposes stable named local URLs, including worktree-aware names. It solves routing and addressability through a local proxy; it does not provide Portzilla's session-tagged lease contract, MCP ownership queries, or multi-harness policy that blocks a foreign agent's kill command.
 - Sandboxes / containers — isolate the port namespace entirely, which solves the conflict by preventing sharing, not by coordinating it. Many dev workflows (see below) need agents sharing the host network namespace, e.g. to reach `localhost` services from the host browser or another tool.
 
-Nobody in this space treats "who currently owns this port and why" as a queryable, declared fact instead of an inference from process state.
+Portzilla's narrower gap is making "which agent session owns this process and may another agent kill it?" a declared, queryable fact and an enforceable pre-command policy.
 
 ## Target users
 
@@ -27,7 +28,7 @@ Nobody in this space treats "who currently owns this port and why" as a queryabl
 
 ## Use cases
 
-1. **Agent claims a port before starting a dev server.** An agent about to run `npm run dev` first runs `portzilla claim 3000 --tag "my-app dev server" --session <session-id>`. If 3000 is free or was held by a dead process, it gets 3000. If a live process already holds 3000 under a different owner, `portzilla` hands back the next free port instead, and the agent starts its server on that port instead of on 3000.
+1. **Agent starts a server through a verified lease.** An agent runs `portzilla run 3000 --tag "my-app dev server" --session <session-id> -- <command>`. If 3000 is unavailable, Portzilla assigns the next free port, passes it to the child as `PORTZILLA_PORT`, and transfers the lease to the verified server PID. The lower-level `claim` command remains available for callers that already own a long-lived PID.
 2. **Agent checks ownership before killing.** An agent that hits `EADDRINUSE` on a port runs `portzilla who 3000 --json` before deciding to kill anything. If the lease belongs to a different session's PID with a live process, the agent backs off (or claims a different port) instead of killing a sibling's server.
 3. **Human audits leases.** A developer running several worktrees runs `portzilla ls` to see every claimed port, its owning PID, its tag, and its age at a glance, without having to cross-reference `lsof` output against which terminal tab is running what.
 4. **Session cleanup.** When a session ends, its process calls `portzilla release <port>` for each port it claimed. If cleanup didn't run (crash, force-kill), a later `portzilla prune` removes every lease whose owning PID is no longer alive, keeping the registry accurate without manual bookkeeping.
@@ -42,7 +43,7 @@ Nobody in this space treats "who currently owns this port and why" as a queryabl
 
 ## Non-goals
 
-- **Not a process manager.** `portzilla` does not start, stop, restart, or supervise the dev servers or other processes bound to leased ports. It only tracks the claim.
+- **Not a general process manager.** `portzilla run` starts one command, transfers its lease, and waits for it. Portzilla does not discover, stop, restart, or supervise arbitrary servers.
 - **Not a firewall.** `portzilla` does not restrict network access to a port, and does not prevent any process from binding a port it has not leased.
 - **Not a sandbox.** `portzilla` does not isolate processes or network namespaces from each other. Isolation-based solutions (containers, network namespaces) solve the same underlying conflict differently; `portzilla` is for the case where isolation is undesirable or impractical (shared localhost access from host tools/browsers).
 - **No network coordination between machines in v0.x.** All state is local to a single machine's data directory. Coordinating leases across multiple machines (e.g. a shared dev server pool) is out of scope for the versions currently planned.
@@ -62,13 +63,14 @@ Because `portzilla` is a small, free CLI tool with no telemetry, success is meas
 | `witr` | Diagnostic | Shows what's listening on a port | No claiming, no ownership record, no coordination |
 | `kill-port` | Destructive | Kills whatever is bound to a port | No check for legitimate ownership before killing |
 | ServerSlayer | Destructive | Bulk-kills dev server processes | Same as above, at a larger blast radius |
+| Portless | Local proxy and launcher | Assigns ports and gives apps stable, worktree-aware local URLs | No session-tagged MCP lease contract or cross-harness kill policy |
 | Sandboxes / containers | Isolation | Give each session its own network namespace | Solves conflict by preventing sharing, not by coordinating within a shared namespace; heavier setup; doesn't help when host-level `localhost` access is required |
-| `portzilla` | Coordination | Lets processes declare and query port ownership before acting | Does not itself manage, firewall, or sandbox processes |
+| `portzilla` | Agent safety and coordination | Declares session ownership, launches with verified lease transfer, and blocks foreign-agent kills | No stable-name proxy, firewall, sandbox, or cross-machine coordination |
 
 The gap `portzilla` fills is the coordination layer that sits before any of the diagnostic or destructive tools would be reached for: a query that answers "should I even consider touching this port?" before `kill-port` or a manual `kill -9` ever runs.
 
 ## Risks
 
 - **Adoption depends on agent-side integration.** The core value proposition — agents checking ownership before killing — only holds if agents actually call `portzilla` instead of defaulting to `lsof`/`kill` patterns baked into their training or their tool prompts. A CLI that only humans use manually captures a fraction of the intended value.
-  - *Mitigation*: the roadmap prioritizes an MCP server (v0.1.x) so agents with MCP tool access can call `portzilla` natively without shelling out, followed by a Claude Code hook (v0.2) that intercepts kill/`lsof`-style command patterns at the source and suggests a `portzilla who` check — turning the safe path into the path of least resistance instead of relying on agents choosing to adopt a new tool unprompted.
+  - *Mitigation*: the MCP server, multi-harness kill guard, `portzilla run`, and installable skill are implemented. Together they make ownership queries native, intercept destructive commands, and teach agents the safe launch path instead of relying on unprompted CLI discovery.
 - **PID-reuse false positives** (see [`README.md`](../README.md#limitations)) could erode trust if a stale lease is reported `alive` and blocks a legitimate reclaim. Mitigated short-term by `prune` being cheap and safe to run frequently; longer-term by the optional daemon with active lease expiry on the roadmap.

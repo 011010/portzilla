@@ -1492,10 +1492,7 @@ mod tests {
             .write_leases(&[Lease::new(port, 100, "server", None)])
             .unwrap();
 
-        let outcome = store
-            .release(port, &AlwaysAlive)
-            .unwrap()
-            .unwrap();
+        let outcome = store.release(port, &AlwaysAlive).unwrap().unwrap();
         assert_eq!(outcome.lease.port, port);
         assert!(outcome.was_alive);
         assert!(store.get(port).unwrap().is_none());
