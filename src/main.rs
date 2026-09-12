@@ -1,3 +1,4 @@
+mod audit;
 mod claude_code;
 mod codex;
 mod cursor;
