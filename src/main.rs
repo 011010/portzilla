@@ -18,7 +18,7 @@ mod windsurf;
 use anyhow::{Context, Result};
 use audit::{
     AuditActor, AuditEventKind, AuditEventType, AuditSource, HistoryPage, HistoryQuery,
-    LeaseSnapshot,
+    LeaseSnapshot, ProcessExitOutcome,
 };
 use clap::{Parser, Subcommand};
 use lease::{Lease, PidChecker, SystemPidChecker};
@@ -1146,6 +1146,8 @@ fn run_portzilla_run(
         AuditActor::new(AuditSource::Run, None, session.clone()),
         &SystemPidChecker,
     )?;
+    let claimed_lease = outcome.lease.clone();
+    let run_actor = AuditActor::new(AuditSource::Run, None, session.clone());
     let assigned = outcome.lease.port;
 
     // The wrapper lease must carry a verified start time before anything is
@@ -1194,21 +1196,30 @@ fn run_portzilla_run(
     // never touching a lease we did not verify as ours.
     let child_pid = child.id();
     let transfer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    let transferred_lease = loop {
         match store.transfer(
             assigned,
             wrapper_pid,
             wrapper_start_time,
             child_pid,
-            AuditActor::new(AuditSource::Run, None, session.clone()),
+            run_actor.clone(),
             &SystemPidChecker,
         ) {
-            Ok(_) => break,
+            Ok(lease) => break lease,
             Err(err) => {
                 if let Some(status) = child
                     .try_wait()
                     .context("failed to poll the run child after a failed lease transfer")?
                 {
+                    if let Err(record_err) = store.record_process_exit(
+                        run_actor.clone(),
+                        &claimed_lease,
+                        process_exit_outcome(&status),
+                    ) {
+                        eprintln!(
+                            "portzilla run: warning: failed to record process exit: {record_err:#}"
+                        );
+                    }
                     exit_with_child_status(status);
                 }
                 if std::time::Instant::now() >= transfer_deadline {
@@ -1221,14 +1232,30 @@ fn run_portzilla_run(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-    }
+    };
 
     let status = child.wait().context("failed to wait for the run child")?;
+    if let Err(err) =
+        store.record_process_exit(run_actor, &transferred_lease, process_exit_outcome(&status))
+    {
+        eprintln!("portzilla run: warning: failed to record process exit: {err:#}");
+    }
     match status.code() {
         Some(0) => Ok(()),
         Some(_) => exit_with_child_status(status),
         None => exit_with_child_status(status),
     }
+}
+
+fn process_exit_outcome(status: &std::process::ExitStatus) -> ProcessExitOutcome {
+    if let Some(code) = status.code() {
+        return ProcessExitOutcome::Code(code);
+    }
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
+        return ProcessExitOutcome::Signal(signal);
+    }
+    ProcessExitOutcome::Unknown
 }
 
 /// Exits this process with the child's status: the same code when the child
@@ -1670,6 +1697,31 @@ fn print_pruned(pruned: &[Lease], json: bool) {
 #[cfg(test)]
 mod actor_tests {
     use super::resolve_cli_actor_session_from;
+
+    #[test]
+    fn process_exit_outcome_classifies_exit_code() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            super::process_exit_outcome(&status),
+            super::ProcessExitOutcome::Code(7)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_outcome_classifies_unix_signal() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            super::process_exit_outcome(&status),
+            super::ProcessExitOutcome::Signal(15)
+        );
+    }
 
     #[test]
     fn claim_actor_prefers_explicit_session_over_ambient() {

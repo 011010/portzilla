@@ -2457,6 +2457,11 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
     assert_eq!(dead["pid"], child_pid);
     assert_eq!(dead["alive"], false);
 
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("leases.json")).unwrap()).unwrap();
+    assert_eq!(state["events"][2]["event"], "process_exited");
+    assert_eq!(state["events"][2]["data"]["outcome"]["kind"], "signal");
+
     cmd(dir.path())
         .args(["prune"])
         .assert()

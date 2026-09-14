@@ -2,7 +2,7 @@
 
 use crate::audit::{
     AuditActor, AuditEvent, AuditEventDraft, AuditEventKind, AuditSource, ClaimDisposition,
-    HistoryPage, HistoryQuery, LeaseSnapshot,
+    HistoryPage, HistoryQuery, LeaseSnapshot, ProcessExitOutcome,
 };
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
@@ -336,6 +336,29 @@ impl Store {
                 events: vec![AuditEventDraft {
                     actor,
                     kind: AuditEventKind::HistoryCleared { removed_count },
+                }],
+            })
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_process_exit(
+        &self,
+        actor: AuditActor,
+        lease: &Lease,
+        outcome: ProcessExitOutcome,
+    ) -> Result<()> {
+        let actor = validate_actor(actor)?;
+        let snapshot = LeaseSnapshot::from(lease);
+        self.update_state(|_| {
+            Ok(StateUpdate::Commit {
+                result: (),
+                events: vec![AuditEventDraft {
+                    actor,
+                    kind: AuditEventKind::ProcessExited {
+                        lease: snapshot,
+                        outcome,
+                    },
                 }],
             })
         })
