@@ -154,6 +154,12 @@ pub(crate) fn validate_claim_inputs(port: u16, tag: &str, session: Option<&str>)
     Ok(())
 }
 
+fn validate_actor(actor: AuditActor) -> Result<AuditActor> {
+    let actor = AuditActor::new(actor.source, actor.harness, actor.session);
+    actor.validate()?;
+    Ok(actor)
+}
+
 /// Result of a `claim` operation: the lease that was actually created/updated,
 /// and whether it landed on a different port than the one requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -347,26 +353,54 @@ impl Store {
     /// Removes the lease on `port`, if any, and reports whether its owning
     /// PID was still alive at the time of removal. Returns `None` if there
     /// was no lease on `port`.
-    pub fn release(&self, port: u16, checker: &dyn PidChecker) -> Result<Option<ReleaseOutcome>> {
-        let _guard = self.lock_exclusive()?;
-        let mut state = self.read_state_unlocked()?;
-        let outcome = release_in_place(&mut state.leases, port, checker);
-        if outcome.is_some() {
-            self.write_v3_state(&state)?;
-        }
-        Ok(outcome)
+    pub fn release(
+        &self,
+        port: u16,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<Option<ReleaseOutcome>> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let Some(outcome) = release_in_place(&mut state.leases, port, checker) else {
+                return Ok(StateUpdate::Unchanged(None));
+            };
+            let event = AuditEventDraft {
+                actor,
+                kind: AuditEventKind::LeaseReleased {
+                    lease: LeaseSnapshot::from(&outcome.lease),
+                    was_alive: outcome.was_alive,
+                },
+            };
+            Ok(StateUpdate::Commit {
+                result: Some(outcome),
+                events: vec![event],
+            })
+        })
     }
 
     /// Removes every lease whose owning PID is dead, and returns the
     /// removed leases. Returns an empty vector if nothing was pruned.
-    pub fn prune(&self, checker: &dyn PidChecker) -> Result<Vec<Lease>> {
-        let _guard = self.lock_exclusive()?;
-        let mut state = self.read_state_unlocked()?;
-        let pruned = prune_in_place(&mut state.leases, checker);
-        if !pruned.is_empty() {
-            self.write_v3_state(&state)?;
-        }
-        Ok(pruned)
+    pub fn prune(&self, actor: AuditActor, checker: &dyn PidChecker) -> Result<Vec<Lease>> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let pruned = prune_in_place(&mut state.leases, checker);
+            if pruned.is_empty() {
+                return Ok(StateUpdate::Unchanged(Vec::new()));
+            }
+            let events = pruned
+                .iter()
+                .map(|lease| AuditEventDraft {
+                    actor: actor.clone(),
+                    kind: AuditEventKind::LeasePruned {
+                        lease: LeaseSnapshot::from(lease),
+                    },
+                })
+                .collect();
+            Ok(StateUpdate::Commit {
+                result: pruned,
+                events,
+            })
+        })
     }
 
     /// Transfers the lease on `port` from the expected wrapper identity to a
@@ -383,44 +417,53 @@ impl Store {
         expected_owner_pid: u32,
         expected_owner_start_time: u64,
         new_owner_pid: u32,
+        actor: AuditActor,
         checker: &dyn PidChecker,
     ) -> Result<Lease> {
-        let _guard = self.lock_exclusive()?;
-        let mut state = self.read_state_unlocked()?;
-        let index = state
-            .leases
-            .iter()
-            .position(|lease| lease.port == port)
-            .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
-        let existing = state.leases[index].clone();
-
-        if existing.pid != expected_owner_pid
-            || existing.process_start_time != Some(expected_owner_start_time)
-        {
-            bail!(
-                "lease on port {port} is not owned by expected owner {expected_owner_pid}: transfer rejected"
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let index = state
+                .leases
+                .iter()
+                .position(|lease| lease.port == port)
+                .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
+            let existing = state.leases[index].clone();
+            if existing.pid != expected_owner_pid
+                || existing.process_start_time != Some(expected_owner_start_time)
+            {
+                bail!(
+                    "lease on port {port} is not owned by expected owner {expected_owner_pid}: transfer rejected"
+                );
+            }
+            if !existing.is_alive(checker) {
+                bail!("lease on port {port} owner is no longer alive: transfer rejected");
+            }
+            if !checker.is_alive(new_owner_pid) {
+                bail!("child pid {new_owner_pid} is not alive: transfer rejected");
+            }
+            let Some(child_start_time) = checker.process_start_time(new_owner_pid) else {
+                bail!("child pid {new_owner_pid} has no resolvable start time: transfer rejected");
+            };
+            let transferred = Lease::new_with_process_start_time(
+                existing.port,
+                new_owner_pid,
+                existing.tag.clone(),
+                existing.session.clone(),
+                Some(child_start_time),
             );
-        }
-        if !existing.is_alive(checker) {
-            bail!("lease on port {port} owner is no longer alive: transfer rejected");
-        }
-        if !checker.is_alive(new_owner_pid) {
-            bail!("child pid {new_owner_pid} is not alive: transfer rejected");
-        }
-        let Some(child_start_time) = checker.process_start_time(new_owner_pid) else {
-            bail!("child pid {new_owner_pid} has no resolvable start time: transfer rejected");
-        };
-
-        let transferred = Lease::new_with_process_start_time(
-            existing.port,
-            new_owner_pid,
-            existing.tag.clone(),
-            existing.session.clone(),
-            Some(child_start_time),
-        );
-        state.leases[index] = transferred.clone();
-        self.write_v3_state(&state)?;
-        Ok(transferred)
+            state.leases[index] = transferred.clone();
+            Ok(StateUpdate::Commit {
+                result: transferred.clone(),
+                events: vec![AuditEventDraft {
+                    actor,
+                    kind: AuditEventKind::LeaseTransferred {
+                        wrapper_pid: expected_owner_pid,
+                        wrapper_start_time: expected_owner_start_time,
+                        lease: LeaseSnapshot::from(&transferred),
+                    },
+                }],
+            })
+        })
     }
 
     /// Ensures the data directory exists and is restricted to owner-only
@@ -2041,7 +2084,14 @@ mod tests {
             )])
             .unwrap();
 
-        let outcome = store.release(port, &AlwaysAlive).unwrap().unwrap();
+        let outcome = store
+            .release(
+                port,
+                AuditActor::new(AuditSource::Cli, None, None),
+                &AlwaysAlive,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome.lease.port, port);
         assert!(outcome.was_alive);
         assert!(store.get(port).unwrap().is_none());
@@ -2051,7 +2101,16 @@ mod tests {
     fn store_release_returns_none_for_a_port_with_no_lease() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        assert!(store.release(3000, &AlwaysAlive).unwrap().is_none());
+        assert!(
+            store
+                .release(
+                    3000,
+                    AuditActor::new(AuditSource::Cli, None, None),
+                    &AlwaysAlive
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2078,7 +2137,12 @@ mod tests {
             )
             .unwrap();
 
-        let pruned = store.prune(&AlivePids(vec![100])).unwrap();
+        let pruned = store
+            .prune(
+                AuditActor::new(AuditSource::Watch, None, None),
+                &AlivePids(vec![100]),
+            )
+            .unwrap();
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].pid, 200);
 
@@ -2101,7 +2165,12 @@ mod tests {
             )
             .unwrap();
 
-        let pruned = store.prune(&AlwaysAlive).unwrap();
+        let pruned = store
+            .prune(
+                AuditActor::new(AuditSource::Watch, None, None),
+                &AlwaysAlive,
+            )
+            .unwrap();
         assert!(pruned.is_empty());
         assert_eq!(store.list().unwrap().len(), 1);
     }
@@ -2330,7 +2399,14 @@ mod tests {
         let original = seed_wrapper_lease(&store, port, wrapper_pid, wrapper_start);
 
         let transferred = store
-            .transfer(port, wrapper_pid, wrapper_start, child_pid, &checker)
+            .transfer(
+                port,
+                wrapper_pid,
+                wrapper_start,
+                child_pid,
+                run_actor("run-session"),
+                &checker,
+            )
             .unwrap();
 
         assert_eq!(transferred.port, port);
@@ -2351,7 +2427,9 @@ mod tests {
         let port = 23201;
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
 
-        let err = store.transfer(port, 100, 111, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 100, 111, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("no lease"),
             "unexpected error: {err:#}"
@@ -2367,7 +2445,9 @@ mod tests {
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
         let original = seed_wrapper_lease(&store, port, 100, 111);
 
-        let err = store.transfer(port, 101, 111, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 101, 111, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("expected owner"),
             "unexpected error: {err:#}"
@@ -2383,7 +2463,9 @@ mod tests {
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
         let original = seed_wrapper_lease(&store, port, 100, 111);
 
-        let err = store.transfer(port, 100, 999, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 100, 999, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("expected owner"),
             "unexpected error: {err:#}"
@@ -2401,7 +2483,14 @@ mod tests {
         let recycled_checker = TransferChecker::wrapper_and_child(100, 333, 200, Some(222));
 
         let err = store
-            .transfer(port, 100, 111, 200, &recycled_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &recycled_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("no longer alive"),
@@ -2420,7 +2509,14 @@ mod tests {
         let dead_child_checker = TransferChecker::new(vec![(100, Some(111))]);
 
         let err = store
-            .transfer(port, 100, 111, 200, &dead_child_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &dead_child_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("child"),
@@ -2439,7 +2535,14 @@ mod tests {
         let no_identity_checker = TransferChecker::wrapper_and_child(100, 111, 200, None);
 
         let err = store
-            .transfer(port, 100, 111, 200, &no_identity_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &no_identity_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("child"),
@@ -2790,6 +2893,146 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("session"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    fn run_actor(session: &str) -> AuditActor {
+        AuditActor::new(AuditSource::Run, None, Some(session.to_string()))
+    }
+
+    #[test]
+    fn transfer_persists_child_lease_and_transfer_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        seed_wrapper_lease(&store, 23220, 100, 111);
+
+        store
+            .transfer(23220, 100, 111, 200, run_actor("run-session"), &checker)
+            .unwrap();
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].actor.session.as_deref(),
+            Some("run-session")
+        );
+        assert!(matches!(
+            state.events[0].kind,
+            AuditEventKind::LeaseTransferred { .. }
+        ));
+        assert_eq!(state.leases[0].pid, 200);
+        assert_eq!(state.leases[0].session.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn failed_transfer_does_not_emit_an_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        seed_wrapper_lease(&store, 23221, 100, 111);
+        let original = std::fs::read(store.state_file_path()).unwrap();
+
+        assert!(
+            store
+                .transfer(23221, 100, 999, 200, run_actor("run-session"), &checker)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        assert!(store.read_state().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn release_persists_removal_and_release_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = seed_wrapper_lease(&store, 23222, 100, 111);
+
+        store
+            .release(
+                23222,
+                AuditActor::new(AuditSource::Cli, None, Some("cli-session".into())),
+                &AlwaysAlive,
+            )
+            .unwrap();
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].actor.session.as_deref(),
+            Some("cli-session")
+        );
+        assert!(
+            matches!(state.events[0].kind, AuditEventKind::LeaseReleased { lease: ref snapshot, .. } if snapshot == &LeaseSnapshot::from(&lease))
+        );
+    }
+
+    #[test]
+    fn release_missing_port_does_not_emit_or_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+
+        assert!(
+            store
+                .release(
+                    23223,
+                    AuditActor::new(AuditSource::Cli, None, None),
+                    &AlwaysAlive
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn prune_persists_one_event_per_removed_lease_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .write_v2_leases(&[
+                Lease::new(23224, 100, "one", Some("owner-one".to_string())),
+                Lease::new(23225, 200, "two", Some("owner-two".to_string())),
+            ])
+            .unwrap();
+
+        let pruned = store
+            .prune(AuditActor::new(AuditSource::Watch, None, None), &AlwaysDead)
+            .unwrap();
+        assert_eq!(pruned.len(), 2);
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert_eq!(state.events.len(), 2);
+        assert!(
+            state
+                .events
+                .iter()
+                .all(|event| event.actor.source == AuditSource::Watch)
+        );
+        assert!(
+            state
+                .events
+                .iter()
+                .all(|event| matches!(event.kind, AuditEventKind::LeasePruned { .. }))
+        );
+    }
+
+    #[test]
+    fn prune_without_dead_leases_does_not_emit_or_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        seed_wrapper_lease(&store, 23226, 100, 111);
+        let original = std::fs::read(store.state_file_path()).unwrap();
+
+        assert!(
+            store
+                .prune(
+                    AuditActor::new(AuditSource::Watch, None, None),
+                    &TransferChecker::wrapper_and_child(100, 111, 200, Some(222))
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
     }
 }
