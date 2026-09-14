@@ -546,9 +546,49 @@ impl Store {
         hook();
         let mut leases = self.read_leases()?;
         let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
-        self.write_leases(&leases)?;
+        self.write_v2_leases(&leases)?;
         Ok(outcome)
     }
+}
+
+fn validate_state(state: &StoreState, path: &Path) -> Result<()> {
+    validate_unique_ports(&state.leases, path)?;
+    if state.next_event_sequence == 0 {
+        bail!(
+            "state file at {} has an invalid zero next_event_sequence and was not modified",
+            path.display()
+        );
+    }
+    if state.events.len() > MAX_HISTORY_EVENTS {
+        bail!(
+            "state file at {} contains more than {MAX_HISTORY_EVENTS} events and was not modified",
+            path.display()
+        );
+    }
+
+    let mut previous_sequence = 0;
+    for event in &state.events {
+        event.validate().with_context(|| {
+            format!(
+                "state file at {} contains an invalid audit event and was not modified",
+                path.display()
+            )
+        })?;
+        if event.sequence <= previous_sequence {
+            bail!(
+                "state file at {} contains duplicate or unordered event sequences and was not modified",
+                path.display()
+            );
+        }
+        previous_sequence = event.sequence;
+    }
+    if previous_sequence >= state.next_event_sequence {
+        bail!(
+            "state file at {} has next_event_sequence not above retained events and was not modified",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Applies the claim logic in-memory against an existing lease list:
@@ -869,6 +909,156 @@ mod tests {
         assert!(leases.is_empty());
     }
 
+    fn v3_event_json(sequence: u64) -> String {
+        format!(
+            r#"{{"sequence":{sequence},"occurred_at":1,"source":"cli","actor":{{"source":"cli","harness":null,"session":null}},"event":"history_cleared","data":{{"removed_count":0}}}}"#
+        )
+    }
+
+    fn write_v3_fixture(store: &Store, next_event_sequence: u64, events: &[String]) -> Vec<u8> {
+        let original = format!(
+            r#"{{"format_version":3,"next_event_sequence":{next_event_sequence},"leases":[],"events":[{}]}}"#,
+            events.join(",")
+        )
+        .into_bytes();
+        std::fs::write(store.state_file_path(), &original).unwrap();
+        original
+    }
+
+    #[test]
+    fn v2_state_decodes_with_empty_history_and_next_sequence_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(
+            store.state_file_path(),
+            r#"{"format_version":2,"leases":[]}"#,
+        )
+        .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert!(state.events.is_empty());
+        assert_eq!(state.next_event_sequence, 1);
+    }
+
+    #[test]
+    fn legacy_array_decodes_with_empty_history_and_next_sequence_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(
+            store.state_file_path(),
+            r#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#,
+        )
+        .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.leases.len(), 1);
+        assert!(state.events.is_empty());
+        assert_eq!(state.next_event_sequence, 1);
+    }
+
+    #[test]
+    fn v3_state_round_trips_leases_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 2, &[v3_event_json(1)]);
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.next_event_sequence, 2);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].sequence, 1);
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn read_only_calls_do_not_migrate_legacy_or_v2_state() {
+        for fixture in [
+            r#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#,
+            r#"{"format_version":2,"leases":[]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+            std::fs::write(store.state_file_path(), fixture).unwrap();
+            let original = std::fs::read(store.state_file_path()).unwrap();
+            assert!(store.read_state().is_ok());
+            assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn v3_rejects_zero_next_event_sequence_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 0, &[]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_duplicate_or_unordered_event_sequences_without_rewriting() {
+        for events in [
+            vec![v3_event_json(1), v3_event_json(1)],
+            vec![v3_event_json(2), v3_event_json(1)],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+            let original = write_v3_fixture(&store, 3, &events);
+            assert!(store.read_state().is_err());
+            assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn v3_rejects_zero_event_sequence_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[v3_event_json(0)]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_next_sequence_not_above_retained_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[v3_event_json(1)]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_more_than_ten_thousand_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let events: Vec<_> = (1..=10_001).map(v3_event_json).collect();
+        let original = write_v3_fixture(&store, 10_002, &events);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_oversized_bounded_event_fields_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let event = format!(
+            r#"{{"sequence":1,"occurred_at":1,"actor":{{"source":"cli","harness":null,"session":"{}"}},"event":"history_cleared","data":{{"removed_count":0}}}}"#,
+            "s".repeat(MAX_SESSION_CHARS + 1)
+        );
+        let original = write_v3_fixture(&store, 2, &[event]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn unknown_state_version_remains_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"{"format_version":99,"leases":[]}"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
     #[test]
     fn corrupt_state_file_returns_a_clear_error_instead_of_crashing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1022,7 +1212,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", requested_port)).unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .write_leases(&[Lease::new(requested_port, 4_000_000_000, "stale", None)])
+            .write_v2_leases(&[Lease::new(requested_port, 4_000_000_000, "stale", None)])
             .unwrap();
 
         let outcome = store
@@ -1080,7 +1270,7 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(reloaded.state_file_path()).unwrap())
                 .unwrap();
-        assert_eq!(state["format_version"], STATE_FORMAT_VERSION);
+        assert_eq!(state["format_version"], V2_STATE_FORMAT_VERSION);
     }
 
     #[test]
@@ -1600,7 +1790,7 @@ mod tests {
         let port = 27011;
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .write_leases(&[Lease::new_with_process_start_time(
+            .write_v2_leases(&[Lease::new_with_process_start_time(
                 port,
                 100,
                 "server",
@@ -1878,7 +2068,7 @@ mod tests {
             Some("sess-1".to_string()),
             Some(wrapper_start),
         );
-        store.write_leases(std::slice::from_ref(&lease)).unwrap();
+        store.write_v2_leases(std::slice::from_ref(&lease)).unwrap();
         lease
     }
 
