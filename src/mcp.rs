@@ -8,6 +8,7 @@
 //! `--json` flag emits (see `crate::view`), so anything already written
 //! against the CLI's JSON output recognizes MCP tool results too.
 
+use crate::audit::{AuditActor, AuditSource};
 use crate::lease::SystemPidChecker;
 use crate::store::Store;
 use crate::view::{to_claim_view, to_view};
@@ -113,7 +114,14 @@ impl PortzillaMcpServer {
         // onto tokio's dedicated blocking thread pool instead.
         let mut value = tokio::task::spawn_blocking(move || {
             store
-                .claim(requested_port, pid, tag, session, &SystemPidChecker)
+                .claim_with_actor(
+                    requested_port,
+                    pid,
+                    tag,
+                    session.clone(),
+                    AuditActor::new(AuditSource::Mcp, None, session),
+                    &SystemPidChecker,
+                )
                 .map(|outcome| {
                     serde_json::to_value(to_claim_view(&outcome, requested_port))
                         .expect("ClaimView always serializes")

@@ -16,6 +16,7 @@ mod watch;
 mod windsurf;
 
 use anyhow::{Context, Result};
+use audit::{AuditActor, AuditSource};
 use clap::{Parser, Subcommand};
 use lease::{Lease, PidChecker, SystemPidChecker};
 use std::io::Read;
@@ -397,7 +398,15 @@ fn run() -> Result<(), RunError> {
         } => {
             let store = Store::open(None)?;
             let pid = pid.unwrap_or_else(default_pid);
-            let outcome = store.claim(port, pid, tag, session, &SystemPidChecker)?;
+            let actor_session = resolve_cli_actor_session(session.as_deref());
+            let outcome = store.claim_with_actor(
+                port,
+                pid,
+                tag,
+                session,
+                AuditActor::new(AuditSource::Cli, None, actor_session),
+                &SystemPidChecker,
+            )?;
             print_claim_outcome(&outcome, port, json);
         }
         Commands::Ls { json } => {
@@ -973,6 +982,30 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
     }
 }
 
+fn resolve_cli_actor_session(explicit: Option<&str>) -> Option<String> {
+    resolve_cli_actor_session_from(
+        explicit,
+        std::env::var("PORTZILLA_SESSION").ok().as_deref(),
+        std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref(),
+    )
+}
+
+fn resolve_cli_actor_session_from(
+    explicit: Option<&str>,
+    portzilla_session: Option<&str>,
+    claude_session: Option<&str>,
+) -> Option<String> {
+    explicit
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            portzilla_session
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| claude_session.filter(|v| !v.is_empty()).map(str::to_owned))
+}
+
 /// Maps a failure to start `program` to the POSIX-conventional exit code a
 /// shell would use for the same failure: 127 when the program could not be
 /// found at all, 126 for every other reason it couldn't be started (not
@@ -1043,7 +1076,14 @@ fn run_portzilla_run(
     let session = session.filter(|s| !s.is_empty());
     let store = Store::open(None)?;
     let wrapper_pid = std::process::id();
-    let outcome = store.claim(port, wrapper_pid, tag, session.clone(), &SystemPidChecker)?;
+    let outcome = store.claim_with_actor(
+        port,
+        wrapper_pid,
+        tag,
+        session.clone(),
+        AuditActor::new(AuditSource::Run, None, session.clone()),
+        &SystemPidChecker,
+    )?;
     let assigned = outcome.lease.port;
 
     // The wrapper lease must carry a verified start time before anything is
@@ -1479,6 +1519,43 @@ fn print_pruned(pruned: &[Lease], json: bool) {
             view.port,
             view.pid,
             sanitize_for_display(&view.tag)
+        );
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::resolve_cli_actor_session_from;
+
+    #[test]
+    fn claim_actor_prefers_explicit_session_over_ambient() {
+        assert_eq!(
+            resolve_cli_actor_session_from(Some("explicit"), Some("portzilla"), Some("claude")),
+            Some("explicit".to_string())
+        );
+    }
+
+    #[test]
+    fn claim_actor_uses_portzilla_session_without_changing_lease_session() {
+        assert_eq!(
+            resolve_cli_actor_session_from(None, Some("portzilla"), Some("claude")),
+            Some("portzilla".to_string())
+        );
+    }
+
+    #[test]
+    fn claim_actor_falls_back_to_claude_code_session_id() {
+        assert_eq!(
+            resolve_cli_actor_session_from(None, None, Some("claude")),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn claim_actor_ignores_empty_portzilla_session_before_claude_fallback() {
+        assert_eq!(
+            resolve_cli_actor_session_from(None, Some(""), Some("claude")),
+            Some("claude".to_string())
         );
     }
 }
