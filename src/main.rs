@@ -1002,8 +1002,23 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
     // Fail-open: a store problem is not a reason to block a command a
     // human or script explicitly asked to run. Under `PORTZILLA_FAIL_CLOSED`,
     // a store we can't read flips to deny instead.
-    let leases = match Store::open(None).and_then(|store| store.list()) {
-        Ok(leases) => leases,
+    let (store, leases) = match Store::open(None) {
+        Ok(store) => match store.list() {
+            Ok(leases) => (Some(store), leases),
+            Err(err) => {
+                if fail_closed {
+                    eprintln!(
+                        "portzilla guard: blocked — could not verify lease safety \
+                         and PORTZILLA_FAIL_CLOSED is set (failing closed): {err:#}"
+                    );
+                    std::process::exit(2);
+                }
+                eprintln!(
+                    "portzilla guard: failed to read the lease store, failing open (execute): {err:#}"
+                );
+                (None, Vec::new())
+            }
+        },
         Err(err) => {
             if fail_closed {
                 eprintln!(
@@ -1015,17 +1030,20 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
             eprintln!(
                 "portzilla guard: failed to read the lease store, failing open (execute): {err:#}"
             );
-            Vec::new()
+            (None, Vec::new())
         }
     };
 
-    let action = guard_cmd::decide(
+    let (action, evidence) = guard_cmd::decide_with_evidence(
         &command_display,
         &leases,
         None,
         self_session.as_deref(),
         &SystemPidChecker,
     );
+    if let Some(evidence) = evidence {
+        persist_guard_evidence(store.as_ref(), evidence, self_session.as_deref());
+    }
     match action {
         guard_cmd::GuardAction::Deny { explanation } => {
             eprintln!("portzilla guard: blocked — {explanation}");
@@ -1041,6 +1059,24 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
             execute(&command);
         }
         guard_cmd::GuardAction::Execute => execute(&command),
+    }
+}
+
+fn persist_guard_evidence(
+    store: Option<&Store>,
+    evidence: guard::GuardAuditDraft,
+    actor_session: Option<&str>,
+) {
+    let Some(store) = store else { return };
+    if let Err(err) = store.record_guard_evidence(
+        AuditActor::new(
+            AuditSource::Guard,
+            Some(audit::AuditHarness::Generic),
+            actor_session.map(str::to_owned),
+        ),
+        evidence.evidence,
+    ) {
+        eprintln!("portzilla guard: warning: failed to record guard event: {err:#}");
     }
 }
 

@@ -109,6 +109,7 @@ fn unwrap_shell_c(args: &[String], depth: u32) -> Option<String> {
 /// Decides what to do with a command about to be run, given the current
 /// lease registry and the caller's session/PID identity (see the module
 /// doc comment for how those are resolved before this is called).
+#[allow(dead_code)]
 pub fn decide(
     command_display: &str,
     leases: &[Lease],
