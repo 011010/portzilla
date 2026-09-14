@@ -63,8 +63,8 @@
 //! existing throw-on-deny path then blocks the tool call exactly as a real
 //! deny would.
 
-use crate::guard::Verdict;
-use crate::hook_common::{EvaluationRequest, evaluate};
+use crate::guard::{GuardAuditDraft, Verdict};
+use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,8 @@ use serde::{Deserialize, Serialize};
 pub struct HookOutcome {
     pub stdout_json: String,
     pub stderr_note: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) audit: Option<GuardAuditDraft>,
 }
 
 /// Builds the verdict JSON for a given action.
@@ -150,6 +152,7 @@ pub fn handle_with_policy(
                 return HookOutcome {
                     stdout_json: fail_closed_response("could not parse hook input JSON"),
                     stderr_note: None,
+                    audit: None,
                 };
             }
             return HookOutcome {
@@ -157,6 +160,7 @@ pub fn handle_with_policy(
                 stderr_note: Some(format!(
                     "portzilla hook opencode: could not parse hook input JSON, failing open (allow): {err}"
                 )),
+                audit: None,
             };
         }
     };
@@ -166,6 +170,7 @@ pub fn handle_with_policy(
             return HookOutcome {
                 stdout_json: fail_closed_response("hook input had no command"),
                 stderr_note: None,
+                audit: None,
             };
         }
         return HookOutcome {
@@ -174,26 +179,31 @@ pub fn handle_with_policy(
                 "portzilla hook opencode: hook input had no command, failing open (allow)"
                     .to_string(),
             ),
+            audit: None,
         };
     };
 
-    match evaluate(EvaluationRequest {
+    let evaluation = evaluate_with_evidence(EvaluationRequest {
         command: &command,
         session: input.session_id.as_deref(),
         leases,
         checker,
-    }) {
+    });
+    match evaluation.verdict {
         Verdict::Allow => HookOutcome {
             stdout_json: verdict_json("allow", None),
             stderr_note: None,
+            audit: evaluation.evidence,
         },
         Verdict::Deny { explanation, .. } => HookOutcome {
             stdout_json: verdict_json("deny", Some(explanation)),
             stderr_note: None,
+            audit: evaluation.evidence,
         },
         Verdict::Warn { explanation } => HookOutcome {
             stdout_json: verdict_json("warn", Some(explanation)),
             stderr_note: None,
+            audit: evaluation.evidence,
         },
     }
 }
@@ -440,5 +450,29 @@ mod tests {
         assert!(PLUGIN_SNIPPET.contains("throw new Error"));
         assert!(PLUGIN_SNIPPET.contains("PORTZILLA_SESSION"));
         assert!(PLUGIN_SNIPPET.contains("input.tool !== \"bash\""));
+    }
+
+    #[test]
+    fn audit_is_present_for_deny_and_warn_and_absent_for_allow() {
+        let leases = vec![lease_with_session(3000, 1234, "server", "owner")];
+        assert!(
+            handle(
+                &shim_input_with_session("kill 1234", "caller"),
+                &leases,
+                &AlwaysAlive
+            )
+            .audit
+            .is_some()
+        );
+        assert!(
+            handle(&shim_input("pkill node"), &[], &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shim_input("git status"), &leases, &AlwaysAlive)
+                .audit
+                .is_none()
+        );
     }
 }
