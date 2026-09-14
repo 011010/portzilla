@@ -13,6 +13,13 @@ pub(crate) struct AuditEvent {
     pub(crate) kind: AuditEventKind,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditEventDraft {
+    pub(crate) actor: AuditActor,
+    pub(crate) kind: AuditEventKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditActor {
     pub(crate) source: AuditSource,

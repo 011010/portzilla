@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Restricts `path` (a directory) to owner-only access (`0700`) on Unix.
 /// No-op on non-Unix platforms, which don't share the same permission model.
@@ -54,6 +56,49 @@ pub(crate) struct StoreState {
     pub(crate) next_event_sequence: u64,
     pub(crate) leases: Vec<Lease>,
     pub(crate) events: Vec<AuditEvent>,
+}
+
+#[allow(dead_code)]
+pub(crate) enum StateUpdate<R> {
+    Unchanged(R),
+    Commit {
+        result: R,
+        events: Vec<crate::audit::AuditEventDraft>,
+    },
+}
+
+#[allow(dead_code)]
+pub(crate) trait Clock {
+    fn now(&self) -> Result<u64>;
+}
+
+#[allow(dead_code)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Result<u64> {
+        Ok(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs())
+    }
+}
+
+trait FileOps: Send + Sync {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()>;
+}
+
+struct RealFileOps;
+
+impl FileOps for RealFileOps {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes).map_err(Into::into)
+    }
+
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()> {
+        fs::rename(from, to).map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -141,6 +186,7 @@ pub struct ReleaseOutcome {
 #[derive(Clone)]
 pub struct Store {
     data_dir: PathBuf,
+    file_ops: Arc<dyn FileOps>,
 }
 
 impl Store {
@@ -184,7 +230,10 @@ impl Store {
             std::env::var(XDG_DATA_HOME_ENV_VAR).ok(),
             std::env::var(HOME_ENV_VAR).ok(),
         )?;
-        let store = Self { data_dir };
+        let store = Self {
+            data_dir,
+            file_ops: Arc::new(RealFileOps),
+        };
         store.ensure_data_dir()?;
         Ok(store)
     }
@@ -512,21 +561,109 @@ impl Store {
             leases: leases.to_vec(),
         })
         .context("failed to serialize leases to JSON")?;
-        fs::write(&tmp_path, json).with_context(|| {
-            format!(
-                "failed to write temporary state file at {}",
-                tmp_path.display()
-            )
-        })?;
+        self.file_ops
+            .write_temp(&tmp_path, &json)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary state file at {}",
+                    tmp_path.display()
+                )
+            })?;
         // Harden before the rename: rename preserves the file's existing mode,
         // so this also leaves the final `leases.json` owner-only (0600).
         harden_file_permissions(&tmp_path)?;
-        fs::rename(&tmp_path, &path).with_context(|| {
-            format!(
-                "failed to atomically replace state file at {}",
-                path.display()
-            )
-        })?;
+        self.file_ops
+            .rename_temp(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace state file at {}",
+                    path.display()
+                )
+            })?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn update_state<R>(
+        &self,
+        mutate: impl FnOnce(&mut StoreState) -> Result<StateUpdate<R>>,
+    ) -> Result<R> {
+        self.update_state_with_clock(SystemClock, mutate)
+    }
+
+    #[allow(dead_code)]
+    fn update_state_with_clock<R>(
+        &self,
+        clock: impl Clock,
+        mutate: impl FnOnce(&mut StoreState) -> Result<StateUpdate<R>>,
+    ) -> Result<R> {
+        let _guard = self.lock_exclusive()?;
+        let mut state = self.read_state_unlocked()?;
+        let update = mutate(&mut state)?;
+        let StateUpdate::Commit { result, events } = update else {
+            let StateUpdate::Unchanged(result) = update else {
+                unreachable!();
+            };
+            return Ok(result);
+        };
+        if events.is_empty() {
+            bail!("state commit requires at least one event draft");
+        }
+        if state.next_event_sequence == u64::MAX
+            || events.len() as u64 > u64::MAX - state.next_event_sequence
+        {
+            bail!("state update would exhaust the event sequence");
+        }
+        let occurred_at = clock.now()?;
+        for draft in events {
+            let sequence = state.next_event_sequence;
+            state.next_event_sequence += 1;
+            state.events.push(AuditEvent {
+                sequence,
+                occurred_at,
+                actor: draft.actor,
+                kind: draft.kind,
+            });
+        }
+        let excess = state.events.len().saturating_sub(MAX_HISTORY_EVENTS);
+        if excess > 0 {
+            state.events.drain(..excess);
+        }
+        validate_state(&state, &self.state_file_path())?;
+        self.write_v3_state(&state)?;
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    fn write_v3_state(&self, state: &StoreState) -> Result<()> {
+        let path = self.state_file_path();
+        let tmp_path = self
+            .data_dir
+            .join(format!(".leases.json.tmp.{}", std::process::id()));
+        let json = serde_json::to_vec_pretty(&StoredStateV3 {
+            format_version: STATE_FORMAT_VERSION,
+            next_event_sequence: state.next_event_sequence,
+            leases: state.leases.clone(),
+            events: state.events.clone(),
+        })
+        .context("failed to serialize state to JSON")?;
+        self.file_ops
+            .write_temp(&tmp_path, &json)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary state file at {}",
+                    tmp_path.display()
+                )
+            })?;
+        harden_file_permissions(&tmp_path)?;
+        self.file_ops
+            .rename_temp(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace state file at {}",
+                    path.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -814,6 +951,7 @@ pub(crate) fn prune_in_place(leases: &mut Vec<Lease>, checker: &dyn PidChecker) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditEventDraft;
     use crate::lease::{
         SystemPidChecker,
         test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
@@ -2204,5 +2342,180 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    struct FixedClock(u64);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    fn history_clear_draft() -> AuditEventDraft {
+        AuditEventDraft {
+            actor: crate::audit::AuditActor::new(
+                crate::audit::AuditSource::Cli,
+                None,
+                Some("session-a".to_string()),
+            ),
+            kind: crate::audit::AuditEventKind::HistoryCleared { removed_count: 0 },
+        }
+    }
+
+    #[test]
+    fn state_update_assigns_consecutive_sequences_with_one_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let result = store
+            .update_state_with_clock(FixedClock(123), |state| {
+                state.leases.clear();
+                Ok(StateUpdate::Commit {
+                    result: 7,
+                    events: vec![history_clear_draft(), history_clear_draft()],
+                })
+            })
+            .unwrap();
+
+        assert_eq!(result, 7);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), 2);
+        assert_eq!(state.events[0].sequence, 1);
+        assert_eq!(state.events[1].sequence, 2);
+        assert_eq!(state.events[0].occurred_at, 123);
+        assert_eq!(state.events[1].occurred_at, 123);
+        assert_eq!(state.next_event_sequence, 3);
+    }
+
+    #[test]
+    fn state_update_trims_oldest_events_and_preserves_monotonic_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let events: Vec<_> = (1..=MAX_HISTORY_EVENTS)
+            .map(|sequence| v3_event_json(sequence as u64))
+            .collect();
+        write_v3_fixture(&store, (MAX_HISTORY_EVENTS + 1) as u64, &events);
+
+        store
+            .update_state_with_clock(FixedClock(456), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft(), history_clear_draft()],
+                })
+            })
+            .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), MAX_HISTORY_EVENTS);
+        assert_eq!(state.events[0].sequence, 3);
+        assert_eq!(
+            state.events.last().unwrap().sequence,
+            (MAX_HISTORY_EVENTS + 2) as u64
+        );
+        assert_eq!(state.next_event_sequence, (MAX_HISTORY_EVENTS + 3) as u64);
+    }
+
+    #[test]
+    fn state_update_rejects_sequence_exhaustion_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, u64::MAX, &[]);
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("sequence"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn state_update_rejects_commit_without_event_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: Vec::new(),
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("event"));
+    }
+
+    #[test]
+    fn state_update_does_not_write_for_unchanged_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+
+        let result = store
+            .update_state_with_clock(FixedClock(1), |_| Ok(StateUpdate::Unchanged(9)))
+            .unwrap();
+        assert_eq!(result, 9);
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn temporary_write_failure_preserves_previous_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+        std::fs::create_dir(
+            store
+                .data_dir
+                .join(format!(".leases.json.tmp.{}", std::process::id())),
+        )
+        .unwrap();
+
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("temporary") || err.to_string().contains("write"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    struct RenameFailFileOps;
+
+    impl FileOps for RenameFailFileOps {
+        fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+            std::fs::write(path, bytes).map_err(Into::into)
+        }
+
+        fn rename_temp(&self, _from: &Path, _to: &Path) -> Result<()> {
+            anyhow::bail!("injected rename failure")
+        }
+    }
+
+    #[test]
+    fn rename_failure_preserves_previous_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            data_dir: dir.path().to_path_buf(),
+            file_ops: std::sync::Arc::new(RenameFailFileOps),
+        };
+        store.ensure_data_dir().unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("atomically replace"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
     }
 }
