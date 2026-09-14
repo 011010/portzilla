@@ -188,7 +188,19 @@ For agents with MCP access (Claude Code, etc.) — typed JSON in/out instead of 
 $ claude mcp add portzilla -- portzilla serve --mcp
 ```
 
-Exposes `claim`, `who`, `ls`, `release`, `prune` as MCP tools with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
+Exposes `claim`, `who`, `ls`, `release`, `prune`, and read-only `history` as MCP tools with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
+
+## Audit history
+
+Portzilla keeps the latest 10,000 operational events alongside the lease state. Lease changes, managed-process exits, and guard denies/warnings are recorded; guard allows and raw shell commands are not.
+
+```console
+$ portzilla history --json
+$ portzilla history --session my-session --event guard_denied
+$ portzilla history clear
+```
+
+History is newest-first and supports `--session`, `--port`, `--event`, `--before`, and `--limit`. Hook and guard event writes are best-effort: a journal failure never changes an allow/deny decision. The MCP server exposes the same read-only history query; clearing history is CLI-only. See **[docs/CLI.md#history](docs/CLI.md#history)**.
 
 ## Kill guard
 
@@ -213,7 +225,7 @@ Full harness setup, `sh -c` unwrapping rules, and fail-open/closed semantics →
 
 ## Data file & config
 
-Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. State at `leases.json` (atomic write + `leases.json.lock`).
+Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. State at `leases.json` (atomic write + `leases.json.lock`). New writes use the v3 envelope, which stores leases and bounded audit history together.
 
 `PORTZILLA_DATA_DIR` isolates tests/CI. `tag` max 1024 chars, `session` max 512, hook stdin capped at 1 MiB. New leases persist `process_start_time` when available; reassignment JSON includes `reassignment_reason` (`lease_conflict` or `os_occupied`). Claims for an explicit PID that does not exist yet are retained as unverified/dead records, not as ownership promises. The normal CLI default attributes a claim to its live parent process. See **[docs/CLI.md](docs/CLI.md)**.
 
@@ -229,7 +241,7 @@ Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.lo
 
 ## Roadmap
 
-v0.1: `claim`/`ls`/`who`/`release`/`prune` + JSON + locked state. v0.1.x: MCP server. v0.2: kill guard + harness adapters + `portzilla guard`. v0.3: `portzilla run` + installable agent skill. The optional foreground `watch` command is implemented; an active daemon remains future work. Full plan → [`docs/ROADMAP.md`](docs/ROADMAP.md). Release procedure → [`docs/RELEASING.md`](docs/RELEASING.md).
+v0.1: `claim`/`ls`/`who`/`release`/`prune` + JSON + locked state. v0.1.x: MCP server. v0.2: kill guard + harness adapters + `portzilla guard`. v0.3: `portzilla run` + installable agent skill + audit history. The optional foreground `watch` command is implemented; an active daemon remains future work. Full plan → [`docs/ROADMAP.md`](docs/ROADMAP.md). Release procedure → [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## License
 
