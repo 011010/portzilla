@@ -1,5 +1,8 @@
 use crate::lease::Lease;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+
+pub(crate) const MAX_AUDIT_TARGET_CHARS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditEvent {
@@ -7,12 +10,6 @@ pub(crate) struct AuditEvent {
     pub(crate) occurred_at: u64,
     pub(crate) actor: AuditActor,
     #[serde(flatten)]
-    pub(crate) kind: AuditEventKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AuditEventDraft {
-    pub(crate) actor: AuditActor,
     pub(crate) kind: AuditEventKind,
 }
 
@@ -24,6 +21,7 @@ pub(crate) struct AuditActor {
 }
 
 impl AuditActor {
+    #[allow(dead_code)]
     pub(crate) fn new(
         source: AuditSource,
         harness: Option<AuditHarness>,
@@ -34,6 +32,10 @@ impl AuditActor {
             harness,
             session: session.filter(|value| !value.is_empty()),
         }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_optional_string(self.session.as_deref(), "actor session")
     }
 }
 
@@ -84,6 +86,15 @@ impl From<&Lease> for LeaseSnapshot {
     }
 }
 
+impl LeaseSnapshot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.tag.chars().count() > crate::store::MAX_TAG_CHARS {
+            bail!("audit lease tag exceeds the maximum length");
+        }
+        validate_optional_string(self.session.as_deref(), "lease session")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClaimDisposition {
@@ -108,6 +119,17 @@ pub(crate) enum GuardTarget {
     Pid { pid: u32 },
     Port { port: u16 },
     ProcessName { name: String },
+}
+
+impl GuardTarget {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Self::ProcessName { name } = self
+            && (name.is_empty() || name.chars().count() > MAX_AUDIT_TARGET_CHARS)
+        {
+            bail!("audit process name must be between 1 and {MAX_AUDIT_TARGET_CHARS} characters");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +205,71 @@ pub(crate) enum AuditEventType {
     GuardWarned,
     #[value(name = "history_cleared")]
     HistoryCleared,
+}
+
+impl AuditEventKind {
+    #[allow(dead_code)]
+    pub(crate) fn event_type(&self) -> AuditEventType {
+        match self {
+            Self::LeaseClaimed { .. } => AuditEventType::LeaseClaimed,
+            Self::LeaseTransferred { .. } => AuditEventType::LeaseTransferred,
+            Self::LeaseReleased { .. } => AuditEventType::LeaseReleased,
+            Self::LeasePruned { .. } => AuditEventType::LeasePruned,
+            Self::ProcessExited { .. } => AuditEventType::ProcessExited,
+            Self::GuardDenied { .. } => AuditEventType::GuardDenied,
+            Self::GuardWarned { .. } => AuditEventType::GuardWarned,
+            Self::HistoryCleared { .. } => AuditEventType::HistoryCleared,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::LeaseClaimed {
+                lease,
+                prior_lease,
+                replaced_lease,
+                ..
+            } => {
+                lease.validate()?;
+                if let Some(snapshot) = prior_lease {
+                    snapshot.validate()?;
+                }
+                if let Some(snapshot) = replaced_lease {
+                    snapshot.validate()?;
+                }
+            }
+            Self::LeaseTransferred { lease, .. }
+            | Self::LeaseReleased { lease, .. }
+            | Self::LeasePruned { lease }
+            | Self::ProcessExited { lease, .. }
+            | Self::GuardDenied { lease, .. } => lease.validate()?,
+            Self::GuardWarned { target, .. } => target.validate()?,
+            Self::HistoryCleared { .. } => {}
+        }
+        if let Self::GuardDenied { target, .. } = self {
+            target.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl AuditEvent {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.sequence == 0 {
+            bail!("audit event sequence must be greater than zero");
+        }
+        self.actor.validate()?;
+        self.kind.validate()
+    }
+}
+
+fn validate_optional_string(value: Option<&str>, label: &str) -> Result<()> {
+    if let Some(value) = value
+        && value.chars().count() > crate::store::MAX_SESSION_CHARS
+    {
+        bail!("{label} exceeds the maximum length");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
