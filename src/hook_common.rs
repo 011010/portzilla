@@ -8,6 +8,7 @@ pub(crate) struct EvaluationRequest<'a> {
     pub(crate) checker: &'a dyn PidChecker,
 }
 
+#[allow(dead_code)]
 pub(crate) fn evaluate(request: EvaluationRequest<'_>) -> Verdict {
     evaluate_with_evidence(request).verdict
 }
