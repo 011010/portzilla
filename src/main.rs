@@ -423,7 +423,11 @@ fn run() -> Result<(), RunError> {
         }
         Commands::Release { port, json } => {
             let store = Store::open(None)?;
-            match store.release(port, &SystemPidChecker)? {
+            match store.release(
+                port,
+                AuditActor::new(AuditSource::Cli, None, resolve_cli_actor_session(None)),
+                &SystemPidChecker,
+            )? {
                 Some(outcome) => {
                     if outcome.was_alive {
                         eprintln!(
@@ -438,7 +442,10 @@ fn run() -> Result<(), RunError> {
         }
         Commands::Prune { json } => {
             let store = Store::open(None)?;
-            let pruned = store.prune(&SystemPidChecker)?;
+            let pruned = store.prune(
+                AuditActor::new(AuditSource::Cli, None, resolve_cli_actor_session(None)),
+                &SystemPidChecker,
+            )?;
             print_pruned(&pruned, json);
         }
     }
@@ -1138,6 +1145,7 @@ fn run_portzilla_run(
             wrapper_pid,
             wrapper_start_time,
             child_pid,
+            AuditActor::new(AuditSource::Run, None, session.clone()),
             &SystemPidChecker,
         ) {
             Ok(_) => break,

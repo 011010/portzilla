@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::audit::{AuditActor, AuditSource};
 use crate::lease::{Lease, PidChecker, SystemPidChecker, current_unix_timestamp};
 use crate::store::Store;
 use crate::view::LeaseView;
@@ -148,7 +149,7 @@ fn run_cycle_with_checker(
 ) -> Result<Vec<Lease>> {
     let store = Store::open(data_dir).context("failed to open store for watch cycle")?;
     store
-        .prune(checker)
+        .prune(AuditActor::new(AuditSource::Watch, None, None), checker)
         .context("failed to prune leases during watch cycle")
 }
 
