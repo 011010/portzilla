@@ -325,6 +325,22 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn clear_history(&self, actor: AuditActor) -> Result<usize> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let removed_count = state.events.len() as u64;
+            state.events.clear();
+            Ok(StateUpdate::Commit {
+                result: removed_count as usize,
+                events: vec![AuditEventDraft {
+                    actor,
+                    kind: AuditEventKind::HistoryCleared { removed_count },
+                }],
+            })
+        })
+    }
+
     /// Claims `requested_port` for `pid`, following the conflict-resolution
     /// rules documented on [`claim_in_place`].
     #[allow(dead_code)]
@@ -3271,5 +3287,52 @@ mod tests {
             .unwrap();
         assert!(page.events.is_empty());
         assert!(!page.has_more);
+    }
+
+    #[test]
+    fn store_clear_history_is_atomic_and_preserves_next_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![AuditEventKind::HistoryCleared { removed_count: 0 }],
+        );
+        let removed = store
+            .clear_history(AuditActor::new(
+                AuditSource::Cli,
+                None,
+                Some("clear-session".into()),
+            ))
+            .unwrap();
+        assert_eq!(removed, 1);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.next_event_sequence, 3);
+        assert_eq!(state.events.len(), 1);
+        assert!(matches!(
+            state.events[0].kind,
+            AuditEventKind::HistoryCleared { removed_count: 1 }
+        ));
+        assert_eq!(
+            state.events[0].actor.session.as_deref(),
+            Some("clear-session")
+        );
+    }
+
+    #[test]
+    fn store_clear_history_on_empty_state_records_zero_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            store
+                .clear_history(AuditActor::new(AuditSource::Cli, None, None))
+                .unwrap(),
+            0
+        );
+        let state = store.read_state().unwrap();
+        assert_eq!(state.next_event_sequence, 2);
+        assert!(matches!(
+            state.events[0].kind,
+            AuditEventKind::HistoryCleared { removed_count: 0 }
+        ));
     }
 }
