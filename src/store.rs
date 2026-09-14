@@ -4,6 +4,7 @@ use crate::audit::{
     AuditActor, AuditEvent, AuditEventDraft, AuditEventKind, AuditSource, ClaimDisposition,
     HistoryPage, HistoryQuery, LeaseSnapshot, ProcessExitOutcome,
 };
+use crate::guard::GuardEvidence;
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -360,6 +361,32 @@ impl Store {
                         outcome,
                     },
                 }],
+            })
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_guard_evidence(
+        &self,
+        actor: AuditActor,
+        evidence: GuardEvidence,
+    ) -> Result<()> {
+        let actor = validate_actor(actor)?;
+        let kind = match evidence {
+            GuardEvidence::Denied { target, lease } => AuditEventKind::GuardDenied {
+                target,
+                reason: crate::audit::GuardDenyReason::ForeignLiveLease,
+                lease: LeaseSnapshot::from(&lease),
+            },
+            GuardEvidence::Warned { target } => AuditEventKind::GuardWarned {
+                target,
+                reason: crate::audit::GuardWarnReason::UnresolvableProcessName,
+            },
+        };
+        self.update_state(|_| {
+            Ok(StateUpdate::Commit {
+                result: (),
+                events: vec![AuditEventDraft { actor, kind }],
             })
         })
     }
@@ -3357,5 +3384,74 @@ mod tests {
             state.events[0].kind,
             AuditEventKind::HistoryCleared { removed_count: 0 }
         ));
+    }
+
+    #[test]
+    fn record_guard_denied_persists_structured_target_and_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = Lease::new(23030, 1234, "server", Some("owner".into()));
+        store
+            .record_guard_evidence(
+                AuditActor::new(AuditSource::Guard, None, Some("caller".into())),
+                GuardEvidence::Denied {
+                    target: crate::audit::GuardTarget::Pid { pid: 1234 },
+                    lease: lease.clone(),
+                },
+            )
+            .unwrap();
+        let event = &store.read_state().unwrap().events[0];
+        assert_eq!(event.actor.session.as_deref(), Some("caller"));
+        assert!(matches!(
+            event.kind,
+            AuditEventKind::GuardDenied {
+                target: crate::audit::GuardTarget::Pid { pid: 1234 },
+                lease: ref snapshot,
+                ..
+            } if snapshot == &LeaseSnapshot::from(&lease)
+        ));
+    }
+
+    #[test]
+    fn record_guard_warned_persists_bounded_process_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .record_guard_evidence(
+                AuditActor::new(AuditSource::Guard, None, None),
+                GuardEvidence::Warned {
+                    target: crate::audit::GuardTarget::ProcessName {
+                        name: "node".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.read_state().unwrap().events[0].kind,
+            AuditEventKind::GuardWarned {
+                target: crate::audit::GuardTarget::ProcessName { ref name },
+                ..
+            } if name == "node"
+        ));
+    }
+
+    #[test]
+    fn record_guard_evidence_rejects_oversized_process_name_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+        assert!(
+            store
+                .record_guard_evidence(
+                    AuditActor::new(AuditSource::Guard, None, None),
+                    GuardEvidence::Warned {
+                        target: crate::audit::GuardTarget::ProcessName {
+                            name: "x".repeat(crate::audit::MAX_AUDIT_TARGET_CHARS + 1),
+                        },
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
     }
 }
