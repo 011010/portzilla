@@ -2,7 +2,7 @@
 
 use crate::audit::{
     AuditActor, AuditEvent, AuditEventDraft, AuditEventKind, AuditSource, ClaimDisposition,
-    LeaseSnapshot,
+    HistoryPage, HistoryQuery, LeaseSnapshot,
 };
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
@@ -47,6 +47,8 @@ const HOME_ENV_VAR: &str = "HOME";
 const V2_STATE_FORMAT_VERSION: u32 = 2;
 const STATE_FORMAT_VERSION: u32 = 3;
 pub(crate) const MAX_HISTORY_EVENTS: usize = 10_000;
+#[allow(dead_code)]
+pub(crate) const MAX_HISTORY_LIMIT: usize = 1_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct StoredStateV2 {
@@ -276,6 +278,51 @@ impl Store {
     pub fn list(&self) -> Result<Vec<Lease>> {
         let _guard = self.lock_exclusive()?;
         self.read_leases_for_read()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn history(&self, query: &HistoryQuery) -> Result<HistoryPage> {
+        let _guard = self.lock_exclusive()?;
+        if query.before == Some(0) {
+            return Ok(HistoryPage {
+                events: Vec::new(),
+                has_more: false,
+                next_before: None,
+            });
+        }
+        let mut matching = self
+            .read_state_unlocked()?
+            .events
+            .into_iter()
+            .rev()
+            .filter(|event| query.before.is_none_or(|before| event.sequence < before))
+            .filter(|event| {
+                query
+                    .event
+                    .is_none_or(|event_type| event.kind.event_type() == event_type)
+            })
+            .filter(|event| {
+                query.session.as_deref().is_none_or(|session| {
+                    event.actor.session.as_deref() == Some(session)
+                        || event.kind.involves_session(session)
+                })
+            })
+            .filter(|event| query.port.is_none_or(|port| event.kind.involves_port(port)));
+        let mut events = Vec::with_capacity(query.limit);
+        while events.len() <= query.limit {
+            let Some(event) = matching.next() else { break };
+            events.push(event);
+        }
+        let has_more = events.len() > query.limit;
+        if has_more {
+            events.pop();
+        }
+        let next_before = events.last().map(|event| event.sequence);
+        Ok(HistoryPage {
+            events,
+            has_more,
+            next_before,
+        })
     }
 
     /// Claims `requested_port` for `pid`, following the conflict-resolution
@@ -1098,7 +1145,7 @@ pub(crate) fn prune_in_place(leases: &mut Vec<Lease>, checker: &dyn PidChecker) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditActor, AuditEventDraft, AuditEventKind, AuditSource};
+    use crate::audit::{AuditActor, AuditEventDraft, AuditEventKind, AuditEventType, AuditSource};
     use crate::lease::{
         SystemPidChecker,
         test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
@@ -3034,5 +3081,195 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    fn append_history(store: &Store, kinds: Vec<AuditEventKind>) {
+        store
+            .update_state(|_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: kinds
+                        .into_iter()
+                        .map(|kind| AuditEventDraft {
+                            actor: AuditActor::new(
+                                AuditSource::Cli,
+                                None,
+                                Some("actor-session".into()),
+                            ),
+                            kind,
+                        })
+                        .collect(),
+                })
+            })
+            .unwrap();
+    }
+
+    fn history_query(
+        session: Option<&str>,
+        port: Option<u16>,
+        event: Option<AuditEventType>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> HistoryQuery {
+        HistoryQuery::try_new(session.map(str::to_owned), port, event, before, limit).unwrap()
+    }
+
+    #[test]
+    fn history_returns_matching_events_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+                AuditEventKind::GuardWarned {
+                    target: crate::audit::GuardTarget::Port { port: 23000 },
+                    reason: crate::audit::GuardWarnReason::UnresolvableProcessName,
+                },
+            ],
+        );
+
+        let page = store
+            .history(&history_query(None, None, None, None, 100))
+            .unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(!page.has_more);
+        assert_eq!(page.next_before, Some(1));
+    }
+
+    #[test]
+    fn history_combines_filters_with_logical_and() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = LeaseSnapshot::from(&Lease::new(
+            23001,
+            1234,
+            "tag",
+            Some("owner-session".into()),
+        ));
+        append_history(
+            &store,
+            vec![
+                AuditEventKind::LeaseReleased {
+                    lease: lease.clone(),
+                    was_alive: false,
+                },
+                AuditEventKind::LeasePruned { lease },
+            ],
+        );
+        let page = store
+            .history(&history_query(
+                Some("owner-session"),
+                Some(23001),
+                Some(AuditEventType::LeasePruned),
+                None,
+                100,
+            ))
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].sequence, 2);
+    }
+
+    #[test]
+    fn history_session_matches_actor_or_affected_lease_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![AuditEventKind::LeaseReleased {
+                lease: LeaseSnapshot::from(&Lease::new(
+                    23002,
+                    1234,
+                    "tag",
+                    Some("owner-session".into()),
+                )),
+                was_alive: false,
+            }],
+        );
+        let page = store
+            .history(&history_query(Some("owner-session"), None, None, None, 100))
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+    }
+
+    #[test]
+    fn history_before_sequence_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+            ],
+        );
+        let page = store
+            .history(&history_query(None, None, None, Some(3), 100))
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].sequence, 2);
+    }
+
+    #[test]
+    fn history_uses_one_extra_match_to_calculate_has_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+                AuditEventKind::HistoryCleared { removed_count: 0 },
+            ],
+        );
+        let page = store
+            .history(&history_query(None, None, None, None, 2))
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert!(page.has_more);
+        assert_eq!(page.next_before, Some(2));
+    }
+
+    #[test]
+    fn history_rejects_empty_or_oversized_session_filters() {
+        assert!(HistoryQuery::try_new(Some(String::new()), None, None, None, 100).is_err());
+        assert!(
+            HistoryQuery::try_new(
+                Some("x".repeat(MAX_SESSION_CHARS + 1)),
+                None,
+                None,
+                None,
+                100,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn history_rejects_limits_outside_one_through_one_thousand() {
+        assert!(HistoryQuery::try_new(None, None, None, None, 0).is_err());
+        assert!(HistoryQuery::try_new(None, None, None, None, 1001).is_err());
+    }
+
+    #[test]
+    fn history_before_zero_returns_an_empty_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        append_history(
+            &store,
+            vec![AuditEventKind::HistoryCleared { removed_count: 0 }],
+        );
+        let page = store
+            .history(&history_query(None, None, None, Some(0), 100))
+            .unwrap();
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
     }
 }
