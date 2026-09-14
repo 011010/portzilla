@@ -16,7 +16,10 @@ mod watch;
 mod windsurf;
 
 use anyhow::{Context, Result};
-use audit::{AuditActor, AuditSource};
+use audit::{
+    AuditActor, AuditEventKind, AuditEventType, AuditSource, HistoryPage, HistoryQuery,
+    LeaseSnapshot,
+};
 use clap::{Parser, Subcommand};
 use lease::{Lease, PidChecker, SystemPidChecker};
 use std::io::Read;
@@ -125,6 +128,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Query or clear the bounded event history.
+    History {
+        /// Clear all retained events instead of querying them.
+        #[arg(value_enum)]
+        action: Option<HistoryAction>,
+        #[arg(long, conflicts_with = "action")]
+        session: Option<String>,
+        #[arg(long, conflicts_with = "action")]
+        port: Option<u16>,
+        #[arg(long, value_enum, conflicts_with = "action")]
+        event: Option<AuditEventType>,
+        #[arg(long, conflicts_with = "action")]
+        before: Option<u64>,
+        #[arg(long, conflicts_with = "action")]
+        limit: Option<usize>,
+        #[arg(long, conflicts_with = "action")]
+        json: bool,
+    },
     /// Periodically remove leases whose owning processes have exited.
     Watch {
         /// Seconds between lease-pruning cycles (default: 60).
@@ -195,6 +216,11 @@ enum Commands {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HistoryAction {
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -447,6 +473,35 @@ fn run() -> Result<(), RunError> {
                 &SystemPidChecker,
             )?;
             print_pruned(&pruned, json);
+        }
+        Commands::History {
+            action,
+            session,
+            port,
+            event,
+            before,
+            limit,
+            json,
+        } => {
+            let store = Store::open(None)?;
+            if matches!(action, Some(HistoryAction::Clear)) {
+                let removed = store.clear_history(AuditActor::new(
+                    AuditSource::Cli,
+                    None,
+                    resolve_cli_actor_session(None),
+                ))?;
+                println!("cleared {removed} history events");
+            } else {
+                let query = HistoryQuery::try_new(
+                    session,
+                    port,
+                    event,
+                    before,
+                    limit.unwrap_or(audit::DEFAULT_HISTORY_LIMIT),
+                )?;
+                let page = store.history(&query)?;
+                print_history(&page, json);
+            }
         }
     }
     Ok(())
@@ -1413,6 +1468,87 @@ pub(crate) fn sanitize_for_display(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+fn print_history(page: &HistoryPage, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(page).expect("HistoryPage always serializes")
+        );
+        return;
+    }
+    if page.events.is_empty() {
+        println!("no history events");
+        return;
+    }
+    println!("SEQ EVENT SOURCE HARNESS ACTOR_SESSION LEASE_SESSION PORT PID SUMMARY");
+    let now = lease::current_unix_timestamp();
+    for event in &page.events {
+        let snapshot = history_snapshot(&event.kind);
+        let lease_session = snapshot
+            .and_then(|lease| lease.session.as_deref())
+            .map(sanitize_for_display)
+            .unwrap_or_else(|| "(none)".into());
+        let port =
+            history_port(&event.kind, snapshot).map_or_else(|| "-".into(), |port| port.to_string());
+        let pid = snapshot.map_or_else(|| "-".into(), |lease| lease.pid.to_string());
+        let actor_session = event
+            .actor
+            .session
+            .as_deref()
+            .map(sanitize_for_display)
+            .unwrap_or_else(|| "(none)".into());
+        let source = serde_json::to_string(&event.actor.source)
+            .unwrap_or_else(|_| "unknown".into())
+            .trim_matches('"')
+            .to_string();
+        let harness = event
+            .actor
+            .harness
+            .and_then(|value| serde_json::to_string(&value).ok())
+            .map(|value| value.trim_matches('"').to_string())
+            .unwrap_or_else(|| "-".into());
+        let summary = serde_json::to_string(&event.kind)
+            .unwrap_or_else(|_| "{}".into())
+            .replace(['\n', '\r', '\t'], " ");
+        println!(
+            "{} {} {} {} {} {} {} {} age={}s {}",
+            event.sequence,
+            event.kind.event_type().as_str(),
+            source,
+            harness,
+            actor_session,
+            lease_session,
+            port,
+            pid,
+            now.saturating_sub(event.occurred_at),
+            summary
+        );
+    }
+}
+
+fn history_snapshot(kind: &AuditEventKind) -> Option<&LeaseSnapshot> {
+    match kind {
+        AuditEventKind::LeaseClaimed { lease, .. }
+        | AuditEventKind::LeaseTransferred { lease, .. }
+        | AuditEventKind::LeaseReleased { lease, .. }
+        | AuditEventKind::LeasePruned { lease }
+        | AuditEventKind::ProcessExited { lease, .. }
+        | AuditEventKind::GuardDenied { lease, .. } => Some(lease),
+        AuditEventKind::GuardWarned { .. } | AuditEventKind::HistoryCleared { .. } => None,
+    }
+}
+
+fn history_port(kind: &AuditEventKind, snapshot: Option<&LeaseSnapshot>) -> Option<u16> {
+    match kind {
+        AuditEventKind::LeaseClaimed { requested_port, .. } => Some(*requested_port),
+        AuditEventKind::GuardWarned { target, .. } => match target {
+            audit::GuardTarget::Port { port } => Some(*port),
+            _ => None,
+        },
+        _ => snapshot.map(|lease| lease.port),
+    }
 }
 
 fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) {

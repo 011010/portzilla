@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_AUDIT_TARGET_CHARS: usize = 512;
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditEvent {
@@ -212,6 +213,21 @@ pub(crate) enum AuditEventType {
     GuardWarned,
     #[value(name = "history_cleared")]
     HistoryCleared,
+}
+
+impl AuditEventType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseClaimed => "lease_claimed",
+            Self::LeaseTransferred => "lease_transferred",
+            Self::LeaseReleased => "lease_released",
+            Self::LeasePruned => "lease_pruned",
+            Self::ProcessExited => "process_exited",
+            Self::GuardDenied => "guard_denied",
+            Self::GuardWarned => "guard_warned",
+            Self::HistoryCleared => "history_cleared",
+        }
+    }
 }
 
 #[allow(dead_code)]
