@@ -1,6 +1,9 @@
 //! Locked JSON persistence for leases, and the port-claiming core logic.
 
-use crate::audit::AuditEvent;
+use crate::audit::{
+    AuditActor, AuditEvent, AuditEventDraft, AuditEventKind, AuditSource, ClaimDisposition,
+    LeaseSnapshot,
+};
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -167,6 +170,22 @@ pub struct ClaimOutcome {
     pub reassignment_reason: Option<ReassignmentReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimMutation {
+    pub(crate) outcome: ClaimOutcome,
+    pub(crate) disposition: ClaimDisposition,
+    pub(crate) prior_lease: Option<Lease>,
+    pub(crate) replaced_lease: Option<Lease>,
+}
+
+impl std::ops::Deref for ClaimMutation {
+    type Target = ClaimOutcome;
+
+    fn deref(&self) -> &Self::Target {
+        &self.outcome
+    }
+}
+
 /// Result of a `release` operation: the lease that was removed, and whether
 /// its owning PID was still alive at the time of release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +274,7 @@ impl Store {
 
     /// Claims `requested_port` for `pid`, following the conflict-resolution
     /// rules documented on [`claim_in_place`].
+    #[allow(dead_code)]
     pub fn claim(
         &self,
         requested_port: u16,
@@ -263,18 +283,58 @@ impl Store {
         session: Option<String>,
         checker: &dyn PidChecker,
     ) -> Result<ClaimOutcome> {
+        self.claim_with_actor(
+            requested_port,
+            pid,
+            tag,
+            session,
+            AuditActor::new(AuditSource::Cli, None, None),
+            checker,
+        )
+    }
+
+    pub(crate) fn claim_with_actor(
+        &self,
+        requested_port: u16,
+        pid: u32,
+        tag: String,
+        session: Option<String>,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<ClaimOutcome> {
         // An empty `--session ""` (e.g. from an unbound `$VAR` expansion)
         // must behave as no session: otherwise two unrelated empty sessions
         // would recognize each other's leases as their own in the guard.
         let session = session.filter(|s| !s.is_empty());
+        let actor = AuditActor::new(actor.source, actor.harness, actor.session);
+        actor.validate()?;
         // Validate before taking the lock / reading state so a rejected
         // claim never touches (or even waits on) the store.
         validate_claim_inputs(requested_port, &tag, session.as_deref())?;
-        let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
-        self.write_v2_leases(&leases)?;
-        Ok(outcome)
+        self.update_state(|state| {
+            let mutation = claim_in_place(
+                &mut state.leases,
+                requested_port,
+                pid,
+                tag,
+                session,
+                checker,
+            )?;
+            let draft = AuditEventDraft {
+                actor,
+                kind: AuditEventKind::LeaseClaimed {
+                    requested_port,
+                    disposition: mutation.disposition,
+                    lease: LeaseSnapshot::from(&mutation.outcome.lease),
+                    prior_lease: mutation.prior_lease.as_ref().map(LeaseSnapshot::from),
+                    replaced_lease: mutation.replaced_lease.as_ref().map(LeaseSnapshot::from),
+                },
+            };
+            Ok(StateUpdate::Commit {
+                result: mutation.outcome,
+                events: vec![draft],
+            })
+        })
     }
 
     /// Returns the lease on `port`, if any.
@@ -289,10 +349,10 @@ impl Store {
     /// was no lease on `port`.
     pub fn release(&self, port: u16, checker: &dyn PidChecker) -> Result<Option<ReleaseOutcome>> {
         let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let outcome = release_in_place(&mut leases, port, checker);
+        let mut state = self.read_state_unlocked()?;
+        let outcome = release_in_place(&mut state.leases, port, checker);
         if outcome.is_some() {
-            self.write_v2_leases(&leases)?;
+            self.write_v3_state(&state)?;
         }
         Ok(outcome)
     }
@@ -301,10 +361,10 @@ impl Store {
     /// removed leases. Returns an empty vector if nothing was pruned.
     pub fn prune(&self, checker: &dyn PidChecker) -> Result<Vec<Lease>> {
         let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let pruned = prune_in_place(&mut leases, checker);
+        let mut state = self.read_state_unlocked()?;
+        let pruned = prune_in_place(&mut state.leases, checker);
         if !pruned.is_empty() {
-            self.write_v2_leases(&leases)?;
+            self.write_v3_state(&state)?;
         }
         Ok(pruned)
     }
@@ -326,12 +386,13 @@ impl Store {
         checker: &dyn PidChecker,
     ) -> Result<Lease> {
         let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let index = leases
+        let mut state = self.read_state_unlocked()?;
+        let index = state
+            .leases
             .iter()
             .position(|lease| lease.port == port)
             .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
-        let existing = leases[index].clone();
+        let existing = state.leases[index].clone();
 
         if existing.pid != expected_owner_pid
             || existing.process_start_time != Some(expected_owner_start_time)
@@ -357,8 +418,8 @@ impl Store {
             existing.session.clone(),
             Some(child_start_time),
         );
-        leases[index] = transferred.clone();
-        self.write_v2_leases(&leases)?;
+        state.leases[index] = transferred.clone();
+        self.write_v3_state(&state)?;
         Ok(transferred)
     }
 
@@ -487,6 +548,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     fn read_leases(&self) -> Result<Vec<Lease>> {
         let path = self.state_file_path();
         let Some(value) = self.read_json_value()? else {
@@ -551,6 +613,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     fn write_v2_leases(&self, leases: &[Lease]) -> Result<()> {
         let path = self.state_file_path();
         let tmp_path = self
@@ -684,7 +747,7 @@ impl Store {
         let mut leases = self.read_leases()?;
         let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
         self.write_v2_leases(&leases)?;
-        Ok(outcome)
+        Ok(outcome.outcome)
     }
 }
 
@@ -744,7 +807,7 @@ pub(crate) fn claim_in_place(
     tag: String,
     session: Option<String>,
     checker: &dyn PidChecker,
-) -> Result<ClaimOutcome> {
+) -> Result<ClaimMutation> {
     let process_start_time = checker.process_start_time(pid);
     let existing_index = leases.iter().position(|l| l.port == requested_port);
 
@@ -755,13 +818,26 @@ pub(crate) fn claim_in_place(
             let lease =
                 Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: port != requested_port,
-                reassignment_reason,
+            let disposition = match reassignment_reason {
+                Some(ReassignmentReason::LeaseConflict) => {
+                    ClaimDisposition::ReassignedLeaseConflict
+                }
+                Some(ReassignmentReason::OsOccupied) => ClaimDisposition::ReassignedOsOccupied,
+                None => ClaimDisposition::Created,
+            };
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: port != requested_port,
+                    reassignment_reason,
+                },
+                disposition,
+                prior_lease: None,
+                replaced_lease: None,
             })
         }
         Some(index) if leases[index].pid == pid && leases[index].is_alive(checker) => {
+            let prior_lease = leases[index].clone();
             let lease = Lease::new_with_process_start_time(
                 requested_port,
                 pid,
@@ -770,15 +846,25 @@ pub(crate) fn claim_in_place(
                 process_start_time,
             );
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: false,
-                reassignment_reason: None,
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: false,
+                    reassignment_reason: None,
+                },
+                disposition: ClaimDisposition::Updated,
+                prior_lease: Some(prior_lease),
+                replaced_lease: None,
             })
         }
         Some(index) if leases[index].is_alive(checker) => {
+            let prior_lease = leases[index].clone();
             let (next_port, reassignment_reason) =
                 resolve_claim_port(requested_port, leases, checker, true)?;
+            let replaced_lease = leases
+                .iter()
+                .find(|lease| lease.port == next_port && !lease.is_alive(checker))
+                .cloned();
             let lease = Lease::new_with_process_start_time(
                 next_port,
                 pid,
@@ -791,14 +877,20 @@ pub(crate) fn claim_in_place(
             // blindly, or the dead entry and the new one both survive on the
             // same port.
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: true,
-                reassignment_reason,
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: true,
+                    reassignment_reason,
+                },
+                disposition: ClaimDisposition::ReassignedLeaseConflict,
+                prior_lease: Some(prior_lease),
+                replaced_lease,
             })
         }
         Some(_) => {
             // Dead lease on the requested port: prune it and take over the port.
+            let prior_lease = leases[existing_index.unwrap()].clone();
             let (port, reassignment_reason) =
                 resolve_claim_port(requested_port, leases, checker, false)?;
             if port != requested_port {
@@ -810,10 +902,22 @@ pub(crate) fn claim_in_place(
             let lease =
                 Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: port != requested_port,
-                reassignment_reason,
+            let disposition = match reassignment_reason {
+                Some(ReassignmentReason::LeaseConflict) => {
+                    ClaimDisposition::ReassignedLeaseConflict
+                }
+                Some(ReassignmentReason::OsOccupied) => ClaimDisposition::ReassignedOsOccupied,
+                None => ClaimDisposition::ReplacedDead,
+            };
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: port != requested_port,
+                    reassignment_reason,
+                },
+                disposition,
+                prior_lease: Some(prior_lease),
+                replaced_lease: None,
             })
         }
     }
@@ -951,7 +1055,7 @@ pub(crate) fn prune_in_place(leases: &mut Vec<Lease>, checker: &dyn PidChecker) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditEventDraft;
+    use crate::audit::{AuditActor, AuditEventDraft, AuditEventKind, AuditSource};
     use crate::lease::{
         SystemPidChecker,
         test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
@@ -1236,7 +1340,7 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(store.state_file_path()).unwrap())
                 .unwrap();
-        assert_eq!(state["format_version"], 2);
+        assert_eq!(state["format_version"], STATE_FORMAT_VERSION);
         assert_eq!(state["leases"][0]["port"], port);
     }
 
@@ -1408,7 +1512,7 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(reloaded.state_file_path()).unwrap())
                 .unwrap();
-        assert_eq!(state["format_version"], V2_STATE_FORMAT_VERSION);
+        assert_eq!(state["format_version"], STATE_FORMAT_VERSION);
     }
 
     #[test]
@@ -2516,6 +2620,176 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("atomically replace"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    fn assert_claim_disposition(
+        mut leases: Vec<Lease>,
+        requested_port: u16,
+        pid: u32,
+        checker: &dyn PidChecker,
+        expected: ClaimDisposition,
+    ) -> ClaimMutation {
+        let mutation = claim_in_place(
+            &mut leases,
+            requested_port,
+            pid,
+            "claimed".to_string(),
+            None,
+            checker,
+        )
+        .unwrap();
+        assert_eq!(mutation.disposition, expected);
+        mutation
+    }
+
+    #[test]
+    fn claim_reports_created_without_prior_lease() {
+        let port = unused_test_port();
+        let mutation = assert_claim_disposition(
+            Vec::new(),
+            port,
+            100,
+            &AlwaysAlive,
+            ClaimDisposition::Created,
+        );
+        assert!(mutation.prior_lease.is_none());
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_updated_with_prior_lease() {
+        let port = unused_test_port();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            100,
+            &AlwaysAlive,
+            ClaimDisposition::Updated,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_replaced_dead_with_prior_lease() {
+        let port = unused_test_port();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            200,
+            &AlwaysDead,
+            ClaimDisposition::ReplacedDead,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_reassigned_lease_conflict() {
+        let (port, _) = unused_adjacent_test_ports();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            200,
+            &AlivePids(vec![100, 200]),
+            ClaimDisposition::ReassignedLeaseConflict,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_reassigned_os_occupied() {
+        let (port, _) = unused_adjacent_test_ports();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mutation = assert_claim_disposition(
+            Vec::new(),
+            port,
+            200,
+            &AlwaysAlive,
+            ClaimDisposition::ReassignedOsOccupied,
+        );
+        assert!(mutation.prior_lease.is_none());
+        drop(listener);
+    }
+
+    #[test]
+    fn claim_reassignment_preserves_stale_destination_snapshot() {
+        let (requested_port, destination_port) = unused_adjacent_test_ports();
+        let prior = Lease::new(requested_port, 100, "requested", None);
+        let stale = Lease::new(destination_port, 300, "stale", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone(), stale.clone()],
+            requested_port,
+            200,
+            &AlivePids(vec![100, 200]),
+            ClaimDisposition::ReassignedLeaseConflict,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert_eq!(mutation.replaced_lease, Some(stale));
+    }
+
+    #[test]
+    fn claim_persists_lease_and_claim_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = unused_test_port();
+        let outcome = store
+            .claim_with_actor(
+                port,
+                100,
+                "service".to_string(),
+                None,
+                AuditActor::new(AuditSource::Cli, None, Some("session-a".to_string())),
+                &AlwaysAlive,
+            )
+            .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.leases, vec![outcome.lease.clone()]);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].actor.session.as_deref(), Some("session-a"));
+        let AuditEventKind::LeaseClaimed {
+            requested_port,
+            disposition,
+            lease,
+            prior_lease,
+            replaced_lease,
+        } = &state.events[0].kind
+        else {
+            panic!("claim must persist a lease_claimed event");
+        };
+        assert_eq!(*requested_port, port);
+        assert_eq!(*disposition, ClaimDisposition::Created);
+        assert_eq!(lease, &LeaseSnapshot::from(&outcome.lease));
+        assert!(prior_lease.is_none());
+        assert!(replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_with_invalid_actor_does_not_write_lease_or_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+        let err = store
+            .claim_with_actor(
+                unused_test_port(),
+                100,
+                "service".to_string(),
+                None,
+                AuditActor::new(
+                    AuditSource::Cli,
+                    None,
+                    Some("s".repeat(MAX_SESSION_CHARS + 1)),
+                ),
+                &AlwaysAlive,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("session"));
         assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
     }
 }
