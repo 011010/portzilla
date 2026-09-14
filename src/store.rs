@@ -1,5 +1,6 @@
 //! Locked JSON persistence for leases, and the port-claiming core logic.
 
+use crate::audit::AuditEvent;
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -38,12 +39,29 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 const DATA_DIR_ENV_VAR: &str = "PORTZILLA_DATA_DIR";
 const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 const HOME_ENV_VAR: &str = "HOME";
-const STATE_FORMAT_VERSION: u32 = 2;
+const V2_STATE_FORMAT_VERSION: u32 = 2;
+const STATE_FORMAT_VERSION: u32 = 3;
+pub(crate) const MAX_HISTORY_EVENTS: usize = 10_000;
 
 #[derive(Debug, Deserialize, Serialize)]
-struct VersionedState {
+struct StoredStateV2 {
     format_version: u32,
     leases: Vec<Lease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreState {
+    pub(crate) next_event_sequence: u64,
+    pub(crate) leases: Vec<Lease>,
+    pub(crate) events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StoredStateV3 {
+    format_version: u32,
+    next_event_sequence: u64,
+    leases: Vec<Lease>,
+    events: Vec<AuditEvent>,
 }
 
 /// Maximum allowed length of a lease `tag`, in CHARACTERS (not bytes).
@@ -183,7 +201,7 @@ impl Store {
     /// Returns all currently stored leases.
     pub fn list(&self) -> Result<Vec<Lease>> {
         let _guard = self.lock_exclusive()?;
-        self.read_leases()
+        self.read_leases_for_read()
     }
 
     /// Claims `requested_port` for `pid`, following the conflict-resolution
@@ -206,14 +224,14 @@ impl Store {
         let _guard = self.lock_exclusive()?;
         let mut leases = self.read_leases()?;
         let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
-        self.write_leases(&leases)?;
+        self.write_v2_leases(&leases)?;
         Ok(outcome)
     }
 
     /// Returns the lease on `port`, if any.
     pub fn get(&self, port: u16) -> Result<Option<Lease>> {
         let _guard = self.lock_exclusive()?;
-        let leases = self.read_leases()?;
+        let leases = self.read_leases_for_read()?;
         Ok(leases.into_iter().find(|lease| lease.port == port))
     }
 
@@ -225,7 +243,7 @@ impl Store {
         let mut leases = self.read_leases()?;
         let outcome = release_in_place(&mut leases, port, checker);
         if outcome.is_some() {
-            self.write_leases(&leases)?;
+            self.write_v2_leases(&leases)?;
         }
         Ok(outcome)
     }
@@ -237,7 +255,7 @@ impl Store {
         let mut leases = self.read_leases()?;
         let pruned = prune_in_place(&mut leases, checker);
         if !pruned.is_empty() {
-            self.write_leases(&leases)?;
+            self.write_v2_leases(&leases)?;
         }
         Ok(pruned)
     }
@@ -291,7 +309,7 @@ impl Store {
             Some(child_start_time),
         );
         leases[index] = transferred.clone();
-        self.write_leases(&leases)?;
+        self.write_v2_leases(&leases)?;
         Ok(transferred)
     }
 
@@ -332,36 +350,40 @@ impl Store {
         Ok(lock_file)
     }
 
-    fn read_leases(&self) -> Result<Vec<Lease>> {
+    #[cfg(test)]
+    pub(crate) fn read_state(&self) -> Result<StoreState> {
+        let _guard = self.lock_exclusive()?;
+        self.read_state_unlocked()
+    }
+
+    fn read_leases_for_read(&self) -> Result<Vec<Lease>> {
+        Ok(self.read_state_unlocked()?.leases)
+    }
+
+    fn read_state_unlocked(&self) -> Result<StoreState> {
         let path = self.state_file_path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read state file at {}", path.display()));
-            }
+        let Some(value) = self.read_json_value()? else {
+            return Ok(StoreState {
+                next_event_sequence: 1,
+                leases: Vec::new(),
+                events: Vec::new(),
+            });
         };
-        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(Vec::new());
-        }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "state file at {} contains invalid JSON and was not modified",
-                path.display()
-            )
-        })?;
 
         match value {
-            serde_json::Value::Array(_) => {
-                let leases: Vec<Lease> = serde_json::from_value(value).with_context(|| {
+            serde_json::Value::Array(value) => {
+                let leases: Vec<Lease> = serde_json::from_value(serde_json::Value::Array(value)).with_context(|| {
                     format!(
                         "state file at {} contains invalid legacy lease data and was not modified",
                         path.display()
                     )
                 })?;
                 validate_unique_ports(&leases, &path)?;
-                Ok(leases)
+                Ok(StoreState {
+                    next_event_sequence: 1,
+                    leases,
+                    events: Vec::new(),
+                })
             }
             serde_json::Value::Object(ref object) => {
                 let version = object
@@ -373,13 +395,77 @@ impl Store {
                             path.display()
                         )
                     })?;
-                if version != STATE_FORMAT_VERSION as u64 {
+                match version as u32 {
+                    V2_STATE_FORMAT_VERSION => {
+                        let state: StoredStateV2 = serde_json::from_value(value).with_context(|| {
+                            format!(
+                                "state file at {} contains invalid versioned lease data and was not modified",
+                                path.display()
+                            )
+                        })?;
+                        validate_unique_ports(&state.leases, &path)?;
+                        Ok(StoreState {
+                            next_event_sequence: 1,
+                            leases: state.leases,
+                            events: Vec::new(),
+                        })
+                    }
+                    STATE_FORMAT_VERSION => {
+                        let state: StoredStateV3 = serde_json::from_value(value).with_context(|| {
+                            format!(
+                                "state file at {} contains invalid v3 lease data and was not modified",
+                                path.display()
+                            )
+                        })?;
+                        let state = StoreState {
+                            next_event_sequence: state.next_event_sequence,
+                            leases: state.leases,
+                            events: state.events,
+                        };
+                        validate_state(&state, &path)?;
+                        Ok(state)
+                    }
+                    _ => bail!(
+                        "unsupported state file format version {version} at {}; upgrade portzilla before using this state file",
+                        path.display()
+                    ),
+                }
+            }
+            _ => bail!(
+                "state file at {} must be a legacy lease array or a versioned object and was not modified",
+                path.display()
+            ),
+        }
+    }
+
+    fn read_leases(&self) -> Result<Vec<Lease>> {
+        let path = self.state_file_path();
+        let Some(value) = self.read_json_value()? else {
+            return Ok(Vec::new());
+        };
+        match value {
+            serde_json::Value::Array(value) => {
+                let leases: Vec<Lease> = serde_json::from_value(serde_json::Value::Array(value)).with_context(|| {
+                    format!(
+                        "state file at {} contains invalid legacy lease data and was not modified",
+                        path.display()
+                    )
+                })?;
+                validate_unique_ports(&leases, &path)?;
+                Ok(leases)
+            }
+            serde_json::Value::Object(object) => {
+                let version = object
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("state file at {} is an object without a numeric format_version and was not modified", path.display()))?;
+                if version != V2_STATE_FORMAT_VERSION as u64 {
                     bail!(
                         "unsupported state file format version {version} at {}; upgrade portzilla before using this state file",
                         path.display()
                     );
                 }
-                let state: VersionedState = serde_json::from_value(value).with_context(|| {
+                let state: StoredStateV2 = serde_json::from_value(serde_json::Value::Object(object)).with_context(|| {
                     format!(
                         "state file at {} contains invalid versioned lease data and was not modified",
                         path.display()
@@ -395,13 +481,34 @@ impl Store {
         }
     }
 
-    fn write_leases(&self, leases: &[Lease]) -> Result<()> {
+    fn read_json_value(&self) -> Result<Option<serde_json::Value>> {
+        let path = self.state_file_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read state file at {}", path.display()));
+            }
+        };
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(None);
+        }
+        serde_json::from_slice(&bytes).map(Some).with_context(|| {
+            format!(
+                "state file at {} contains invalid JSON and was not modified",
+                path.display()
+            )
+        })
+    }
+
+    fn write_v2_leases(&self, leases: &[Lease]) -> Result<()> {
         let path = self.state_file_path();
         let tmp_path = self
             .data_dir
             .join(format!(".leases.json.tmp.{}", std::process::id()));
-        let json = serde_json::to_vec_pretty(&VersionedState {
-            format_version: STATE_FORMAT_VERSION,
+        let json = serde_json::to_vec_pretty(&StoredStateV2 {
+            format_version: V2_STATE_FORMAT_VERSION,
             leases: leases.to_vec(),
         })
         .context("failed to serialize leases to JSON")?;
