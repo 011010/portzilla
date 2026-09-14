@@ -557,6 +557,7 @@ fn run_hook_claude_code() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::ClaudeCode);
             if let Some(json) = outcome.stdout_json {
                 println!("{json}");
             }
@@ -627,6 +628,7 @@ fn run_hook_cursor() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Cursor);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -693,6 +695,7 @@ fn run_hook_gemini() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Gemini);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -760,6 +763,7 @@ fn run_hook_codex() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Codex);
             if let Some(json) = outcome.stdout_json {
                 println!("{json}");
             }
@@ -826,6 +830,7 @@ fn run_hook_kimi() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Kimi);
             if let Some(text) = outcome.stdout_text {
                 println!("{text}");
             }
@@ -892,6 +897,7 @@ fn run_hook_windsurf() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Windsurf);
             if let Some(text) = outcome.stdout_text {
                 println!("{text}");
             }
@@ -964,6 +970,7 @@ fn run_hook_opencode() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::OpenCode);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -1077,6 +1084,16 @@ fn persist_guard_evidence(
         evidence.evidence,
     ) {
         eprintln!("portzilla guard: warning: failed to record guard event: {err:#}");
+    }
+}
+
+fn persist_hook_evidence(evidence: Option<guard::GuardAuditDraft>, harness: audit::AuditHarness) {
+    let Some(evidence) = evidence else { return };
+    let actor = AuditActor::new(AuditSource::Guard, Some(harness), evidence.actor_session);
+    match Store::open(None).and_then(|store| store.record_guard_evidence(actor, evidence.evidence))
+    {
+        Ok(()) => {}
+        Err(err) => eprintln!("portzilla hook: warning: failed to record guard event: {err:#}"),
     }
 }
 
