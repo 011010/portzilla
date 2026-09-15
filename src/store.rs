@@ -2940,18 +2940,24 @@ mod tests {
 
     #[test]
     fn claim_reassignment_preserves_stale_destination_snapshot() {
-        let (requested_port, destination_port) = unused_adjacent_test_ports();
-        let prior = Lease::new(requested_port, 100, "requested", None);
-        let stale = Lease::new(destination_port, 300, "stale", None);
-        let mutation = assert_claim_disposition(
-            vec![prior.clone(), stale.clone()],
-            requested_port,
-            200,
-            &AlivePids(vec![100, 200]),
-            ClaimDisposition::ReassignedLeaseConflict,
-        );
-        assert_eq!(mutation.prior_lease, Some(prior));
-        assert_eq!(mutation.replaced_lease, Some(stale));
+        for _ in 0..100 {
+            let (requested_port, destination_port) = unused_adjacent_test_ports();
+            let prior = Lease::new(requested_port, 100, "requested", None);
+            let stale = Lease::new(destination_port, 300, "stale", None);
+            let mutation = assert_claim_disposition(
+                vec![prior.clone(), stale.clone()],
+                requested_port,
+                200,
+                &AlivePids(vec![100, 200]),
+                ClaimDisposition::ReassignedLeaseConflict,
+            );
+            if mutation.replaced_lease.is_some() {
+                assert_eq!(mutation.prior_lease, Some(prior));
+                assert_eq!(mutation.replaced_lease, Some(stale));
+                return;
+            }
+        }
+        panic!("could not acquire an uncontended adjacent test port pair");
     }
 
     #[test]

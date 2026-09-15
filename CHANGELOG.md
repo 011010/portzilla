@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- Added a bounded session flight recorder with structured audit events for lease claims, releases, transfers, pruning, and guard decisions.
+- Added `portzilla history` with JSON output, filtering, pagination, and history clearing.
+- Added MCP tools for lease history and structured process/port ownership queries.
+- Added actor and session attribution across CLI commands, hooks, the guard wrapper, and MCP operations.
+- Added community health files, issue forms, and release documentation for the project.
+
 ## 0.3.0
 
 - Added `portzilla run` to claim a port, launch a server with the actual port in `PORTZILLA_PORT`, and transfer the lease to the verified child process.
