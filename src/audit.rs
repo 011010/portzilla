@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_AUDIT_TARGET_CHARS: usize = 512;
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuditEvent {
@@ -214,6 +215,72 @@ pub(crate) enum AuditEventType {
     HistoryCleared,
 }
 
+impl AuditEventType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseClaimed => "lease_claimed",
+            Self::LeaseTransferred => "lease_transferred",
+            Self::LeaseReleased => "lease_released",
+            Self::LeasePruned => "lease_pruned",
+            Self::ProcessExited => "process_exited",
+            Self::GuardDenied => "guard_denied",
+            Self::GuardWarned => "guard_warned",
+            Self::HistoryCleared => "history_cleared",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryQuery {
+    pub(crate) session: Option<String>,
+    pub(crate) port: Option<u16>,
+    pub(crate) event: Option<AuditEventType>,
+    pub(crate) before: Option<u64>,
+    pub(crate) limit: usize,
+}
+
+#[allow(dead_code)]
+impl HistoryQuery {
+    pub(crate) fn try_new(
+        session: Option<String>,
+        port: Option<u16>,
+        event: Option<AuditEventType>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Self> {
+        if session.as_deref() == Some("") {
+            bail!("history session must not be empty");
+        }
+        if let Some(value) = &session
+            && value.chars().count() > crate::store::MAX_SESSION_CHARS
+        {
+            bail!("history session exceeds the maximum length");
+        }
+        if !(1..=crate::store::MAX_HISTORY_LIMIT).contains(&limit) {
+            bail!(
+                "history limit must be between 1 and {}",
+                crate::store::MAX_HISTORY_LIMIT
+            );
+        }
+        Ok(Self {
+            session,
+            port,
+            event,
+            before,
+            limit,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HistoryPage {
+    pub(crate) events: Vec<AuditEvent>,
+    pub(crate) has_more: bool,
+    pub(crate) next_before: Option<u64>,
+}
+
 impl AuditEventKind {
     #[allow(dead_code)]
     pub(crate) fn event_type(&self) -> AuditEventType {
@@ -226,6 +293,57 @@ impl AuditEventKind {
             Self::GuardDenied { .. } => AuditEventType::GuardDenied,
             Self::GuardWarned { .. } => AuditEventType::GuardWarned,
             Self::HistoryCleared { .. } => AuditEventType::HistoryCleared,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn involves_session(&self, session: &str) -> bool {
+        let matches = |snapshot: &LeaseSnapshot| snapshot.session.as_deref() == Some(session);
+        match self {
+            Self::LeaseClaimed {
+                lease,
+                prior_lease,
+                replaced_lease,
+                ..
+            } => {
+                matches(lease)
+                    || prior_lease.as_ref().is_some_and(matches)
+                    || replaced_lease.as_ref().is_some_and(matches)
+            }
+            Self::LeaseTransferred { lease, .. }
+            | Self::LeaseReleased { lease, .. }
+            | Self::LeasePruned { lease }
+            | Self::ProcessExited { lease, .. }
+            | Self::GuardDenied { lease, .. } => matches(lease),
+            Self::GuardWarned { .. } | Self::HistoryCleared { .. } => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn involves_port(&self, port: u16) -> bool {
+        let matches = |snapshot: &LeaseSnapshot| snapshot.port == port;
+        match self {
+            Self::LeaseClaimed {
+                requested_port,
+                lease,
+                prior_lease,
+                replaced_lease,
+                ..
+            } => {
+                *requested_port == port
+                    || matches(lease)
+                    || prior_lease.as_ref().is_some_and(matches)
+                    || replaced_lease.as_ref().is_some_and(matches)
+            }
+            Self::LeaseTransferred { lease, .. }
+            | Self::LeaseReleased { lease, .. }
+            | Self::LeasePruned { lease }
+            | Self::ProcessExited { lease, .. }
+            | Self::GuardDenied { lease, .. } => matches(lease),
+            Self::GuardWarned { target, .. } => {
+                matches!(target, GuardTarget::Port { port: target_port } if *target_port == port)
+            }
+            Self::HistoryCleared { .. } => false,
         }
     }
 

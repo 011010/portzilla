@@ -5,6 +5,8 @@
 - Added `portzilla run` to claim a port, launch a server with the actual port in `PORTZILLA_PORT`, and transfer the lease to the verified child process.
 - Added `PORTZILLA_SESSION` propagation and child exit-status forwarding for managed launches.
 - Added an installable agent skill, available from `portzilla init skill`, that teaches agents to use the safe server lifecycle.
+- Added bounded audit history with `portzilla history`, MCP read-only queries, lease/process lifecycle events, and structured guard deny/warn evidence.
+- Added best-effort journal persistence to all hook adapters and the universal `portzilla guard` wrapper without changing their wire contracts.
 - Made the release-persistence test independent of ephemeral port allocation.
 
 ## 0.2.0

@@ -166,10 +166,10 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
         tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         tool_names,
-        ["claim", "who", "ls", "release", "prune"]
+        ["claim", "who", "ls", "release", "prune", "history"]
             .into_iter()
             .collect(),
-        "tools/list must expose exactly the five portzilla tools"
+        "tools/list must expose exactly the six portzilla tools"
     );
     let claim_tool = tools.iter().find(|t| t["name"] == "claim").unwrap();
     assert!(

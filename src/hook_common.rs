@@ -1,4 +1,4 @@
-use crate::guard::{self, Verdict};
+use crate::guard::{self, GuardEvaluation, Verdict};
 use crate::lease::{Lease, PidChecker};
 
 pub(crate) struct EvaluationRequest<'a> {
@@ -8,8 +8,13 @@ pub(crate) struct EvaluationRequest<'a> {
     pub(crate) checker: &'a dyn PidChecker,
 }
 
+#[allow(dead_code)]
 pub(crate) fn evaluate(request: EvaluationRequest<'_>) -> Verdict {
-    guard::check(
+    evaluate_with_evidence(request).verdict
+}
+
+pub(crate) fn evaluate_with_evidence(request: EvaluationRequest<'_>) -> GuardEvaluation {
+    guard::check_with_evidence(
         request.command,
         request.leases,
         None,

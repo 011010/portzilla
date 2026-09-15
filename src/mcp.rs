@@ -8,7 +8,7 @@
 //! `--json` flag emits (see `crate::view`), so anything already written
 //! against the CLI's JSON output recognizes MCP tool results too.
 
-use crate::audit::{AuditActor, AuditSource};
+use crate::audit::{AuditActor, AuditEventType, AuditSource, HistoryQuery};
 use crate::lease::SystemPidChecker;
 use crate::store::Store;
 use crate::view::{to_claim_view, to_view};
@@ -64,6 +64,36 @@ struct ClaimParams {
 struct PortParams {
     /// The port to look up.
     port: u16,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReleaseParams {
+    /// The port to release.
+    port: u16,
+    /// Session identifying the agent requesting the release.
+    #[serde(default)]
+    actor_session: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct PruneParams {
+    /// Session identifying the agent requesting the prune.
+    #[serde(default)]
+    actor_session: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct HistoryParams {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    event: Option<AuditEventType>,
+    #[serde(default)]
+    before: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[tool_router]
@@ -207,8 +237,13 @@ impl PortzillaMcpServer {
     )]
     async fn release(
         &self,
-        Parameters(params): Parameters<PortParams>,
+        Parameters(params): Parameters<ReleaseParams>,
     ) -> Result<CallToolResult, McpError> {
+        let actor_session = params.actor_session;
+        if let Err(err) = AuditActor::new(AuditSource::Mcp, None, actor_session.clone()).validate()
+        {
+            return Err(McpError::invalid_params(format!("{err:#}"), None));
+        }
         let store = self.store.clone();
         let port = params.port;
 
@@ -216,7 +251,7 @@ impl PortzillaMcpServer {
             store
                 .release(
                     port,
-                    AuditActor::new(AuditSource::Mcp, None, None),
+                    AuditActor::new(AuditSource::Mcp, None, actor_session),
                     &SystemPidChecker,
                 )
                 .map(|outcome| {
@@ -243,13 +278,21 @@ impl PortzillaMcpServer {
         description = "Remove every lease whose owning process is no longer alive, and return \
         the leases that were removed (an empty list if none were dead)."
     )]
-    async fn prune(&self) -> Result<CallToolResult, McpError> {
+    async fn prune(
+        &self,
+        Parameters(params): Parameters<PruneParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor_session = params.actor_session;
+        if let Err(err) = AuditActor::new(AuditSource::Mcp, None, actor_session.clone()).validate()
+        {
+            return Err(McpError::invalid_params(format!("{err:#}"), None));
+        }
         let store = self.store.clone();
 
         let value = tokio::task::spawn_blocking(move || {
             store
                 .prune(
-                    AuditActor::new(AuditSource::Mcp, None, None),
+                    AuditActor::new(AuditSource::Mcp, None, actor_session),
                     &SystemPidChecker,
                 )
                 .map(|pruned| {
@@ -264,6 +307,33 @@ impl PortzillaMcpServer {
         .map_err(blocking_task_failed)?
         .map_err(store_error)?;
 
+        Ok(CallToolResult::structured(value))
+    }
+
+    #[tool(
+        description = "Read the bounded lease and guard event history, newest first. Filters are combined with AND; use before as an exclusive sequence cursor. This tool is read-only and cannot clear history."
+    )]
+    async fn history(
+        &self,
+        Parameters(params): Parameters<HistoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = HistoryQuery::try_new(
+            params.session,
+            params.port,
+            params.event,
+            params.before,
+            params.limit.unwrap_or(crate::audit::DEFAULT_HISTORY_LIMIT),
+        )
+        .map_err(|err| McpError::invalid_params(format!("{err:#}"), None))?;
+        let store = self.store.clone();
+        let value = tokio::task::spawn_blocking(move || {
+            store
+                .history(&query)
+                .map(|page| serde_json::to_value(page).expect("HistoryPage always serializes"))
+        })
+        .await
+        .map_err(blocking_task_failed)?
+        .map_err(store_error)?;
         Ok(CallToolResult::structured(value))
     }
 }
@@ -376,14 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn all_five_tools_are_registered_with_descriptions() {
+    fn all_six_tools_are_registered_with_descriptions() {
         let (server, _dir) = server_with_tempdir();
         let tools = server.tool_router.list_all();
         let names: std::collections::HashSet<&str> =
             tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
             names,
-            ["claim", "who", "ls", "release", "prune"]
+            ["claim", "who", "ls", "release", "prune", "history"]
                 .into_iter()
                 .collect()
         );
@@ -706,7 +776,10 @@ mod tests {
             .unwrap();
 
         let result = server
-            .release(Parameters(PortParams { port: 4300 }))
+            .release(Parameters(ReleaseParams {
+                port: 4300,
+                actor_session: None,
+            }))
             .await
             .unwrap();
 
@@ -738,7 +811,10 @@ mod tests {
             .unwrap();
 
         let result = server
-            .release(Parameters(PortParams { port: 4301 }))
+            .release(Parameters(ReleaseParams {
+                port: 4301,
+                actor_session: None,
+            }))
             .await
             .unwrap();
         let value = structured(&result);
@@ -749,7 +825,10 @@ mod tests {
     async fn release_not_found_returns_a_tool_level_error() {
         let (server, _dir) = server_with_tempdir();
         let result = server
-            .release(Parameters(PortParams { port: 4399 }))
+            .release(Parameters(ReleaseParams {
+                port: 4399,
+                actor_session: None,
+            }))
             .await
             .unwrap();
 
@@ -783,7 +862,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = server.prune().await.unwrap();
+        let result = server
+            .prune(Parameters(PruneParams::default()))
+            .await
+            .unwrap();
         assert_eq!(result.is_error, Some(false));
         let value = structured(&result);
         let pruned = value.as_array().unwrap();
@@ -838,9 +920,67 @@ mod tests {
             .await
             .unwrap();
 
-        let result = server.prune().await.unwrap();
+        let result = server
+            .prune(Parameters(PruneParams::default()))
+            .await
+            .unwrap();
         assert_eq!(result.is_error, Some(false));
         let value = structured(&result);
         assert_eq!(value.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn history_returns_stable_envelope() {
+        let (server, _dir) = server_with_tempdir();
+        let result = server
+            .history(Parameters(HistoryParams::default()))
+            .await
+            .unwrap();
+        let value = structured(&result);
+        assert_eq!(
+            value,
+            &json!({"events": [], "has_more": false, "next_before": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn release_actor_session_is_recorded_separately() {
+        let (server, dir) = server_with_tempdir();
+        server
+            .claim(Parameters(ClaimParams {
+                port: 4403,
+                tag: "owned".into(),
+                pid: Some(100),
+                session: Some("owner".into()),
+            }))
+            .await
+            .unwrap();
+        server
+            .release(Parameters(ReleaseParams {
+                port: 4403,
+                actor_session: Some("actor".into()),
+            }))
+            .await
+            .unwrap();
+        let state: crate::store::StoreState = server.store.read_state().unwrap();
+        assert_eq!(state.events[1].actor.session.as_deref(), Some("actor"));
+        assert_eq!(
+            state.events[1].kind.event_type(),
+            AuditEventType::LeaseReleased
+        );
+        assert!(dir.path().join("leases.json").exists());
+    }
+
+    #[tokio::test]
+    async fn release_rejects_oversized_actor_session_without_mutating() {
+        let (server, _dir) = server_with_tempdir();
+        let err = server
+            .release(Parameters(ReleaseParams {
+                port: 4404,
+                actor_session: Some("x".repeat(crate::store::MAX_SESSION_CHARS + 1)),
+            }))
+            .await
+            .expect_err("oversized actor session must be invalid params");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }

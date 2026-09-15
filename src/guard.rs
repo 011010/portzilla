@@ -57,6 +57,7 @@
 //!   LOCATES the binary) is left as-is and therefore not detected; no
 //!   command substitution, variable expansion, or backslash escapes.
 
+use crate::audit::GuardTarget;
 use crate::lease::{Lease, PidChecker};
 
 /// The result of checking a command against the lease registry.
@@ -80,6 +81,24 @@ pub enum Verdict {
     Warn { explanation: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardEvaluation {
+    pub(crate) verdict: Verdict,
+    pub(crate) evidence: Option<GuardAuditDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardAuditDraft {
+    pub(crate) actor_session: Option<String>,
+    pub(crate) evidence: GuardEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GuardEvidence {
+    Denied { target: GuardTarget, lease: Lease },
+    Warned { target: GuardTarget },
+}
+
 /// Evaluates `command` against `leases`, deciding whether it looks safe to
 /// run.
 ///
@@ -98,6 +117,7 @@ pub enum Verdict {
 /// hook payload) but never `self_pid` (the command hasn't run yet, so there
 /// is no PID), while a hypothetical harness driving `guard::check` after the
 /// fact might have a real PID but no session concept at all.
+#[allow(dead_code)]
 pub fn check(
     command: &str,
     leases: &[Lease],
@@ -105,35 +125,83 @@ pub fn check(
     self_session: Option<&str>,
     checker: &dyn PidChecker,
 ) -> Verdict {
+    check_with_evidence(command, leases, self_pid, self_session, checker).verdict
+}
+
+pub(crate) fn check_with_evidence(
+    command: &str,
+    leases: &[Lease],
+    self_pid: Option<u32>,
+    self_session: Option<&str>,
+    checker: &dyn PidChecker,
+) -> GuardEvaluation {
     match detect_target(command) {
-        None => Verdict::Allow,
+        None => GuardEvaluation {
+            verdict: Verdict::Allow,
+            evidence: None,
+        },
         Some(KillTarget::Pids(pids)) => {
             for pid in pids {
                 if let Some(lease) = leases.iter().find(|l| l.pid == pid)
                     && lease.is_alive(checker)
                     && !owned_by_self(lease, self_pid, self_session)
                 {
-                    return deny(lease);
+                    return denied_evaluation(GuardTarget::Pid { pid }, lease, self_session);
                 }
             }
-            Verdict::Allow
+            GuardEvaluation {
+                verdict: Verdict::Allow,
+                evidence: None,
+            }
         }
         Some(KillTarget::Port(port)) => match leases.iter().find(|l| l.port == port) {
             Some(lease)
                 if lease.is_alive(checker) && !owned_by_self(lease, self_pid, self_session) =>
             {
-                deny(lease)
+                denied_evaluation(GuardTarget::Port { port }, lease, self_session)
             }
-            _ => Verdict::Allow,
+            _ => GuardEvaluation {
+                verdict: Verdict::Allow,
+                evidence: None,
+            },
         },
-        Some(KillTarget::ProcessName(name)) => Verdict::Warn {
-            explanation: format!(
-                "This command targets processes by name (\"{name}\"), which portzilla cannot \
-                 resolve to a specific port or lease — it may affect a live dev server \
-                 belonging to another session. Run `portzilla ls` to check for live leases \
-                 before proceeding, or target a specific PID/port instead."
-            ),
+        Some(KillTarget::ProcessName(name)) => GuardEvaluation {
+            verdict: Verdict::Warn {
+                explanation: format!(
+                    "This command targets processes by name (\"{name}\"), which portzilla cannot \
+                     resolve to a specific port or lease — it may affect a live dev server \
+                     belonging to another session. Run `portzilla ls` to check for live leases \
+                     before proceeding, or target a specific PID/port instead."
+                ),
+            },
+            evidence: Some(GuardAuditDraft {
+                actor_session: normalized_session(self_session),
+                evidence: GuardEvidence::Warned {
+                    target: GuardTarget::ProcessName { name },
+                },
+            }),
         },
+    }
+}
+
+fn normalized_session(session: Option<&str>) -> Option<String> {
+    session.filter(|value| !value.is_empty()).map(str::to_owned)
+}
+
+fn denied_evaluation(
+    target: GuardTarget,
+    lease: &Lease,
+    self_session: Option<&str>,
+) -> GuardEvaluation {
+    GuardEvaluation {
+        verdict: deny(lease),
+        evidence: Some(GuardAuditDraft {
+            actor_session: normalized_session(self_session),
+            evidence: GuardEvidence::Denied {
+                target,
+                lease: lease.clone(),
+            },
+        }),
     }
 }
 
@@ -581,6 +649,99 @@ mod tests {
 
     fn lease_with_session(port: u16, pid: u32, tag: &str, session: &str) -> Lease {
         Lease::new(port, pid, tag, Some(session.to_string()))
+    }
+
+    #[test]
+    fn guard_evidence_for_pid_contains_specific_target_and_lease() {
+        let protected = lease_with_session(3000, 1234, "dev-server", "owner");
+        let evaluation = check_with_evidence(
+            "kill 1234; echo secret-sentinel",
+            std::slice::from_ref(&protected),
+            None,
+            Some("caller"),
+            &AlwaysAlive,
+        );
+        assert!(matches!(
+            evaluation.evidence,
+            Some(GuardAuditDraft {
+                evidence: GuardEvidence::Denied {
+                    target: GuardTarget::Pid { pid: 1234 },
+                    lease,
+                },
+                ..
+            }) if lease == protected
+        ));
+    }
+
+    #[test]
+    fn guard_evidence_for_port_contains_specific_target_and_lease() {
+        let protected = lease(3001, 1234, "dev-server");
+        let evaluation = check_with_evidence(
+            "kill-port 3001; echo secret-sentinel",
+            std::slice::from_ref(&protected),
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(
+            evaluation.evidence,
+            Some(GuardAuditDraft {
+                evidence: GuardEvidence::Denied {
+                    target: GuardTarget::Port { port: 3001 },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guard_evidence_for_multiple_pids_names_first_protected_target() {
+        let protected = lease(3002, 2222, "second");
+        let evaluation = check_with_evidence(
+            "kill 1111 2222 secret-sentinel",
+            std::slice::from_ref(&protected),
+            None,
+            None,
+            &AlwaysAlive,
+        );
+        assert!(matches!(
+            evaluation.evidence,
+            Some(GuardAuditDraft {
+                evidence: GuardEvidence::Denied {
+                    target: GuardTarget::Pid { pid: 2222 },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guard_evidence_for_process_name_contains_structured_warning() {
+        let evaluation = check_with_evidence(
+            "pkill node secret-sentinel",
+            &[],
+            None,
+            Some("caller"),
+            &AlwaysAlive,
+        );
+        assert!(matches!(
+            evaluation.evidence,
+            Some(GuardAuditDraft {
+                actor_session: Some(ref session),
+                evidence: GuardEvidence::Warned {
+                    target: GuardTarget::ProcessName { ref name },
+                },
+            }) if session == "caller" && name == "node"
+        ));
+    }
+
+    #[test]
+    fn guard_allow_has_no_evidence() {
+        let evaluation = check_with_evidence("echo secret-sentinel", &[], None, None, &AlwaysAlive);
+        assert_eq!(evaluation.verdict, Verdict::Allow);
+        assert!(evaluation.evidence.is_none());
     }
 
     // ==== kill / kill -9 <pid> ====

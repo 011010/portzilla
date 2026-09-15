@@ -140,6 +140,12 @@ $ echo $?
 
   `portzilla guard` recognizes an `sh`/`bash`/`zsh`/`dash` invocation with a `-c`-family flag (combined, like `-lc`, or separate, like `-x -c` or `--norc -c`) ahead of the payload, and analyzes the raw payload directly instead of the literal `sh -c ...` text — including recursively through a nested `sh -c "sh -c '...'"`, up to 8 levels deep. This is a targeted unwrap for that specific shape, not a shell parser: it does not follow `$(...)` command substitution, variable expansion, or backslash escaping inside the payload, and only recognizes `sh`/`bash`/`zsh`/`dash` by name (not `ksh`, `fish`, `python3 -c`, PowerShell's `-Command`, etc.) — see `src/guard_cmd.rs`'s module doc comment for the complete, current list of what it does and doesn't catch.
 
+## Audit evidence
+
+Every deny and warning carries bounded structured evidence into the local audit journal. Denials record the protected target, reason, and affected lease; warnings record the unresolved process name. Allows do not create events, and raw shell commands are never stored. Query the records with `portzilla history --event guard_denied` or `--event guard_warned`.
+
+Audit writes are best-effort. If the lease store cannot record evidence, the adapter emits a warning where its protocol has a safe diagnostic channel, but the original guard verdict and harness response remain unchanged.
+
 ## Failure modes
 
 By default, portzilla-side failures in every adapter (`hook claude-code`, `hook codex`, `hook cursor`, `hook gemini`, `hook kimi`, `hook opencode`, and `hook windsurf`) and `guard` fail open: unreadable stdin, malformed hook JSON, an unreadable lease store, and internal panics are handled through the harness's allow path with a diagnostic where supported. The harness's normal permission flow then applies as if the hook were not installed.

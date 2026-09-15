@@ -156,7 +156,7 @@ The persisted `leases.json` records an internal `process_identity_verified` bool
 
 ## MCP server
 
-`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, and `prune` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
+`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, and read-only `history` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
 
 Register it with Claude Code:
 
@@ -173,10 +173,27 @@ Every tool's description is written to make the intended behavior explicit to th
 - **`ls()`** — same semantics as `portzilla ls`, no arguments.
 - **`release(port)`** — same semantics as `portzilla release`, including the still-alive warning (surfaced as a `was_alive` field on the result instead of a stderr line).
 - **`prune()`** — same semantics as `portzilla prune`, no arguments.
+- **`history(session?, port?, event?, before?, limit?)`** — same filtered, newest-first journal query as `portzilla history`; read-only.
 
 **Errors**: a missing lease (`who`/`release` on a port with no lease) comes back as a *tool-level* error — the JSON-RPC call still succeeds, but the tool result is flagged `isError: true` with a structured `{"error": "not_found", "port": ..., "message": ...}` body. This mirrors the CLI's exit code `2`: it is an expected, well-formed outcome the calling agent should see and act on, not a protocol failure. Actual portzilla failures (I/O errors, corrupt state, lock failures — the CLI's exit code `1`) come back as real JSON-RPC protocol errors instead, since those mean the server itself couldn't do its job.
 
 The MCP server reads and writes the exact same locked `leases.json` the CLI does (respecting `PORTZILLA_DATA_DIR`) — it is a second front end onto the same on-disk state, not a separate store.
+
+## History
+
+`history` reads the bounded operational journal stored with the leases:
+
+```console
+$ portzilla history
+$ portzilla history --json
+$ portzilla history --session my-session --port 3000 --event guard_denied
+$ portzilla history --before 42 --limit 50
+$ portzilla history clear
+```
+
+Results are newest-first. Filters combine with logical AND; `--before` is an exclusive sequence cursor, and `--limit` accepts 1 through 1000. The journal retains at most 10,000 events and trims the oldest entries while preserving monotonically increasing sequence numbers. `history clear` atomically removes prior events and records one `history_cleared` marker. Clear is CLI-only; the MCP `history` tool is read-only.
+
+Recorded event types are lease mutations, `process_exited`, `guard_denied`, `guard_warned`, and `history_cleared`. Raw shell commands and guard allows are intentionally omitted. Guard event persistence is best-effort and cannot weaken the guard decision.
 
 ## Input validation
 
@@ -192,12 +209,12 @@ The MCP server reads and writes the exact same locked `leases.json` the CLI does
 2. `$XDG_DATA_HOME/portzilla`.
 3. `$HOME/.local/share/portzilla`.
 
-The state lives at `<data_dir>/leases.json`, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation. New writes use this envelope:
+The state lives at `<data_dir>/leases.json`, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation. New writes use the v3 envelope containing `leases`, `events`, and `next_event_sequence`:
 
 ```json
-{"format_version":2,"leases":[{"port":3001,"pid":57108,"tag":"vite-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"process_identity_verified":true}]}
+{"format_version":3,"leases":[{"port":3001,"pid":57108,"tag":"vite-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"process_identity_verified":true}],"events":[],"next_event_sequence":1}
 ```
 
-Legacy bare arrays remain readable and are upgraded when the new binary writes. Unknown or future format versions are refused without modifying the file. Do not point an older portzilla binary at a v2 state file: it does not understand the envelope and must be upgraded first. This guard prevents an older writer from dropping process identity fields.
+Legacy bare arrays and v2 envelopes remain readable and are upgraded when the new binary writes. Unknown or future format versions are refused without modifying the file. Do not point an older portzilla binary at a v3 state file: it does not understand the envelope and must be upgraded first. This guard prevents an older writer from dropping process identity or history fields.
 
 Set `PORTZILLA_DATA_DIR` to isolate tests, CI runs, or throwaway experiments from your real lease store.

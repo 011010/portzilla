@@ -36,8 +36,8 @@
 //! is through the policy flag set by `main.rs` based on the environment
 //! variable.
 
-use crate::guard::Verdict;
-use crate::hook_common::{EvaluationRequest, evaluate};
+use crate::guard::{GuardAuditDraft, Verdict};
+use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,8 @@ use serde::{Deserialize, Serialize};
 pub struct HookOutcome {
     pub stdout_json: Option<String>,
     pub stderr_note: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) audit: Option<GuardAuditDraft>,
 }
 
 impl HookOutcome {
@@ -58,6 +60,7 @@ impl HookOutcome {
         Self {
             stdout_json: None,
             stderr_note: None,
+            audit: None,
         }
     }
 
@@ -65,6 +68,7 @@ impl HookOutcome {
         Self {
             stdout_json: None,
             stderr_note: Some(note.into()),
+            audit: None,
         }
     }
 
@@ -72,6 +76,7 @@ impl HookOutcome {
         Self {
             stdout_json: Some(fail_closed_response(&reason)),
             stderr_note: None,
+            audit: None,
         }
     }
 }
@@ -226,12 +231,13 @@ pub fn handle_with_policy(
         );
     };
 
-    match evaluate(EvaluationRequest {
+    let evaluation = evaluate_with_evidence(EvaluationRequest {
         command: &command,
         session: self_session.as_deref(),
         leases,
         checker,
-    }) {
+    });
+    match evaluation.verdict {
         Verdict::Allow => HookOutcome::allow_silent(),
         Verdict::Deny { explanation, .. } => {
             let response = HookResponse {
@@ -248,6 +254,7 @@ pub fn handle_with_policy(
                     serde_json::to_string(&response).expect("HookResponse always serializes"),
                 ),
                 stderr_note: None,
+                audit: evaluation.evidence,
             }
         }
         Verdict::Warn { explanation } => {
@@ -265,6 +272,7 @@ pub fn handle_with_policy(
                     serde_json::to_string(&response).expect("HookResponse always serializes"),
                 ),
                 stderr_note: None,
+                audit: evaluation.evidence,
             }
         }
     }
@@ -341,6 +349,30 @@ mod tests {
         assert!(
             json["hookSpecificOutput"]
                 .get("additionalContext")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn audit_is_present_for_deny_and_warn_and_absent_for_allow() {
+        let leases = vec![lease_with_session(3000, 1234, "dev-server", "owner")];
+        assert!(
+            handle(
+                &bash_input_with_session("kill 1234", "caller"),
+                &leases,
+                &AlwaysAlive
+            )
+            .audit
+            .is_some()
+        );
+        assert!(
+            handle(&bash_input("pkill node"), &[], &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&bash_input("git status"), &leases, &AlwaysAlive)
+                .audit
                 .is_none()
         );
     }
