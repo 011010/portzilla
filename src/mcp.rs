@@ -537,34 +537,41 @@ mod tests {
 
     #[tokio::test]
     async fn claim_conflicting_with_a_live_pid_reassigns() {
-        let (server, _dir) = server_with_tempdir();
-        let port = unused_test_port();
-        let own_pid = std::process::id();
-        server
-            .claim(Parameters(ClaimParams {
-                port,
-                tag: "first".to_string(),
-                pid: Some(own_pid),
-                session: None,
-            }))
-            .await
-            .unwrap();
+        for _ in 0..100 {
+            let (server, _dir) = server_with_tempdir();
+            let port = unused_test_port();
+            let own_pid = std::process::id();
+            let first = server
+                .claim(Parameters(ClaimParams {
+                    port,
+                    tag: "first".to_string(),
+                    pid: Some(own_pid),
+                    session: None,
+                }))
+                .await
+                .unwrap();
+            if structured(&first)["reassigned"] == true {
+                continue;
+            }
 
-        let result = server
-            .claim(Parameters(ClaimParams {
-                port,
-                tag: "second".to_string(),
-                pid: Some(own_pid + 1),
-                session: None,
-            }))
-            .await
-            .unwrap();
+            let result = server
+                .claim(Parameters(ClaimParams {
+                    port,
+                    tag: "second".to_string(),
+                    pid: Some(own_pid + 1),
+                    session: None,
+                }))
+                .await
+                .unwrap();
 
-        let value = structured(&result);
-        assert_eq!(value["reassigned"], true);
-        assert!(value["port"].as_u64().unwrap() > port as u64);
-        assert_eq!(value["requested_port"], port);
-        assert_eq!(value["reassignment_reason"], "lease_conflict");
+            let value = structured(&result);
+            assert_eq!(value["reassigned"], true);
+            assert!(value["port"].as_u64().unwrap() > port as u64);
+            assert_eq!(value["requested_port"], port);
+            assert_eq!(value["reassignment_reason"], "lease_conflict");
+            return;
+        }
+        panic!("could not acquire a free test port");
     }
 
     #[tokio::test]
