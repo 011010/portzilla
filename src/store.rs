@@ -1,11 +1,17 @@
 //! Locked JSON persistence for leases, and the port-claiming core logic.
 
+use crate::audit::{
+    AuditActor, AuditEvent, AuditEventDraft, AuditEventKind, AuditSource, ClaimDisposition,
+    LeaseSnapshot,
+};
 use crate::lease::{Lease, PidChecker};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Restricts `path` (a directory) to owner-only access (`0700`) on Unix.
 /// No-op on non-Unix platforms, which don't share the same permission model.
@@ -38,12 +44,72 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 const DATA_DIR_ENV_VAR: &str = "PORTZILLA_DATA_DIR";
 const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 const HOME_ENV_VAR: &str = "HOME";
-const STATE_FORMAT_VERSION: u32 = 2;
+const V2_STATE_FORMAT_VERSION: u32 = 2;
+const STATE_FORMAT_VERSION: u32 = 3;
+pub(crate) const MAX_HISTORY_EVENTS: usize = 10_000;
 
 #[derive(Debug, Deserialize, Serialize)]
-struct VersionedState {
+struct StoredStateV2 {
     format_version: u32,
     leases: Vec<Lease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreState {
+    pub(crate) next_event_sequence: u64,
+    pub(crate) leases: Vec<Lease>,
+    pub(crate) events: Vec<AuditEvent>,
+}
+
+#[allow(dead_code)]
+pub(crate) enum StateUpdate<R> {
+    Unchanged(R),
+    Commit {
+        result: R,
+        events: Vec<crate::audit::AuditEventDraft>,
+    },
+}
+
+#[allow(dead_code)]
+pub(crate) trait Clock {
+    fn now(&self) -> Result<u64>;
+}
+
+#[allow(dead_code)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Result<u64> {
+        Ok(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs())
+    }
+}
+
+trait FileOps: Send + Sync {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()>;
+}
+
+struct RealFileOps;
+
+impl FileOps for RealFileOps {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes).map_err(Into::into)
+    }
+
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()> {
+        fs::rename(from, to).map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StoredStateV3 {
+    format_version: u32,
+    next_event_sequence: u64,
+    leases: Vec<Lease>,
+    events: Vec<AuditEvent>,
 }
 
 /// Maximum allowed length of a lease `tag`, in CHARACTERS (not bytes).
@@ -88,6 +154,12 @@ pub(crate) fn validate_claim_inputs(port: u16, tag: &str, session: Option<&str>)
     Ok(())
 }
 
+fn validate_actor(actor: AuditActor) -> Result<AuditActor> {
+    let actor = AuditActor::new(actor.source, actor.harness, actor.session);
+    actor.validate()?;
+    Ok(actor)
+}
+
 /// Result of a `claim` operation: the lease that was actually created/updated,
 /// and whether it landed on a different port than the one requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -102,6 +174,22 @@ pub struct ClaimOutcome {
     pub lease: Lease,
     pub reassigned: bool,
     pub reassignment_reason: Option<ReassignmentReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimMutation {
+    pub(crate) outcome: ClaimOutcome,
+    pub(crate) disposition: ClaimDisposition,
+    pub(crate) prior_lease: Option<Lease>,
+    pub(crate) replaced_lease: Option<Lease>,
+}
+
+impl std::ops::Deref for ClaimMutation {
+    type Target = ClaimOutcome;
+
+    fn deref(&self) -> &Self::Target {
+        &self.outcome
+    }
 }
 
 /// Result of a `release` operation: the lease that was removed, and whether
@@ -123,6 +211,7 @@ pub struct ReleaseOutcome {
 #[derive(Clone)]
 pub struct Store {
     data_dir: PathBuf,
+    file_ops: Arc<dyn FileOps>,
 }
 
 impl Store {
@@ -166,7 +255,10 @@ impl Store {
             std::env::var(XDG_DATA_HOME_ENV_VAR).ok(),
             std::env::var(HOME_ENV_VAR).ok(),
         )?;
-        let store = Self { data_dir };
+        let store = Self {
+            data_dir,
+            file_ops: Arc::new(RealFileOps),
+        };
         store.ensure_data_dir()?;
         Ok(store)
     }
@@ -183,11 +275,12 @@ impl Store {
     /// Returns all currently stored leases.
     pub fn list(&self) -> Result<Vec<Lease>> {
         let _guard = self.lock_exclusive()?;
-        self.read_leases()
+        self.read_leases_for_read()
     }
 
     /// Claims `requested_port` for `pid`, following the conflict-resolution
     /// rules documented on [`claim_in_place`].
+    #[allow(dead_code)]
     pub fn claim(
         &self,
         requested_port: u16,
@@ -196,50 +289,118 @@ impl Store {
         session: Option<String>,
         checker: &dyn PidChecker,
     ) -> Result<ClaimOutcome> {
+        self.claim_with_actor(
+            requested_port,
+            pid,
+            tag,
+            session,
+            AuditActor::new(AuditSource::Cli, None, None),
+            checker,
+        )
+    }
+
+    pub(crate) fn claim_with_actor(
+        &self,
+        requested_port: u16,
+        pid: u32,
+        tag: String,
+        session: Option<String>,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<ClaimOutcome> {
         // An empty `--session ""` (e.g. from an unbound `$VAR` expansion)
         // must behave as no session: otherwise two unrelated empty sessions
         // would recognize each other's leases as their own in the guard.
         let session = session.filter(|s| !s.is_empty());
+        let actor = AuditActor::new(actor.source, actor.harness, actor.session);
+        actor.validate()?;
         // Validate before taking the lock / reading state so a rejected
         // claim never touches (or even waits on) the store.
         validate_claim_inputs(requested_port, &tag, session.as_deref())?;
-        let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
-        self.write_leases(&leases)?;
-        Ok(outcome)
+        self.update_state(|state| {
+            let mutation = claim_in_place(
+                &mut state.leases,
+                requested_port,
+                pid,
+                tag,
+                session,
+                checker,
+            )?;
+            let draft = AuditEventDraft {
+                actor,
+                kind: AuditEventKind::LeaseClaimed {
+                    requested_port,
+                    disposition: mutation.disposition,
+                    lease: LeaseSnapshot::from(&mutation.outcome.lease),
+                    prior_lease: mutation.prior_lease.as_ref().map(LeaseSnapshot::from),
+                    replaced_lease: mutation.replaced_lease.as_ref().map(LeaseSnapshot::from),
+                },
+            };
+            Ok(StateUpdate::Commit {
+                result: mutation.outcome,
+                events: vec![draft],
+            })
+        })
     }
 
     /// Returns the lease on `port`, if any.
     pub fn get(&self, port: u16) -> Result<Option<Lease>> {
         let _guard = self.lock_exclusive()?;
-        let leases = self.read_leases()?;
+        let leases = self.read_leases_for_read()?;
         Ok(leases.into_iter().find(|lease| lease.port == port))
     }
 
     /// Removes the lease on `port`, if any, and reports whether its owning
     /// PID was still alive at the time of removal. Returns `None` if there
     /// was no lease on `port`.
-    pub fn release(&self, port: u16, checker: &dyn PidChecker) -> Result<Option<ReleaseOutcome>> {
-        let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let outcome = release_in_place(&mut leases, port, checker);
-        if outcome.is_some() {
-            self.write_leases(&leases)?;
-        }
-        Ok(outcome)
+    pub fn release(
+        &self,
+        port: u16,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<Option<ReleaseOutcome>> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let Some(outcome) = release_in_place(&mut state.leases, port, checker) else {
+                return Ok(StateUpdate::Unchanged(None));
+            };
+            let event = AuditEventDraft {
+                actor,
+                kind: AuditEventKind::LeaseReleased {
+                    lease: LeaseSnapshot::from(&outcome.lease),
+                    was_alive: outcome.was_alive,
+                },
+            };
+            Ok(StateUpdate::Commit {
+                result: Some(outcome),
+                events: vec![event],
+            })
+        })
     }
 
     /// Removes every lease whose owning PID is dead, and returns the
     /// removed leases. Returns an empty vector if nothing was pruned.
-    pub fn prune(&self, checker: &dyn PidChecker) -> Result<Vec<Lease>> {
-        let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let pruned = prune_in_place(&mut leases, checker);
-        if !pruned.is_empty() {
-            self.write_leases(&leases)?;
-        }
-        Ok(pruned)
+    pub fn prune(&self, actor: AuditActor, checker: &dyn PidChecker) -> Result<Vec<Lease>> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let pruned = prune_in_place(&mut state.leases, checker);
+            if pruned.is_empty() {
+                return Ok(StateUpdate::Unchanged(Vec::new()));
+            }
+            let events = pruned
+                .iter()
+                .map(|lease| AuditEventDraft {
+                    actor: actor.clone(),
+                    kind: AuditEventKind::LeasePruned {
+                        lease: LeaseSnapshot::from(lease),
+                    },
+                })
+                .collect();
+            Ok(StateUpdate::Commit {
+                result: pruned,
+                events,
+            })
+        })
     }
 
     /// Transfers the lease on `port` from the expected wrapper identity to a
@@ -256,43 +417,53 @@ impl Store {
         expected_owner_pid: u32,
         expected_owner_start_time: u64,
         new_owner_pid: u32,
+        actor: AuditActor,
         checker: &dyn PidChecker,
     ) -> Result<Lease> {
-        let _guard = self.lock_exclusive()?;
-        let mut leases = self.read_leases()?;
-        let index = leases
-            .iter()
-            .position(|lease| lease.port == port)
-            .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
-        let existing = leases[index].clone();
-
-        if existing.pid != expected_owner_pid
-            || existing.process_start_time != Some(expected_owner_start_time)
-        {
-            bail!(
-                "lease on port {port} is not owned by expected owner {expected_owner_pid}: transfer rejected"
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let index = state
+                .leases
+                .iter()
+                .position(|lease| lease.port == port)
+                .with_context(|| format!("no lease on port {port}: transfer rejected"))?;
+            let existing = state.leases[index].clone();
+            if existing.pid != expected_owner_pid
+                || existing.process_start_time != Some(expected_owner_start_time)
+            {
+                bail!(
+                    "lease on port {port} is not owned by expected owner {expected_owner_pid}: transfer rejected"
+                );
+            }
+            if !existing.is_alive(checker) {
+                bail!("lease on port {port} owner is no longer alive: transfer rejected");
+            }
+            if !checker.is_alive(new_owner_pid) {
+                bail!("child pid {new_owner_pid} is not alive: transfer rejected");
+            }
+            let Some(child_start_time) = checker.process_start_time(new_owner_pid) else {
+                bail!("child pid {new_owner_pid} has no resolvable start time: transfer rejected");
+            };
+            let transferred = Lease::new_with_process_start_time(
+                existing.port,
+                new_owner_pid,
+                existing.tag.clone(),
+                existing.session.clone(),
+                Some(child_start_time),
             );
-        }
-        if !existing.is_alive(checker) {
-            bail!("lease on port {port} owner is no longer alive: transfer rejected");
-        }
-        if !checker.is_alive(new_owner_pid) {
-            bail!("child pid {new_owner_pid} is not alive: transfer rejected");
-        }
-        let Some(child_start_time) = checker.process_start_time(new_owner_pid) else {
-            bail!("child pid {new_owner_pid} has no resolvable start time: transfer rejected");
-        };
-
-        let transferred = Lease::new_with_process_start_time(
-            existing.port,
-            new_owner_pid,
-            existing.tag.clone(),
-            existing.session.clone(),
-            Some(child_start_time),
-        );
-        leases[index] = transferred.clone();
-        self.write_leases(&leases)?;
-        Ok(transferred)
+            state.leases[index] = transferred.clone();
+            Ok(StateUpdate::Commit {
+                result: transferred.clone(),
+                events: vec![AuditEventDraft {
+                    actor,
+                    kind: AuditEventKind::LeaseTransferred {
+                        wrapper_pid: expected_owner_pid,
+                        wrapper_start_time: expected_owner_start_time,
+                        lease: LeaseSnapshot::from(&transferred),
+                    },
+                }],
+            })
+        })
     }
 
     /// Ensures the data directory exists and is restricted to owner-only
@@ -332,36 +503,40 @@ impl Store {
         Ok(lock_file)
     }
 
-    fn read_leases(&self) -> Result<Vec<Lease>> {
+    #[cfg(test)]
+    pub(crate) fn read_state(&self) -> Result<StoreState> {
+        let _guard = self.lock_exclusive()?;
+        self.read_state_unlocked()
+    }
+
+    fn read_leases_for_read(&self) -> Result<Vec<Lease>> {
+        Ok(self.read_state_unlocked()?.leases)
+    }
+
+    fn read_state_unlocked(&self) -> Result<StoreState> {
         let path = self.state_file_path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read state file at {}", path.display()));
-            }
+        let Some(value) = self.read_json_value()? else {
+            return Ok(StoreState {
+                next_event_sequence: 1,
+                leases: Vec::new(),
+                events: Vec::new(),
+            });
         };
-        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(Vec::new());
-        }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "state file at {} contains invalid JSON and was not modified",
-                path.display()
-            )
-        })?;
 
         match value {
-            serde_json::Value::Array(_) => {
-                let leases: Vec<Lease> = serde_json::from_value(value).with_context(|| {
+            serde_json::Value::Array(value) => {
+                let leases: Vec<Lease> = serde_json::from_value(serde_json::Value::Array(value)).with_context(|| {
                     format!(
                         "state file at {} contains invalid legacy lease data and was not modified",
                         path.display()
                     )
                 })?;
                 validate_unique_ports(&leases, &path)?;
-                Ok(leases)
+                Ok(StoreState {
+                    next_event_sequence: 1,
+                    leases,
+                    events: Vec::new(),
+                })
             }
             serde_json::Value::Object(ref object) => {
                 let version = object
@@ -373,13 +548,78 @@ impl Store {
                             path.display()
                         )
                     })?;
-                if version != STATE_FORMAT_VERSION as u64 {
+                match version as u32 {
+                    V2_STATE_FORMAT_VERSION => {
+                        let state: StoredStateV2 = serde_json::from_value(value).with_context(|| {
+                            format!(
+                                "state file at {} contains invalid versioned lease data and was not modified",
+                                path.display()
+                            )
+                        })?;
+                        validate_unique_ports(&state.leases, &path)?;
+                        Ok(StoreState {
+                            next_event_sequence: 1,
+                            leases: state.leases,
+                            events: Vec::new(),
+                        })
+                    }
+                    STATE_FORMAT_VERSION => {
+                        let state: StoredStateV3 = serde_json::from_value(value).with_context(|| {
+                            format!(
+                                "state file at {} contains invalid v3 lease data and was not modified",
+                                path.display()
+                            )
+                        })?;
+                        let state = StoreState {
+                            next_event_sequence: state.next_event_sequence,
+                            leases: state.leases,
+                            events: state.events,
+                        };
+                        validate_state(&state, &path)?;
+                        Ok(state)
+                    }
+                    _ => bail!(
+                        "unsupported state file format version {version} at {}; upgrade portzilla before using this state file",
+                        path.display()
+                    ),
+                }
+            }
+            _ => bail!(
+                "state file at {} must be a legacy lease array or a versioned object and was not modified",
+                path.display()
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn read_leases(&self) -> Result<Vec<Lease>> {
+        let path = self.state_file_path();
+        let Some(value) = self.read_json_value()? else {
+            return Ok(Vec::new());
+        };
+        match value {
+            serde_json::Value::Array(value) => {
+                let leases: Vec<Lease> = serde_json::from_value(serde_json::Value::Array(value)).with_context(|| {
+                    format!(
+                        "state file at {} contains invalid legacy lease data and was not modified",
+                        path.display()
+                    )
+                })?;
+                validate_unique_ports(&leases, &path)?;
+                Ok(leases)
+            }
+            serde_json::Value::Object(object) => {
+                let version = object
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("state file at {} is an object without a numeric format_version and was not modified", path.display()))?;
+                if version != V2_STATE_FORMAT_VERSION as u64 {
                     bail!(
                         "unsupported state file format version {version} at {}; upgrade portzilla before using this state file",
                         path.display()
                     );
                 }
-                let state: VersionedState = serde_json::from_value(value).with_context(|| {
+                let state: StoredStateV2 = serde_json::from_value(serde_json::Value::Object(object)).with_context(|| {
                     format!(
                         "state file at {} contains invalid versioned lease data and was not modified",
                         path.display()
@@ -395,31 +635,141 @@ impl Store {
         }
     }
 
-    fn write_leases(&self, leases: &[Lease]) -> Result<()> {
+    fn read_json_value(&self) -> Result<Option<serde_json::Value>> {
+        let path = self.state_file_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read state file at {}", path.display()));
+            }
+        };
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(None);
+        }
+        serde_json::from_slice(&bytes).map(Some).with_context(|| {
+            format!(
+                "state file at {} contains invalid JSON and was not modified",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn write_v2_leases(&self, leases: &[Lease]) -> Result<()> {
         let path = self.state_file_path();
         let tmp_path = self
             .data_dir
             .join(format!(".leases.json.tmp.{}", std::process::id()));
-        let json = serde_json::to_vec_pretty(&VersionedState {
-            format_version: STATE_FORMAT_VERSION,
+        let json = serde_json::to_vec_pretty(&StoredStateV2 {
+            format_version: V2_STATE_FORMAT_VERSION,
             leases: leases.to_vec(),
         })
         .context("failed to serialize leases to JSON")?;
-        fs::write(&tmp_path, json).with_context(|| {
-            format!(
-                "failed to write temporary state file at {}",
-                tmp_path.display()
-            )
-        })?;
+        self.file_ops
+            .write_temp(&tmp_path, &json)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary state file at {}",
+                    tmp_path.display()
+                )
+            })?;
         // Harden before the rename: rename preserves the file's existing mode,
         // so this also leaves the final `leases.json` owner-only (0600).
         harden_file_permissions(&tmp_path)?;
-        fs::rename(&tmp_path, &path).with_context(|| {
-            format!(
-                "failed to atomically replace state file at {}",
-                path.display()
-            )
-        })?;
+        self.file_ops
+            .rename_temp(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace state file at {}",
+                    path.display()
+                )
+            })?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn update_state<R>(
+        &self,
+        mutate: impl FnOnce(&mut StoreState) -> Result<StateUpdate<R>>,
+    ) -> Result<R> {
+        self.update_state_with_clock(SystemClock, mutate)
+    }
+
+    #[allow(dead_code)]
+    fn update_state_with_clock<R>(
+        &self,
+        clock: impl Clock,
+        mutate: impl FnOnce(&mut StoreState) -> Result<StateUpdate<R>>,
+    ) -> Result<R> {
+        let _guard = self.lock_exclusive()?;
+        let mut state = self.read_state_unlocked()?;
+        let update = mutate(&mut state)?;
+        let StateUpdate::Commit { result, events } = update else {
+            let StateUpdate::Unchanged(result) = update else {
+                unreachable!();
+            };
+            return Ok(result);
+        };
+        if events.is_empty() {
+            bail!("state commit requires at least one event draft");
+        }
+        if state.next_event_sequence == u64::MAX
+            || events.len() as u64 > u64::MAX - state.next_event_sequence
+        {
+            bail!("state update would exhaust the event sequence");
+        }
+        let occurred_at = clock.now()?;
+        for draft in events {
+            let sequence = state.next_event_sequence;
+            state.next_event_sequence += 1;
+            state.events.push(AuditEvent {
+                sequence,
+                occurred_at,
+                actor: draft.actor,
+                kind: draft.kind,
+            });
+        }
+        let excess = state.events.len().saturating_sub(MAX_HISTORY_EVENTS);
+        if excess > 0 {
+            state.events.drain(..excess);
+        }
+        validate_state(&state, &self.state_file_path())?;
+        self.write_v3_state(&state)?;
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    fn write_v3_state(&self, state: &StoreState) -> Result<()> {
+        let path = self.state_file_path();
+        let tmp_path = self
+            .data_dir
+            .join(format!(".leases.json.tmp.{}", std::process::id()));
+        let json = serde_json::to_vec_pretty(&StoredStateV3 {
+            format_version: STATE_FORMAT_VERSION,
+            next_event_sequence: state.next_event_sequence,
+            leases: state.leases.clone(),
+            events: state.events.clone(),
+        })
+        .context("failed to serialize state to JSON")?;
+        self.file_ops
+            .write_temp(&tmp_path, &json)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary state file at {}",
+                    tmp_path.display()
+                )
+            })?;
+        harden_file_permissions(&tmp_path)?;
+        self.file_ops
+            .rename_temp(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace state file at {}",
+                    path.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -439,9 +789,49 @@ impl Store {
         hook();
         let mut leases = self.read_leases()?;
         let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
-        self.write_leases(&leases)?;
-        Ok(outcome)
+        self.write_v2_leases(&leases)?;
+        Ok(outcome.outcome)
     }
+}
+
+fn validate_state(state: &StoreState, path: &Path) -> Result<()> {
+    validate_unique_ports(&state.leases, path)?;
+    if state.next_event_sequence == 0 {
+        bail!(
+            "state file at {} has an invalid zero next_event_sequence and was not modified",
+            path.display()
+        );
+    }
+    if state.events.len() > MAX_HISTORY_EVENTS {
+        bail!(
+            "state file at {} contains more than {MAX_HISTORY_EVENTS} events and was not modified",
+            path.display()
+        );
+    }
+
+    let mut previous_sequence = 0;
+    for event in &state.events {
+        event.validate().with_context(|| {
+            format!(
+                "state file at {} contains an invalid audit event and was not modified",
+                path.display()
+            )
+        })?;
+        if event.sequence <= previous_sequence {
+            bail!(
+                "state file at {} contains duplicate or unordered event sequences and was not modified",
+                path.display()
+            );
+        }
+        previous_sequence = event.sequence;
+    }
+    if previous_sequence >= state.next_event_sequence {
+        bail!(
+            "state file at {} has next_event_sequence not above retained events and was not modified",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Applies the claim logic in-memory against an existing lease list:
@@ -460,7 +850,7 @@ pub(crate) fn claim_in_place(
     tag: String,
     session: Option<String>,
     checker: &dyn PidChecker,
-) -> Result<ClaimOutcome> {
+) -> Result<ClaimMutation> {
     let process_start_time = checker.process_start_time(pid);
     let existing_index = leases.iter().position(|l| l.port == requested_port);
 
@@ -471,13 +861,26 @@ pub(crate) fn claim_in_place(
             let lease =
                 Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: port != requested_port,
-                reassignment_reason,
+            let disposition = match reassignment_reason {
+                Some(ReassignmentReason::LeaseConflict) => {
+                    ClaimDisposition::ReassignedLeaseConflict
+                }
+                Some(ReassignmentReason::OsOccupied) => ClaimDisposition::ReassignedOsOccupied,
+                None => ClaimDisposition::Created,
+            };
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: port != requested_port,
+                    reassignment_reason,
+                },
+                disposition,
+                prior_lease: None,
+                replaced_lease: None,
             })
         }
         Some(index) if leases[index].pid == pid && leases[index].is_alive(checker) => {
+            let prior_lease = leases[index].clone();
             let lease = Lease::new_with_process_start_time(
                 requested_port,
                 pid,
@@ -486,15 +889,25 @@ pub(crate) fn claim_in_place(
                 process_start_time,
             );
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: false,
-                reassignment_reason: None,
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: false,
+                    reassignment_reason: None,
+                },
+                disposition: ClaimDisposition::Updated,
+                prior_lease: Some(prior_lease),
+                replaced_lease: None,
             })
         }
         Some(index) if leases[index].is_alive(checker) => {
+            let prior_lease = leases[index].clone();
             let (next_port, reassignment_reason) =
                 resolve_claim_port(requested_port, leases, checker, true)?;
+            let replaced_lease = leases
+                .iter()
+                .find(|lease| lease.port == next_port && !lease.is_alive(checker))
+                .cloned();
             let lease = Lease::new_with_process_start_time(
                 next_port,
                 pid,
@@ -507,14 +920,20 @@ pub(crate) fn claim_in_place(
             // blindly, or the dead entry and the new one both survive on the
             // same port.
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: true,
-                reassignment_reason,
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: true,
+                    reassignment_reason,
+                },
+                disposition: ClaimDisposition::ReassignedLeaseConflict,
+                prior_lease: Some(prior_lease),
+                replaced_lease,
             })
         }
         Some(_) => {
             // Dead lease on the requested port: prune it and take over the port.
+            let prior_lease = leases[existing_index.unwrap()].clone();
             let (port, reassignment_reason) =
                 resolve_claim_port(requested_port, leases, checker, false)?;
             if port != requested_port {
@@ -526,10 +945,22 @@ pub(crate) fn claim_in_place(
             let lease =
                 Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
-            Ok(ClaimOutcome {
-                lease,
-                reassigned: port != requested_port,
-                reassignment_reason,
+            let disposition = match reassignment_reason {
+                Some(ReassignmentReason::LeaseConflict) => {
+                    ClaimDisposition::ReassignedLeaseConflict
+                }
+                Some(ReassignmentReason::OsOccupied) => ClaimDisposition::ReassignedOsOccupied,
+                None => ClaimDisposition::ReplacedDead,
+            };
+            Ok(ClaimMutation {
+                outcome: ClaimOutcome {
+                    lease,
+                    reassigned: port != requested_port,
+                    reassignment_reason,
+                },
+                disposition,
+                prior_lease: Some(prior_lease),
+                replaced_lease: None,
             })
         }
     }
@@ -667,6 +1098,7 @@ pub(crate) fn prune_in_place(leases: &mut Vec<Lease>, checker: &dyn PidChecker) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditActor, AuditEventDraft, AuditEventKind, AuditSource};
     use crate::lease::{
         SystemPidChecker,
         test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
@@ -762,6 +1194,156 @@ mod tests {
         assert!(leases.is_empty());
     }
 
+    fn v3_event_json(sequence: u64) -> String {
+        format!(
+            r#"{{"sequence":{sequence},"occurred_at":1,"source":"cli","actor":{{"source":"cli","harness":null,"session":null}},"event":"history_cleared","data":{{"removed_count":0}}}}"#
+        )
+    }
+
+    fn write_v3_fixture(store: &Store, next_event_sequence: u64, events: &[String]) -> Vec<u8> {
+        let original = format!(
+            r#"{{"format_version":3,"next_event_sequence":{next_event_sequence},"leases":[],"events":[{}]}}"#,
+            events.join(",")
+        )
+        .into_bytes();
+        std::fs::write(store.state_file_path(), &original).unwrap();
+        original
+    }
+
+    #[test]
+    fn v2_state_decodes_with_empty_history_and_next_sequence_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(
+            store.state_file_path(),
+            r#"{"format_version":2,"leases":[]}"#,
+        )
+        .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert!(state.events.is_empty());
+        assert_eq!(state.next_event_sequence, 1);
+    }
+
+    #[test]
+    fn legacy_array_decodes_with_empty_history_and_next_sequence_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(
+            store.state_file_path(),
+            r#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#,
+        )
+        .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.leases.len(), 1);
+        assert!(state.events.is_empty());
+        assert_eq!(state.next_event_sequence, 1);
+    }
+
+    #[test]
+    fn v3_state_round_trips_leases_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 2, &[v3_event_json(1)]);
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.next_event_sequence, 2);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].sequence, 1);
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn read_only_calls_do_not_migrate_legacy_or_v2_state() {
+        for fixture in [
+            r#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#,
+            r#"{"format_version":2,"leases":[]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+            std::fs::write(store.state_file_path(), fixture).unwrap();
+            let original = std::fs::read(store.state_file_path()).unwrap();
+            assert!(store.read_state().is_ok());
+            assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn v3_rejects_zero_next_event_sequence_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 0, &[]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_duplicate_or_unordered_event_sequences_without_rewriting() {
+        for events in [
+            vec![v3_event_json(1), v3_event_json(1)],
+            vec![v3_event_json(2), v3_event_json(1)],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+            let original = write_v3_fixture(&store, 3, &events);
+            assert!(store.read_state().is_err());
+            assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn v3_rejects_zero_event_sequence_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[v3_event_json(0)]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_next_sequence_not_above_retained_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[v3_event_json(1)]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_more_than_ten_thousand_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let events: Vec<_> = (1..=10_001).map(v3_event_json).collect();
+        let original = write_v3_fixture(&store, 10_002, &events);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_rejects_oversized_bounded_event_fields_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let event = format!(
+            r#"{{"sequence":1,"occurred_at":1,"actor":{{"source":"cli","harness":null,"session":"{}"}},"event":"history_cleared","data":{{"removed_count":0}}}}"#,
+            "s".repeat(MAX_SESSION_CHARS + 1)
+        );
+        let original = write_v3_fixture(&store, 2, &[event]);
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn unknown_state_version_remains_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"{"format_version":99,"leases":[]}"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+        assert!(store.read_state().is_err());
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
     #[test]
     fn corrupt_state_file_returns_a_clear_error_instead_of_crashing() {
         let dir = tempfile::tempdir().unwrap();
@@ -801,7 +1383,7 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(store.state_file_path()).unwrap())
                 .unwrap();
-        assert_eq!(state["format_version"], 2);
+        assert_eq!(state["format_version"], STATE_FORMAT_VERSION);
         assert_eq!(state["leases"][0]["port"], port);
     }
 
@@ -915,7 +1497,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", requested_port)).unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .write_leases(&[Lease::new(requested_port, 4_000_000_000, "stale", None)])
+            .write_v2_leases(&[Lease::new(requested_port, 4_000_000_000, "stale", None)])
             .unwrap();
 
         let outcome = store
@@ -1493,7 +2075,7 @@ mod tests {
         let port = 27011;
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
-            .write_leases(&[Lease::new_with_process_start_time(
+            .write_v2_leases(&[Lease::new_with_process_start_time(
                 port,
                 100,
                 "server",
@@ -1502,7 +2084,14 @@ mod tests {
             )])
             .unwrap();
 
-        let outcome = store.release(port, &AlwaysAlive).unwrap().unwrap();
+        let outcome = store
+            .release(
+                port,
+                AuditActor::new(AuditSource::Cli, None, None),
+                &AlwaysAlive,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome.lease.port, port);
         assert!(outcome.was_alive);
         assert!(store.get(port).unwrap().is_none());
@@ -1512,7 +2101,16 @@ mod tests {
     fn store_release_returns_none_for_a_port_with_no_lease() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        assert!(store.release(3000, &AlwaysAlive).unwrap().is_none());
+        assert!(
+            store
+                .release(
+                    3000,
+                    AuditActor::new(AuditSource::Cli, None, None),
+                    &AlwaysAlive
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1539,7 +2137,12 @@ mod tests {
             )
             .unwrap();
 
-        let pruned = store.prune(&AlivePids(vec![100])).unwrap();
+        let pruned = store
+            .prune(
+                AuditActor::new(AuditSource::Watch, None, None),
+                &AlivePids(vec![100]),
+            )
+            .unwrap();
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].pid, 200);
 
@@ -1562,7 +2165,12 @@ mod tests {
             )
             .unwrap();
 
-        let pruned = store.prune(&AlwaysAlive).unwrap();
+        let pruned = store
+            .prune(
+                AuditActor::new(AuditSource::Watch, None, None),
+                &AlwaysAlive,
+            )
+            .unwrap();
         assert!(pruned.is_empty());
         assert_eq!(store.list().unwrap().len(), 1);
     }
@@ -1771,7 +2379,7 @@ mod tests {
             Some("sess-1".to_string()),
             Some(wrapper_start),
         );
-        store.write_leases(std::slice::from_ref(&lease)).unwrap();
+        store.write_v2_leases(std::slice::from_ref(&lease)).unwrap();
         lease
     }
 
@@ -1791,7 +2399,14 @@ mod tests {
         let original = seed_wrapper_lease(&store, port, wrapper_pid, wrapper_start);
 
         let transferred = store
-            .transfer(port, wrapper_pid, wrapper_start, child_pid, &checker)
+            .transfer(
+                port,
+                wrapper_pid,
+                wrapper_start,
+                child_pid,
+                run_actor("run-session"),
+                &checker,
+            )
             .unwrap();
 
         assert_eq!(transferred.port, port);
@@ -1812,7 +2427,9 @@ mod tests {
         let port = 23201;
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
 
-        let err = store.transfer(port, 100, 111, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 100, 111, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("no lease"),
             "unexpected error: {err:#}"
@@ -1828,7 +2445,9 @@ mod tests {
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
         let original = seed_wrapper_lease(&store, port, 100, 111);
 
-        let err = store.transfer(port, 101, 111, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 101, 111, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("expected owner"),
             "unexpected error: {err:#}"
@@ -1844,7 +2463,9 @@ mod tests {
         let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
         let original = seed_wrapper_lease(&store, port, 100, 111);
 
-        let err = store.transfer(port, 100, 999, 200, &checker).unwrap_err();
+        let err = store
+            .transfer(port, 100, 999, 200, run_actor("run-session"), &checker)
+            .unwrap_err();
         assert!(
             err.to_string().contains("expected owner"),
             "unexpected error: {err:#}"
@@ -1862,7 +2483,14 @@ mod tests {
         let recycled_checker = TransferChecker::wrapper_and_child(100, 333, 200, Some(222));
 
         let err = store
-            .transfer(port, 100, 111, 200, &recycled_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &recycled_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("no longer alive"),
@@ -1881,7 +2509,14 @@ mod tests {
         let dead_child_checker = TransferChecker::new(vec![(100, Some(111))]);
 
         let err = store
-            .transfer(port, 100, 111, 200, &dead_child_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &dead_child_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("child"),
@@ -1900,12 +2535,504 @@ mod tests {
         let no_identity_checker = TransferChecker::wrapper_and_child(100, 111, 200, None);
 
         let err = store
-            .transfer(port, 100, 111, 200, &no_identity_checker)
+            .transfer(
+                port,
+                100,
+                111,
+                200,
+                run_actor("run-session"),
+                &no_identity_checker,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("child"),
             "unexpected error: {err:#}"
         );
         assert_eq!(store.get(port).unwrap().unwrap(), original);
+    }
+
+    struct FixedClock(u64);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    fn history_clear_draft() -> AuditEventDraft {
+        AuditEventDraft {
+            actor: crate::audit::AuditActor::new(
+                crate::audit::AuditSource::Cli,
+                None,
+                Some("session-a".to_string()),
+            ),
+            kind: crate::audit::AuditEventKind::HistoryCleared { removed_count: 0 },
+        }
+    }
+
+    #[test]
+    fn state_update_assigns_consecutive_sequences_with_one_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let result = store
+            .update_state_with_clock(FixedClock(123), |state| {
+                state.leases.clear();
+                Ok(StateUpdate::Commit {
+                    result: 7,
+                    events: vec![history_clear_draft(), history_clear_draft()],
+                })
+            })
+            .unwrap();
+
+        assert_eq!(result, 7);
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), 2);
+        assert_eq!(state.events[0].sequence, 1);
+        assert_eq!(state.events[1].sequence, 2);
+        assert_eq!(state.events[0].occurred_at, 123);
+        assert_eq!(state.events[1].occurred_at, 123);
+        assert_eq!(state.next_event_sequence, 3);
+    }
+
+    #[test]
+    fn state_update_trims_oldest_events_and_preserves_monotonic_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let events: Vec<_> = (1..=MAX_HISTORY_EVENTS)
+            .map(|sequence| v3_event_json(sequence as u64))
+            .collect();
+        write_v3_fixture(&store, (MAX_HISTORY_EVENTS + 1) as u64, &events);
+
+        store
+            .update_state_with_clock(FixedClock(456), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft(), history_clear_draft()],
+                })
+            })
+            .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), MAX_HISTORY_EVENTS);
+        assert_eq!(state.events[0].sequence, 3);
+        assert_eq!(
+            state.events.last().unwrap().sequence,
+            (MAX_HISTORY_EVENTS + 2) as u64
+        );
+        assert_eq!(state.next_event_sequence, (MAX_HISTORY_EVENTS + 3) as u64);
+    }
+
+    #[test]
+    fn state_update_rejects_sequence_exhaustion_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, u64::MAX, &[]);
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("sequence"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn state_update_rejects_commit_without_event_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: Vec::new(),
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("event"));
+    }
+
+    #[test]
+    fn state_update_does_not_write_for_unchanged_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = br#"[{"port":3000,"pid":100,"tag":"legacy","created_at":1,"session":null}]"#;
+        std::fs::write(store.state_file_path(), original).unwrap();
+
+        let result = store
+            .update_state_with_clock(FixedClock(1), |_| Ok(StateUpdate::Unchanged(9)))
+            .unwrap();
+        assert_eq!(result, 9);
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn temporary_write_failure_preserves_previous_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+        std::fs::create_dir(
+            store
+                .data_dir
+                .join(format!(".leases.json.tmp.{}", std::process::id())),
+        )
+        .unwrap();
+
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("temporary") || err.to_string().contains("write"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    struct RenameFailFileOps;
+
+    impl FileOps for RenameFailFileOps {
+        fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+            std::fs::write(path, bytes).map_err(Into::into)
+        }
+
+        fn rename_temp(&self, _from: &Path, _to: &Path) -> Result<()> {
+            anyhow::bail!("injected rename failure")
+        }
+    }
+
+    #[test]
+    fn rename_failure_preserves_previous_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            data_dir: dir.path().to_path_buf(),
+            file_ops: std::sync::Arc::new(RenameFailFileOps),
+        };
+        store.ensure_data_dir().unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+
+        let err = store
+            .update_state_with_clock(FixedClock(1), |_| {
+                Ok(StateUpdate::Commit {
+                    result: (),
+                    events: vec![history_clear_draft()],
+                })
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("atomically replace"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    fn assert_claim_disposition(
+        mut leases: Vec<Lease>,
+        requested_port: u16,
+        pid: u32,
+        checker: &dyn PidChecker,
+        expected: ClaimDisposition,
+    ) -> ClaimMutation {
+        let mutation = claim_in_place(
+            &mut leases,
+            requested_port,
+            pid,
+            "claimed".to_string(),
+            None,
+            checker,
+        )
+        .unwrap();
+        assert_eq!(mutation.disposition, expected);
+        mutation
+    }
+
+    #[test]
+    fn claim_reports_created_without_prior_lease() {
+        let port = unused_test_port();
+        let mutation = assert_claim_disposition(
+            Vec::new(),
+            port,
+            100,
+            &AlwaysAlive,
+            ClaimDisposition::Created,
+        );
+        assert!(mutation.prior_lease.is_none());
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_updated_with_prior_lease() {
+        let port = unused_test_port();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            100,
+            &AlwaysAlive,
+            ClaimDisposition::Updated,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_replaced_dead_with_prior_lease() {
+        let port = unused_test_port();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            200,
+            &AlwaysDead,
+            ClaimDisposition::ReplacedDead,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_reassigned_lease_conflict() {
+        let (port, _) = unused_adjacent_test_ports();
+        let prior = Lease::new(port, 100, "old", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone()],
+            port,
+            200,
+            &AlivePids(vec![100, 200]),
+            ClaimDisposition::ReassignedLeaseConflict,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert!(mutation.replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_reports_reassigned_os_occupied() {
+        let (port, _) = unused_adjacent_test_ports();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mutation = assert_claim_disposition(
+            Vec::new(),
+            port,
+            200,
+            &AlwaysAlive,
+            ClaimDisposition::ReassignedOsOccupied,
+        );
+        assert!(mutation.prior_lease.is_none());
+        drop(listener);
+    }
+
+    #[test]
+    fn claim_reassignment_preserves_stale_destination_snapshot() {
+        let (requested_port, destination_port) = unused_adjacent_test_ports();
+        let prior = Lease::new(requested_port, 100, "requested", None);
+        let stale = Lease::new(destination_port, 300, "stale", None);
+        let mutation = assert_claim_disposition(
+            vec![prior.clone(), stale.clone()],
+            requested_port,
+            200,
+            &AlivePids(vec![100, 200]),
+            ClaimDisposition::ReassignedLeaseConflict,
+        );
+        assert_eq!(mutation.prior_lease, Some(prior));
+        assert_eq!(mutation.replaced_lease, Some(stale));
+    }
+
+    #[test]
+    fn claim_persists_lease_and_claim_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let port = unused_test_port();
+        let outcome = store
+            .claim_with_actor(
+                port,
+                100,
+                "service".to_string(),
+                None,
+                AuditActor::new(AuditSource::Cli, None, Some("session-a".to_string())),
+                &AlwaysAlive,
+            )
+            .unwrap();
+
+        let state = store.read_state().unwrap();
+        assert_eq!(state.leases, vec![outcome.lease.clone()]);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].actor.session.as_deref(), Some("session-a"));
+        let AuditEventKind::LeaseClaimed {
+            requested_port,
+            disposition,
+            lease,
+            prior_lease,
+            replaced_lease,
+        } = &state.events[0].kind
+        else {
+            panic!("claim must persist a lease_claimed event");
+        };
+        assert_eq!(*requested_port, port);
+        assert_eq!(*disposition, ClaimDisposition::Created);
+        assert_eq!(lease, &LeaseSnapshot::from(&outcome.lease));
+        assert!(prior_lease.is_none());
+        assert!(replaced_lease.is_none());
+    }
+
+    #[test]
+    fn claim_with_invalid_actor_does_not_write_lease_or_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+        let err = store
+            .claim_with_actor(
+                unused_test_port(),
+                100,
+                "service".to_string(),
+                None,
+                AuditActor::new(
+                    AuditSource::Cli,
+                    None,
+                    Some("s".repeat(MAX_SESSION_CHARS + 1)),
+                ),
+                &AlwaysAlive,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("session"));
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    fn run_actor(session: &str) -> AuditActor {
+        AuditActor::new(AuditSource::Run, None, Some(session.to_string()))
+    }
+
+    #[test]
+    fn transfer_persists_child_lease_and_transfer_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        seed_wrapper_lease(&store, 23220, 100, 111);
+
+        store
+            .transfer(23220, 100, 111, 200, run_actor("run-session"), &checker)
+            .unwrap();
+        let state = store.read_state().unwrap();
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].actor.session.as_deref(),
+            Some("run-session")
+        );
+        assert!(matches!(
+            state.events[0].kind,
+            AuditEventKind::LeaseTransferred { .. }
+        ));
+        assert_eq!(state.leases[0].pid, 200);
+        assert_eq!(state.leases[0].session.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn failed_transfer_does_not_emit_an_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let checker = TransferChecker::wrapper_and_child(100, 111, 200, Some(222));
+        seed_wrapper_lease(&store, 23221, 100, 111);
+        let original = std::fs::read(store.state_file_path()).unwrap();
+
+        assert!(
+            store
+                .transfer(23221, 100, 999, 200, run_actor("run-session"), &checker)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+        assert!(store.read_state().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn release_persists_removal_and_release_event_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let lease = seed_wrapper_lease(&store, 23222, 100, 111);
+
+        store
+            .release(
+                23222,
+                AuditActor::new(AuditSource::Cli, None, Some("cli-session".into())),
+                &AlwaysAlive,
+            )
+            .unwrap();
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].actor.session.as_deref(),
+            Some("cli-session")
+        );
+        assert!(
+            matches!(state.events[0].kind, AuditEventKind::LeaseReleased { lease: ref snapshot, .. } if snapshot == &LeaseSnapshot::from(&lease))
+        );
+    }
+
+    #[test]
+    fn release_missing_port_does_not_emit_or_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        let original = write_v3_fixture(&store, 1, &[]);
+
+        assert!(
+            store
+                .release(
+                    23223,
+                    AuditActor::new(AuditSource::Cli, None, None),
+                    &AlwaysAlive
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn prune_persists_one_event_per_removed_lease_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        store
+            .write_v2_leases(&[
+                Lease::new(23224, 100, "one", Some("owner-one".to_string())),
+                Lease::new(23225, 200, "two", Some("owner-two".to_string())),
+            ])
+            .unwrap();
+
+        let pruned = store
+            .prune(AuditActor::new(AuditSource::Watch, None, None), &AlwaysDead)
+            .unwrap();
+        assert_eq!(pruned.len(), 2);
+        let state = store.read_state().unwrap();
+        assert!(state.leases.is_empty());
+        assert_eq!(state.events.len(), 2);
+        assert!(
+            state
+                .events
+                .iter()
+                .all(|event| event.actor.source == AuditSource::Watch)
+        );
+        assert!(
+            state
+                .events
+                .iter()
+                .all(|event| matches!(event.kind, AuditEventKind::LeasePruned { .. }))
+        );
+    }
+
+    #[test]
+    fn prune_without_dead_leases_does_not_emit_or_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        seed_wrapper_lease(&store, 23226, 100, 111);
+        let original = std::fs::read(store.state_file_path()).unwrap();
+
+        assert!(
+            store
+                .prune(
+                    AuditActor::new(AuditSource::Watch, None, None),
+                    &TransferChecker::wrapper_and_child(100, 111, 200, Some(222))
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
     }
 }

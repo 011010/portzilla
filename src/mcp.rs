@@ -8,6 +8,7 @@
 //! `--json` flag emits (see `crate::view`), so anything already written
 //! against the CLI's JSON output recognizes MCP tool results too.
 
+use crate::audit::{AuditActor, AuditSource};
 use crate::lease::SystemPidChecker;
 use crate::store::Store;
 use crate::view::{to_claim_view, to_view};
@@ -113,7 +114,14 @@ impl PortzillaMcpServer {
         // onto tokio's dedicated blocking thread pool instead.
         let mut value = tokio::task::spawn_blocking(move || {
             store
-                .claim(requested_port, pid, tag, session, &SystemPidChecker)
+                .claim_with_actor(
+                    requested_port,
+                    pid,
+                    tag,
+                    session.clone(),
+                    AuditActor::new(AuditSource::Mcp, None, session),
+                    &SystemPidChecker,
+                )
                 .map(|outcome| {
                     serde_json::to_value(to_claim_view(&outcome, requested_port))
                         .expect("ClaimView always serializes")
@@ -205,15 +213,21 @@ impl PortzillaMcpServer {
         let port = params.port;
 
         let released = tokio::task::spawn_blocking(move || {
-            store.release(port, &SystemPidChecker).map(|outcome| {
-                outcome.map(|outcome| {
-                    let mut value =
-                        serde_json::to_value(to_view(&outcome.lease, &SystemPidChecker))
-                            .expect("LeaseView always serializes");
-                    value["was_alive"] = json!(outcome.was_alive);
-                    value
+            store
+                .release(
+                    port,
+                    AuditActor::new(AuditSource::Mcp, None, None),
+                    &SystemPidChecker,
+                )
+                .map(|outcome| {
+                    outcome.map(|outcome| {
+                        let mut value =
+                            serde_json::to_value(to_view(&outcome.lease, &SystemPidChecker))
+                                .expect("LeaseView always serializes");
+                        value["was_alive"] = json!(outcome.was_alive);
+                        value
+                    })
                 })
-            })
         })
         .await
         .map_err(blocking_task_failed)?
@@ -233,13 +247,18 @@ impl PortzillaMcpServer {
         let store = self.store.clone();
 
         let value = tokio::task::spawn_blocking(move || {
-            store.prune(&SystemPidChecker).map(|pruned| {
-                let views: Vec<_> = pruned
-                    .iter()
-                    .map(|lease| to_view(lease, &SystemPidChecker))
-                    .collect();
-                serde_json::to_value(views).expect("Vec<LeaseView> always serializes")
-            })
+            store
+                .prune(
+                    AuditActor::new(AuditSource::Mcp, None, None),
+                    &SystemPidChecker,
+                )
+                .map(|pruned| {
+                    let views: Vec<_> = pruned
+                        .iter()
+                        .map(|lease| to_view(lease, &SystemPidChecker))
+                        .collect();
+                    serde_json::to_value(views).expect("Vec<LeaseView> always serializes")
+                })
         })
         .await
         .map_err(blocking_task_failed)?
