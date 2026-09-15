@@ -284,13 +284,6 @@ impl Store {
     #[allow(dead_code)]
     pub(crate) fn history(&self, query: &HistoryQuery) -> Result<HistoryPage> {
         let _guard = self.lock_exclusive()?;
-        if query.before == Some(0) {
-            return Ok(HistoryPage {
-                events: Vec::new(),
-                has_more: false,
-                next_before: None,
-            });
-        }
         let mut matching = self
             .read_state_unlocked()?
             .events
@@ -318,7 +311,9 @@ impl Store {
         if has_more {
             events.pop();
         }
-        let next_before = events.last().map(|event| event.sequence);
+        let next_before = has_more
+            .then(|| events.last().map(|event| event.sequence))
+            .flatten();
         Ok(HistoryPage {
             events,
             has_more,
@@ -3206,7 +3201,20 @@ mod tests {
             vec![2, 1]
         );
         assert!(!page.has_more);
-        assert_eq!(page.next_before, Some(1));
+        assert_eq!(page.next_before, None);
+    }
+
+    #[test]
+    fn history_before_zero_still_validates_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        std::fs::write(store.state_file_path(), b"not json").unwrap();
+
+        assert!(
+            store
+                .history(&history_query(None, None, None, Some(0), 100))
+                .is_err()
+        );
     }
 
     #[test]

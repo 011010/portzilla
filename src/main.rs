@@ -1189,6 +1189,7 @@ fn run_portzilla_run(
     // Normalize here as well as in `Store::claim` so the child environment
     // matches the stored lease: empty means absent, never `PORTZILLA_SESSION=""`.
     let session = session.filter(|s| !s.is_empty());
+    let actor_session = resolve_cli_actor_session(session.as_deref());
     let store = Store::open(None)?;
     let wrapper_pid = std::process::id();
     let outcome = store.claim_with_actor(
@@ -1196,11 +1197,11 @@ fn run_portzilla_run(
         wrapper_pid,
         tag,
         session.clone(),
-        AuditActor::new(AuditSource::Run, None, session.clone()),
+        AuditActor::new(AuditSource::Run, None, actor_session.clone()),
         &SystemPidChecker,
     )?;
     let claimed_lease = outcome.lease.clone();
-    let run_actor = AuditActor::new(AuditSource::Run, None, session.clone());
+    let run_actor = AuditActor::new(AuditSource::Run, None, actor_session);
     let assigned = outcome.lease.port;
 
     // The wrapper lease must carry a verified start time before anything is
@@ -1622,7 +1623,7 @@ fn history_snapshot(kind: &AuditEventKind) -> Option<&LeaseSnapshot> {
 
 fn history_port(kind: &AuditEventKind, snapshot: Option<&LeaseSnapshot>) -> Option<u16> {
     match kind {
-        AuditEventKind::LeaseClaimed { requested_port, .. } => Some(*requested_port),
+        AuditEventKind::LeaseClaimed { .. } => snapshot.map(|lease| lease.port),
         AuditEventKind::GuardWarned { target, .. } => match target {
             audit::GuardTarget::Port { port } => Some(*port),
             _ => None,
@@ -1805,6 +1806,23 @@ mod actor_tests {
         assert_eq!(
             resolve_cli_actor_session_from(None, Some(""), Some("claude")),
             Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn claimed_history_rows_display_the_assigned_port() {
+        let lease = super::LeaseSnapshot::from(&super::Lease::new(3001, 42, "tag", None));
+        let kind = super::AuditEventKind::LeaseClaimed {
+            requested_port: 3000,
+            lease,
+            disposition: super::audit::ClaimDisposition::ReassignedLeaseConflict,
+            prior_lease: None,
+            replaced_lease: None,
+        };
+
+        assert_eq!(
+            super::history_port(&kind, super::history_snapshot(&kind)),
+            Some(3001)
         );
     }
 }
