@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest a focused improvement to Portzilla.
+title: "feat: "
+labels: [enhancement, status:needs-review]
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and found no duplicate.
+          required: true
+        - label: I understand that an issue needs `status:approved` before a PR can be opened.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: What problem or limitation would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior from a user's perspective.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - CLI
+        - MCP
+        - Hooks and integrations
+        - Documentation
+        - Packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
