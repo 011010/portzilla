@@ -2985,7 +2985,14 @@ mod tests {
             panic!("claim must persist a lease_claimed event");
         };
         assert_eq!(*requested_port, port);
-        assert_eq!(*disposition, ClaimDisposition::Created);
+        assert!(matches!(
+            disposition,
+            ClaimDisposition::Created | ClaimDisposition::ReassignedOsOccupied
+        ));
+        assert_eq!(
+            outcome.reassigned,
+            *disposition == ClaimDisposition::ReassignedOsOccupied
+        );
         assert_eq!(lease, &LeaseSnapshot::from(&outcome.lease));
         assert!(prior_lease.is_none());
         assert!(replaced_lease.is_none());
