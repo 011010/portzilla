@@ -2885,17 +2885,27 @@ mod tests {
 
     #[test]
     fn claim_reports_replaced_dead_with_prior_lease() {
-        let port = unused_test_port();
-        let prior = Lease::new(port, 100, "old", None);
-        let mutation = assert_claim_disposition(
-            vec![prior.clone()],
-            port,
-            200,
-            &AlwaysDead,
-            ClaimDisposition::ReplacedDead,
-        );
-        assert_eq!(mutation.prior_lease, Some(prior));
-        assert!(mutation.replaced_lease.is_none());
+        for _ in 0..100 {
+            let port = unused_test_port();
+            let prior = Lease::new(port, 100, "old", None);
+            let mutation = claim_in_place(
+                &mut vec![prior.clone()],
+                port,
+                200,
+                "claimed".to_string(),
+                None,
+                &AlwaysDead,
+            )
+            .unwrap();
+            if mutation.disposition == ClaimDisposition::ReassignedOsOccupied {
+                continue;
+            }
+            assert_eq!(mutation.disposition, ClaimDisposition::ReplacedDead);
+            assert_eq!(mutation.prior_lease, Some(prior));
+            assert!(mutation.replaced_lease.is_none());
+            return;
+        }
+        panic!("could not acquire a free test port");
     }
 
     #[test]
