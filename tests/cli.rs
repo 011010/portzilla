@@ -33,6 +33,74 @@ fn claim_on_a_free_port_succeeds_and_reports_the_port() {
         .stdout(predicate::str::contains("4000"));
 }
 
+#[test]
+fn history_json_on_empty_store_returns_stable_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["history", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::is_match(r#"\{"events":\[\],"has_more":false,"next_before":null\}"#)
+                .unwrap(),
+        );
+}
+
+#[test]
+fn history_json_returns_events_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["claim", "4001", "--tag", "history", "--pid", "111"])
+        .assert()
+        .success();
+    let output = cmd(dir.path())
+        .args(["history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["events"][0]["event"], "lease_claimed");
+    assert_eq!(json["events"][0]["sequence"], 1);
+}
+
+#[test]
+fn history_clear_replaces_prior_events_with_clear_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["claim", "4002", "--tag", "history", "--pid", "111"])
+        .assert()
+        .success();
+    cmd(dir.path())
+        .args(["history", "clear"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared 1 history events"));
+    let output = cmd(dir.path())
+        .args(["history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["events"][0]["event"], "history_cleared");
+    assert_eq!(json["events"][0]["data"]["removed_count"], 1);
+}
+
+#[test]
+fn history_clear_rejects_query_options() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["history", "clear", "--limit", "2"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("cannot be used").or(predicate::str::contains("conflicts")),
+        );
+}
+
 fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
     for _ in 0..100 {
         let requested = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2388,6 +2456,11 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
     let dead: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(dead["pid"], child_pid);
     assert_eq!(dead["alive"], false);
+
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("leases.json")).unwrap()).unwrap();
+    assert_eq!(state["events"][2]["event"], "process_exited");
+    assert_eq!(state["events"][2]["data"]["outcome"]["kind"], "signal");
 
     cmd(dir.path())
         .args(["prune"])

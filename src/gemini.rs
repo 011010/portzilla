@@ -59,8 +59,8 @@
 //! `decision` field (Gemini's own docs: "Pollution = Failure ... defaults
 //! to Allow") plus a stderr diagnostic, never a crash or a `deny`.
 
-use crate::guard::Verdict;
-use crate::hook_common::{EvaluationRequest, evaluate};
+use crate::guard::{GuardAuditDraft, Verdict};
+use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,8 @@ use serde::{Deserialize, Serialize};
 pub struct HookOutcome {
     pub stdout_json: String,
     pub stderr_note: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) audit: Option<GuardAuditDraft>,
 }
 
 /// The subset of the Gemini CLI `BeforeTool` hook input JSON this adapter
@@ -154,6 +156,7 @@ pub fn handle_with_policy(
                 return HookOutcome {
                     stdout_json: fail_closed_response("could not parse hook input JSON"),
                     stderr_note: None,
+                    audit: None,
                 };
             }
             return HookOutcome {
@@ -161,6 +164,7 @@ pub fn handle_with_policy(
                 stderr_note: Some(format!(
                     "portzilla hook gemini: could not parse hook input JSON, failing open (allow): {err}"
                 )),
+                audit: None,
             };
         }
     };
@@ -169,6 +173,7 @@ pub fn handle_with_policy(
         return HookOutcome {
             stdout_json: empty_response(),
             stderr_note: None,
+            audit: None,
         };
     }
 
@@ -181,6 +186,7 @@ pub fn handle_with_policy(
                     "run_shell_command call had no tool_input.command",
                 ),
                 stderr_note: None,
+                audit: None,
             };
         }
         return HookOutcome {
@@ -190,15 +196,17 @@ pub fn handle_with_policy(
                  open (allow)"
                     .to_string(),
             ),
+            audit: None,
         };
     };
 
-    let response = match evaluate(EvaluationRequest {
+    let evaluation = evaluate_with_evidence(EvaluationRequest {
         command: &command,
         session: self_session.as_deref(),
         leases,
         checker,
-    }) {
+    });
+    let response = match evaluation.verdict {
         Verdict::Allow => HookResponse::default(),
         Verdict::Deny { explanation, .. } => HookResponse {
             decision: Some("deny"),
@@ -215,6 +223,7 @@ pub fn handle_with_policy(
     HookOutcome {
         stdout_json: serde_json::to_string(&response).expect("HookResponse always serializes"),
         stderr_note: None,
+        audit: evaluation.evidence,
     }
 }
 
@@ -427,6 +436,26 @@ mod tests {
         let outcome = handle(&input, &leases, &AlwaysAlive);
         assert!(response_json(&outcome).get("decision").is_none());
         assert!(outcome.stderr_note.is_some());
+    }
+
+    #[test]
+    fn audit_is_present_for_deny_and_warn_and_absent_for_allow() {
+        let leases = vec![Lease::new(3000, 1234, "server", Some("owner".into()))];
+        assert!(
+            handle(&shell_input("kill 1234"), &leases, &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shell_input("pkill node"), &[], &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shell_input("git status"), &leases, &AlwaysAlive)
+                .audit
+                .is_none()
+        );
     }
 
     #[test]

@@ -62,8 +62,8 @@
 //! flips from "allow + note" to exit 2 with the reason on stderr (Kimi's
 //! own block channel) instead.
 
-use crate::guard::Verdict;
-use crate::hook_common::{EvaluationRequest, evaluate};
+use crate::guard::{GuardAuditDraft, Verdict};
+use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
 use crate::lease::{Lease, PidChecker};
 use serde::Deserialize;
 
@@ -80,6 +80,8 @@ pub struct HookOutcome {
     pub stdout_text: Option<String>,
     pub stderr_note: Option<String>,
     pub exit_code: i32,
+    #[allow(dead_code)]
+    pub(crate) audit: Option<GuardAuditDraft>,
 }
 
 impl HookOutcome {
@@ -88,6 +90,7 @@ impl HookOutcome {
             stdout_text: None,
             stderr_note: None,
             exit_code: 0,
+            audit: None,
         }
     }
 
@@ -96,6 +99,7 @@ impl HookOutcome {
             stdout_text: None,
             stderr_note: Some(note.into()),
             exit_code: 0,
+            audit: None,
         }
     }
 
@@ -107,6 +111,7 @@ impl HookOutcome {
             stdout_text: Some(warning),
             stderr_note: None,
             exit_code: 0,
+            audit: None,
         }
     }
 
@@ -115,6 +120,7 @@ impl HookOutcome {
             stdout_text: None,
             stderr_note: Some(reason),
             exit_code: EXIT_BLOCK,
+            audit: None,
         }
     }
 }
@@ -210,17 +216,22 @@ pub fn handle_with_policy(
         );
     };
 
-    match evaluate(EvaluationRequest {
+    let evaluation = evaluate_with_evidence(EvaluationRequest {
         command: &command,
         session: self_session.as_deref(),
         leases,
         checker,
-    }) {
+    });
+    match evaluation.verdict {
         Verdict::Allow => HookOutcome::allow_silent(),
-        Verdict::Deny { explanation, .. } => HookOutcome::deny_with_reason(explanation),
-        Verdict::Warn { explanation } => {
-            HookOutcome::allow_with_model_visible_warning(format!("portzilla: {explanation}"))
-        }
+        Verdict::Deny { explanation, .. } => HookOutcome {
+            audit: evaluation.evidence,
+            ..HookOutcome::deny_with_reason(explanation)
+        },
+        Verdict::Warn { explanation } => HookOutcome {
+            audit: evaluation.evidence,
+            ..HookOutcome::allow_with_model_visible_warning(format!("portzilla: {explanation}"))
+        },
     }
 }
 
@@ -443,5 +454,29 @@ mod tests {
         assert!(CONFIG_SNIPPET.contains(r#"matcher = "Shell""#));
         assert!(CONFIG_SNIPPET.contains(r#"command = "portzilla hook kimi""#));
         assert!(CONFIG_SNIPPET.contains("timeout"));
+    }
+
+    #[test]
+    fn audit_is_present_for_deny_and_warn_and_absent_for_allow() {
+        let leases = vec![lease_with_session(3000, 1234, "server", "owner")];
+        assert!(
+            handle(
+                &shell_input_with_session("kill 1234", "caller"),
+                &leases,
+                &AlwaysAlive
+            )
+            .audit
+            .is_some()
+        );
+        assert!(
+            handle(&shell_input("pkill node"), &[], &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shell_input("git status"), &leases, &AlwaysAlive)
+                .audit
+                .is_none()
+        );
     }
 }

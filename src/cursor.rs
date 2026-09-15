@@ -40,8 +40,8 @@
 //! internal fail-open handling is defense in depth on top of that, not a
 //! substitute for it (we never ask users to set `failClosed`).
 
-use crate::guard::Verdict;
-use crate::hook_common::{EvaluationRequest, evaluate};
+use crate::guard::{GuardAuditDraft, Verdict};
+use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
 use crate::lease::{Lease, PidChecker};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,8 @@ use serde::{Deserialize, Serialize};
 pub struct HookOutcome {
     pub stdout_json: String,
     pub stderr_note: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) audit: Option<GuardAuditDraft>,
 }
 
 /// The subset of Cursor's `beforeShellExecution` hook input JSON this
@@ -136,6 +138,7 @@ pub fn handle_with_policy(
                 return HookOutcome {
                     stdout_json: fail_closed_response("could not parse hook input JSON"),
                     stderr_note: None,
+                    audit: None,
                 };
             }
             return HookOutcome {
@@ -143,6 +146,7 @@ pub fn handle_with_policy(
                 stderr_note: Some(format!(
                     "portzilla hook cursor: could not parse hook input JSON, failing open (allow): {err}"
                 )),
+                audit: None,
             };
         }
     };
@@ -154,6 +158,7 @@ pub fn handle_with_policy(
             return HookOutcome {
                 stdout_json: fail_closed_response("hook input had no command"),
                 stderr_note: None,
+                audit: None,
             };
         }
         return HookOutcome {
@@ -162,15 +167,17 @@ pub fn handle_with_policy(
                 "portzilla hook cursor: hook input had no command, failing open (allow)"
                     .to_string(),
             ),
+            audit: None,
         };
     };
 
-    let response = match evaluate(EvaluationRequest {
+    let evaluation = evaluate_with_evidence(EvaluationRequest {
         command: &command,
         session: self_session.as_deref(),
         leases,
         checker,
-    }) {
+    });
+    let response = match evaluation.verdict {
         Verdict::Allow => HookResponse {
             permission: "allow",
             user_message: None,
@@ -198,6 +205,7 @@ pub fn handle_with_policy(
     HookOutcome {
         stdout_json: serde_json::to_string(&response).expect("HookResponse always serializes"),
         stderr_note: None,
+        audit: evaluation.evidence,
     }
 }
 
@@ -396,6 +404,26 @@ mod tests {
 
         assert_eq!(response_json(&outcome)["permission"], "allow");
         assert!(outcome.stderr_note.is_some());
+    }
+
+    #[test]
+    fn audit_is_present_for_deny_and_warn_and_absent_for_allow() {
+        let leases = vec![Lease::new(3000, 1234, "server", Some("owner".into()))];
+        assert!(
+            handle(&shell_input("kill 1234"), &leases, &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shell_input("pkill node"), &[], &AlwaysAlive)
+                .audit
+                .is_some()
+        );
+        assert!(
+            handle(&shell_input("git status"), &leases, &AlwaysAlive)
+                .audit
+                .is_none()
+        );
     }
 
     #[test]

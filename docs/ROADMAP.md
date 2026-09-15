@@ -26,7 +26,7 @@ The original foundation: a daemon-less CLI that tracks port ownership in a locke
 
 ## v0.1.x — MCP server — Implemented
 
-`portzilla serve --mcp` runs an MCP server over stdio (built on the `rmcp` SDK), exposing `claim`/`who`/`ls`/`release`/`prune` as MCP tools with the same semantics as their CLI counterparts.
+`portzilla serve --mcp` runs an MCP server over stdio (built on the `rmcp` SDK), exposing `claim`/`who`/`ls`/`release`/`prune` plus a read-only `history` query with the same semantics as the CLI.
 
 | Item | Status |
 |------|--------|
@@ -36,6 +36,7 @@ The original foundation: a daemon-less CLI that tracks port ownership in a locke
 | `claim`'s `pid` defaults to the server's own PID when omitted, with a `note` field flagging it | Implemented |
 | Missing-lease results as tool-level errors (`isError: true`), not JSON-RPC protocol errors | Implemented |
 | Reads/writes the same locked `leases.json` as the CLI (`PORTZILLA_DATA_DIR` respected) | Implemented |
+| Read-only `history` tool with filters and pagination | Implemented |
 
 **Rationale**: the CLI's biggest adoption risk is that agents default to shelling out to `lsof`/`kill` because that's what's in their training and prompts, not because `portzilla` is hard to use. An MCP server removes the "shell out to a subprocess and parse text" friction entirely — an agent with MCP tool access calls `who` the same way it calls any other structured tool, with typed JSON in and out. This is the first and lowest-effort step toward the core goal: making agents actually query ownership before acting, not just making the capability available to them.
 
@@ -149,6 +150,7 @@ An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire
 | Identity-checked lease transfer from wrapper PID to child PID | Implemented |
 | Child stdout preservation and exit-status propagation | Implemented |
 | Checked-in `skills/portzilla/SKILL.md` emitted by `portzilla init skill` | Implemented |
+| Bounded v3 audit journal for lease/process lifecycle and guard deny/warn events | Implemented |
 
 **Rationale**: a pre-claim from an agent's ephemeral shell can become dead while the server keeps running, and claiming after the server binds causes valid OS-occupancy reassignment. `run` owns the claim, spawn, and verified transfer as one operation, while the skill teaches agents to make their framework consume the assigned port.
 

@@ -16,7 +16,10 @@ mod watch;
 mod windsurf;
 
 use anyhow::{Context, Result};
-use audit::{AuditActor, AuditSource};
+use audit::{
+    AuditActor, AuditEventKind, AuditEventType, AuditSource, HistoryPage, HistoryQuery,
+    LeaseSnapshot, ProcessExitOutcome,
+};
 use clap::{Parser, Subcommand};
 use lease::{Lease, PidChecker, SystemPidChecker};
 use std::io::Read;
@@ -125,6 +128,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Query or clear the bounded event history.
+    History {
+        /// Clear all retained events instead of querying them.
+        #[arg(value_enum)]
+        action: Option<HistoryAction>,
+        #[arg(long, conflicts_with = "action")]
+        session: Option<String>,
+        #[arg(long, conflicts_with = "action")]
+        port: Option<u16>,
+        #[arg(long, value_enum, conflicts_with = "action")]
+        event: Option<AuditEventType>,
+        #[arg(long, conflicts_with = "action")]
+        before: Option<u64>,
+        #[arg(long, conflicts_with = "action")]
+        limit: Option<usize>,
+        #[arg(long, conflicts_with = "action")]
+        json: bool,
+    },
     /// Periodically remove leases whose owning processes have exited.
     Watch {
         /// Seconds between lease-pruning cycles (default: 60).
@@ -195,6 +216,11 @@ enum Commands {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HistoryAction {
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -448,6 +474,35 @@ fn run() -> Result<(), RunError> {
             )?;
             print_pruned(&pruned, json);
         }
+        Commands::History {
+            action,
+            session,
+            port,
+            event,
+            before,
+            limit,
+            json,
+        } => {
+            let store = Store::open(None)?;
+            if matches!(action, Some(HistoryAction::Clear)) {
+                let removed = store.clear_history(AuditActor::new(
+                    AuditSource::Cli,
+                    None,
+                    resolve_cli_actor_session(None),
+                ))?;
+                println!("cleared {removed} history events");
+            } else {
+                let query = HistoryQuery::try_new(
+                    session,
+                    port,
+                    event,
+                    before,
+                    limit.unwrap_or(audit::DEFAULT_HISTORY_LIMIT),
+                )?;
+                let page = store.history(&query)?;
+                print_history(&page, json);
+            }
+        }
     }
     Ok(())
 }
@@ -502,6 +557,7 @@ fn run_hook_claude_code() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::ClaudeCode);
             if let Some(json) = outcome.stdout_json {
                 println!("{json}");
             }
@@ -572,6 +628,7 @@ fn run_hook_cursor() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Cursor);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -638,6 +695,7 @@ fn run_hook_gemini() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Gemini);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -705,6 +763,7 @@ fn run_hook_codex() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Codex);
             if let Some(json) = outcome.stdout_json {
                 println!("{json}");
             }
@@ -771,6 +830,7 @@ fn run_hook_kimi() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Kimi);
             if let Some(text) = outcome.stdout_text {
                 println!("{text}");
             }
@@ -837,6 +897,7 @@ fn run_hook_windsurf() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::Windsurf);
             if let Some(text) = outcome.stdout_text {
                 println!("{text}");
             }
@@ -909,6 +970,7 @@ fn run_hook_opencode() {
 
     match result {
         Ok(outcome) => {
+            persist_hook_evidence(outcome.audit, audit::AuditHarness::OpenCode);
             println!("{}", outcome.stdout_json);
             if let Some(note) = outcome.stderr_note {
                 eprintln!("{note}");
@@ -947,8 +1009,23 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
     // Fail-open: a store problem is not a reason to block a command a
     // human or script explicitly asked to run. Under `PORTZILLA_FAIL_CLOSED`,
     // a store we can't read flips to deny instead.
-    let leases = match Store::open(None).and_then(|store| store.list()) {
-        Ok(leases) => leases,
+    let (store, leases) = match Store::open(None) {
+        Ok(store) => match store.list() {
+            Ok(leases) => (Some(store), leases),
+            Err(err) => {
+                if fail_closed {
+                    eprintln!(
+                        "portzilla guard: blocked — could not verify lease safety \
+                         and PORTZILLA_FAIL_CLOSED is set (failing closed): {err:#}"
+                    );
+                    std::process::exit(2);
+                }
+                eprintln!(
+                    "portzilla guard: failed to read the lease store, failing open (execute): {err:#}"
+                );
+                (None, Vec::new())
+            }
+        },
         Err(err) => {
             if fail_closed {
                 eprintln!(
@@ -960,17 +1037,20 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
             eprintln!(
                 "portzilla guard: failed to read the lease store, failing open (execute): {err:#}"
             );
-            Vec::new()
+            (None, Vec::new())
         }
     };
 
-    let action = guard_cmd::decide(
+    let (action, evidence) = guard_cmd::decide_with_evidence(
         &command_display,
         &leases,
         None,
         self_session.as_deref(),
         &SystemPidChecker,
     );
+    if let Some(evidence) = evidence {
+        persist_guard_evidence(store.as_ref(), evidence, self_session.as_deref());
+    }
     match action {
         guard_cmd::GuardAction::Deny { explanation } => {
             eprintln!("portzilla guard: blocked — {explanation}");
@@ -986,6 +1066,34 @@ fn run_guard_cmd(session_flag: Option<String>, command: Vec<String>) {
             execute(&command);
         }
         guard_cmd::GuardAction::Execute => execute(&command),
+    }
+}
+
+fn persist_guard_evidence(
+    store: Option<&Store>,
+    evidence: guard::GuardAuditDraft,
+    actor_session: Option<&str>,
+) {
+    let Some(store) = store else { return };
+    if let Err(err) = store.record_guard_evidence(
+        AuditActor::new(
+            AuditSource::Guard,
+            Some(audit::AuditHarness::Generic),
+            actor_session.map(str::to_owned),
+        ),
+        evidence.evidence,
+    ) {
+        eprintln!("portzilla guard: warning: failed to record guard event: {err:#}");
+    }
+}
+
+fn persist_hook_evidence(evidence: Option<guard::GuardAuditDraft>, harness: audit::AuditHarness) {
+    let Some(evidence) = evidence else { return };
+    let actor = AuditActor::new(AuditSource::Guard, Some(harness), evidence.actor_session);
+    match Store::open(None).and_then(|store| store.record_guard_evidence(actor, evidence.evidence))
+    {
+        Ok(()) => {}
+        Err(err) => eprintln!("portzilla hook: warning: failed to record guard event: {err:#}"),
     }
 }
 
@@ -1081,6 +1189,7 @@ fn run_portzilla_run(
     // Normalize here as well as in `Store::claim` so the child environment
     // matches the stored lease: empty means absent, never `PORTZILLA_SESSION=""`.
     let session = session.filter(|s| !s.is_empty());
+    let actor_session = resolve_cli_actor_session(session.as_deref());
     let store = Store::open(None)?;
     let wrapper_pid = std::process::id();
     let outcome = store.claim_with_actor(
@@ -1088,9 +1197,11 @@ fn run_portzilla_run(
         wrapper_pid,
         tag,
         session.clone(),
-        AuditActor::new(AuditSource::Run, None, session.clone()),
+        AuditActor::new(AuditSource::Run, None, actor_session.clone()),
         &SystemPidChecker,
     )?;
+    let claimed_lease = outcome.lease.clone();
+    let run_actor = AuditActor::new(AuditSource::Run, None, actor_session);
     let assigned = outcome.lease.port;
 
     // The wrapper lease must carry a verified start time before anything is
@@ -1139,21 +1250,30 @@ fn run_portzilla_run(
     // never touching a lease we did not verify as ours.
     let child_pid = child.id();
     let transfer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    let transferred_lease = loop {
         match store.transfer(
             assigned,
             wrapper_pid,
             wrapper_start_time,
             child_pid,
-            AuditActor::new(AuditSource::Run, None, session.clone()),
+            run_actor.clone(),
             &SystemPidChecker,
         ) {
-            Ok(_) => break,
+            Ok(lease) => break lease,
             Err(err) => {
                 if let Some(status) = child
                     .try_wait()
                     .context("failed to poll the run child after a failed lease transfer")?
                 {
+                    if let Err(record_err) = store.record_process_exit(
+                        run_actor.clone(),
+                        &claimed_lease,
+                        process_exit_outcome(&status),
+                    ) {
+                        eprintln!(
+                            "portzilla run: warning: failed to record process exit: {record_err:#}"
+                        );
+                    }
                     exit_with_child_status(status);
                 }
                 if std::time::Instant::now() >= transfer_deadline {
@@ -1166,14 +1286,30 @@ fn run_portzilla_run(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-    }
+    };
 
     let status = child.wait().context("failed to wait for the run child")?;
+    if let Err(err) =
+        store.record_process_exit(run_actor, &transferred_lease, process_exit_outcome(&status))
+    {
+        eprintln!("portzilla run: warning: failed to record process exit: {err:#}");
+    }
     match status.code() {
         Some(0) => Ok(()),
         Some(_) => exit_with_child_status(status),
         None => exit_with_child_status(status),
     }
+}
+
+fn process_exit_outcome(status: &std::process::ExitStatus) -> ProcessExitOutcome {
+    if let Some(code) = status.code() {
+        return ProcessExitOutcome::Code(code);
+    }
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
+        return ProcessExitOutcome::Signal(signal);
+    }
+    ProcessExitOutcome::Unknown
 }
 
 /// Exits this process with the child's status: the same code when the child
@@ -1415,6 +1551,87 @@ pub(crate) fn sanitize_for_display(s: &str) -> String {
         .collect()
 }
 
+fn print_history(page: &HistoryPage, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(page).expect("HistoryPage always serializes")
+        );
+        return;
+    }
+    if page.events.is_empty() {
+        println!("no history events");
+        return;
+    }
+    println!("SEQ EVENT SOURCE HARNESS ACTOR_SESSION LEASE_SESSION PORT PID SUMMARY");
+    let now = lease::current_unix_timestamp();
+    for event in &page.events {
+        let snapshot = history_snapshot(&event.kind);
+        let lease_session = snapshot
+            .and_then(|lease| lease.session.as_deref())
+            .map(sanitize_for_display)
+            .unwrap_or_else(|| "(none)".into());
+        let port =
+            history_port(&event.kind, snapshot).map_or_else(|| "-".into(), |port| port.to_string());
+        let pid = snapshot.map_or_else(|| "-".into(), |lease| lease.pid.to_string());
+        let actor_session = event
+            .actor
+            .session
+            .as_deref()
+            .map(sanitize_for_display)
+            .unwrap_or_else(|| "(none)".into());
+        let source = serde_json::to_string(&event.actor.source)
+            .unwrap_or_else(|_| "unknown".into())
+            .trim_matches('"')
+            .to_string();
+        let harness = event
+            .actor
+            .harness
+            .and_then(|value| serde_json::to_string(&value).ok())
+            .map(|value| value.trim_matches('"').to_string())
+            .unwrap_or_else(|| "-".into());
+        let summary = serde_json::to_string(&event.kind)
+            .unwrap_or_else(|_| "{}".into())
+            .replace(['\n', '\r', '\t'], " ");
+        println!(
+            "{} {} {} {} {} {} {} {} age={}s {}",
+            event.sequence,
+            event.kind.event_type().as_str(),
+            source,
+            harness,
+            actor_session,
+            lease_session,
+            port,
+            pid,
+            now.saturating_sub(event.occurred_at),
+            summary
+        );
+    }
+}
+
+fn history_snapshot(kind: &AuditEventKind) -> Option<&LeaseSnapshot> {
+    match kind {
+        AuditEventKind::LeaseClaimed { lease, .. }
+        | AuditEventKind::LeaseTransferred { lease, .. }
+        | AuditEventKind::LeaseReleased { lease, .. }
+        | AuditEventKind::LeasePruned { lease }
+        | AuditEventKind::ProcessExited { lease, .. }
+        | AuditEventKind::GuardDenied { lease, .. } => Some(lease),
+        AuditEventKind::GuardWarned { .. } | AuditEventKind::HistoryCleared { .. } => None,
+    }
+}
+
+fn history_port(kind: &AuditEventKind, snapshot: Option<&LeaseSnapshot>) -> Option<u16> {
+    match kind {
+        AuditEventKind::LeaseClaimed { .. } => snapshot.map(|lease| lease.port),
+        AuditEventKind::GuardWarned { target, .. } => match target {
+            audit::GuardTarget::Port { port } => Some(*port),
+            _ => None,
+        },
+        _ => snapshot.map(|lease| lease.port),
+    }
+}
+
 fn print_claim_outcome(outcome: &ClaimOutcome, requested_port: u16, json: bool) {
     if json {
         let view = to_claim_view(outcome, requested_port);
@@ -1536,6 +1753,31 @@ mod actor_tests {
     use super::resolve_cli_actor_session_from;
 
     #[test]
+    fn process_exit_outcome_classifies_exit_code() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            super::process_exit_outcome(&status),
+            super::ProcessExitOutcome::Code(7)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_outcome_classifies_unix_signal() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            super::process_exit_outcome(&status),
+            super::ProcessExitOutcome::Signal(15)
+        );
+    }
+
+    #[test]
     fn claim_actor_prefers_explicit_session_over_ambient() {
         assert_eq!(
             resolve_cli_actor_session_from(Some("explicit"), Some("portzilla"), Some("claude")),
@@ -1564,6 +1806,23 @@ mod actor_tests {
         assert_eq!(
             resolve_cli_actor_session_from(None, Some(""), Some("claude")),
             Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn claimed_history_rows_display_the_assigned_port() {
+        let lease = super::LeaseSnapshot::from(&super::Lease::new(3001, 42, "tag", None));
+        let kind = super::AuditEventKind::LeaseClaimed {
+            requested_port: 3000,
+            lease,
+            disposition: super::audit::ClaimDisposition::ReassignedLeaseConflict,
+            prior_lease: None,
+            replaced_lease: None,
+        };
+
+        assert_eq!(
+            super::history_port(&kind, super::history_snapshot(&kind)),
+            Some(3001)
         );
     }
 }

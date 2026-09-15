@@ -26,7 +26,10 @@
 //! process), so failures are surfaced on stderr rather than swallowed
 //! entirely, but they never block execution.
 
-use crate::guard::{self, MAX_SHELL_UNWRAP_DEPTH, Verdict, find_shell_c_payload, shell_words};
+use crate::guard::{
+    self, GuardAuditDraft, GuardEvaluation, MAX_SHELL_UNWRAP_DEPTH, Verdict, find_shell_c_payload,
+    shell_words,
+};
 use crate::lease::{Lease, PidChecker};
 
 /// What `main.rs` should do after resolving a verdict for the command.
@@ -106,6 +109,7 @@ fn unwrap_shell_c(args: &[String], depth: u32) -> Option<String> {
 /// Decides what to do with a command about to be run, given the current
 /// lease registry and the caller's session/PID identity (see the module
 /// doc comment for how those are resolved before this is called).
+#[allow(dead_code)]
 pub fn decide(
     command_display: &str,
     leases: &[Lease],
@@ -113,11 +117,24 @@ pub fn decide(
     self_session: Option<&str>,
     checker: &dyn PidChecker,
 ) -> GuardAction {
-    match guard::check(command_display, leases, self_pid, self_session, checker) {
+    decide_with_evidence(command_display, leases, self_pid, self_session, checker).0
+}
+
+pub(crate) fn decide_with_evidence(
+    command_display: &str,
+    leases: &[Lease],
+    self_pid: Option<u32>,
+    self_session: Option<&str>,
+    checker: &dyn PidChecker,
+) -> (GuardAction, Option<GuardAuditDraft>) {
+    let GuardEvaluation { verdict, evidence } =
+        guard::check_with_evidence(command_display, leases, self_pid, self_session, checker);
+    let action = match verdict {
         Verdict::Allow => GuardAction::Execute,
         Verdict::Deny { explanation, .. } => GuardAction::Deny { explanation },
         Verdict::Warn { explanation } => GuardAction::WarnThenExecute { explanation },
-    }
+    };
+    (action, evidence)
 }
 
 #[cfg(test)]
