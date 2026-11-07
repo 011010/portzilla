@@ -9,6 +9,12 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
+    # audit-check creates a check run via the Checks API; the push-to-main
+    # token needs `checks: write` explicitly or the step fails with
+    # "Resource not accessible by integration".
+    permissions:
+      contents: read
+      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
