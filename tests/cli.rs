@@ -115,6 +115,48 @@ fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
     panic!("could not reserve adjacent test ports");
 }
 
+/// Mirrors the store's `is_os_port_free` probe: wildcard + loopback in
+/// both families, with unbindable IPv6 treated as unprobeable rather than
+/// occupied. `reserve_adjacent_ports` only checks 127.0.0.1, which is not
+/// enough when a test asserts where the conflict walk lands: on macOS CI
+/// runners the walk also skips ports occupied on `0.0.0.0`/`::`/`::1`, so
+/// a merely-IPv4-free "next" port gets passed over.
+fn is_os_free_like_portzilla(port: u16) -> bool {
+    ["0.0.0.0", "127.0.0.1"]
+        .into_iter()
+        .all(|address| TcpListener::bind((address, port)).is_ok())
+        && ["::", "::1"]
+            .into_iter()
+            .all(|address| match TcpListener::bind((address, port)) {
+                Ok(_) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ),
+            })
+}
+
+/// Two adjacent ports that are OS-free on every address family portzilla
+/// probes. The listeners are never returned: the ports are validated and
+/// released, so the caller's claims see exactly the occupancy the probe
+/// promised.
+fn reserve_adjacent_os_free_ports() -> (u16, u16) {
+    for _ in 0..100 {
+        let base = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if let Some(successor) = base.checked_add(1)
+            && is_os_free_like_portzilla(base)
+            && is_os_free_like_portzilla(successor)
+        {
+            return (base, successor);
+        }
+    }
+    panic!("could not find two adjacent OS-free test ports");
+}
+
 fn free_test_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -788,11 +830,19 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     let parent_pid = std::os::unix::process::parent_id();
     let stale_pid = "4000000010";
 
-    // 1. Claim port 6000 for a PID that is alive for the whole test (this process).
+    // Two ports that are OS-free on every family portzilla probes when the
+    // test starts. Hard-coded numbers collide with whatever happens to listen
+    // on the dev machine — e.g. Docker Desktop binding 6001 makes the
+    // conflict-walk skip past it and breaks every assertion about "the next
+    // port". Ephemeral ports verified across all probe families are very
+    // unlikely to be reused in the window before the claims below.
+    let (base, next) = reserve_adjacent_os_free_ports();
+
+    // 1. Claim `base` for a PID that is alive for the whole test (this process).
     cmd(dir.path())
         .args([
             "claim",
-            "6000",
+            &base.to_string(),
             "--tag",
             "live-owner",
             "--pid",
@@ -801,28 +851,44 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
         .assert()
         .success();
 
-    // 2. Claim port 6001 for a PID that is definitely dead (stale lease).
-    cmd(dir.path())
-        .args(["claim", "6001", "--tag", "stale-owner", "--pid", stale_pid])
-        .assert()
-        .success();
-
-    // 3. A different, also-alive PID conflicts on 6000 and must be reassigned
-    //    onto 6001 (the only free-looking port), reusing the stale lease slot.
+    // 2. Claim `next` for a PID that is definitely dead (stale lease).
     cmd(dir.path())
         .args([
             "claim",
-            "6000",
+            &next.to_string(),
+            "--tag",
+            "stale-owner",
+            "--pid",
+            stale_pid,
+        ])
+        .assert()
+        .success();
+
+    // 3. A different, also-alive PID conflicts on `base` and must be reassigned
+    //    onto `next` (the only free-looking port), reusing the stale lease slot.
+    let reassigned = cmd(dir.path())
+        .args([
+            "claim",
+            &base.to_string(),
             "--tag",
             "new-owner",
             "--pid",
             &parent_pid.to_string(),
+            "--json",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("6001"));
+        .get_output()
+        .stdout
+        .clone();
+    let reassigned: Value = serde_json::from_slice(&reassigned).unwrap();
+    assert_eq!(
+        reassigned["port"], next,
+        "the conflict must resolve onto the stale-leased port"
+    );
+    assert_eq!(reassigned["reassignment_reason"], "lease_conflict");
 
-    // 4. `ls --json` must not contain two entries for port 6001.
+    // 4. `ls --json` must not contain two entries for `next`.
     let output = cmd(dir.path())
         .args(["ls", "--json"])
         .assert()
@@ -832,16 +898,16 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
         .clone();
     let json: Value = serde_json::from_slice(&output).unwrap();
     let leases = json.as_array().unwrap();
-    let port_6001_entries: Vec<&Value> = leases.iter().filter(|l| l["port"] == 6001).collect();
+    let port_entries: Vec<&Value> = leases.iter().filter(|l| l["port"] == next).collect();
     assert_eq!(
-        port_6001_entries.len(),
+        port_entries.len(),
         1,
-        "port 6001 must appear exactly once in ls"
+        "port {next} must appear exactly once in ls"
     );
 
-    // 5. `who 6001` must return the NEW owner, not the stale one.
+    // 5. `who next` must return the NEW owner, not the stale one.
     let who_output = cmd(dir.path())
-        .args(["who", "6001", "--json"])
+        .args(["who", &next.to_string(), "--json"])
         .assert()
         .success()
         .get_output()
@@ -851,10 +917,13 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     assert_eq!(who_json["pid"], parent_pid);
     assert_eq!(who_json["tag"], "new-owner");
 
-    // 6. `release 6001` must actually free it: a subsequent `who` must report not-found.
-    cmd(dir.path()).args(["release", "6001"]).assert().success();
+    // 6. `release next` must actually free it: a subsequent `who` must report not-found.
     cmd(dir.path())
-        .args(["who", "6001"])
+        .args(["release", &next.to_string()])
+        .assert()
+        .success();
+    cmd(dir.path())
+        .args(["who", &next.to_string()])
         .assert()
         .failure()
         .code(2);

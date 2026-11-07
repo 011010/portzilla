@@ -113,7 +113,13 @@ impl PortzillaMcpServer {
         previous owner has already exited), you get it directly. If it's genuinely held by a \
         live process, you are NOT allowed to steal it — you are given the next free port \
         instead, and the result says so. Call `who` first if you need to know who currently \
-        holds a busy port before deciding what to do."
+        holds a busy port before deciding what to do.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn claim(
         &self,
@@ -176,7 +182,13 @@ impl PortzillaMcpServer {
         and whether the owning process is currently alive. Use this before assuming a busy \
         port is safe to reuse, or before killing whatever is on it — it tells you who actually \
         owns the port and why. Returns a tool-level error (not a protocol error) if no lease \
-        is recorded for the port; that is a normal, expected result, not a failure."
+        is recorded for the port; that is a normal, expected result, not a failure.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn who(
         &self,
@@ -207,7 +219,13 @@ impl PortzillaMcpServer {
 
     #[tool(
         description = "List every lease currently recorded, with port, pid, tag, session, age \
-        in seconds, and alive/dead status for each."
+        in seconds, and alive/dead status for each.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn ls(&self) -> Result<CallToolResult, McpError> {
         let store = self.store.clone();
@@ -233,7 +251,13 @@ impl PortzillaMcpServer {
         alive, the lease is released anyway — this tool does not refuse or ask for \
         confirmation, since calling it is itself the explicit request. The result flags \
         whether the owning process was still alive at the moment of release. Returns a \
-        tool-level error (not a protocol error) if no lease is recorded for the port."
+        tool-level error (not a protocol error) if no lease is recorded for the port.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn release(
         &self,
@@ -276,7 +300,13 @@ impl PortzillaMcpServer {
 
     #[tool(
         description = "Remove every lease whose owning process is no longer alive, and return \
-        the leases that were removed (an empty list if none were dead)."
+        the leases that were removed (an empty list if none were dead).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn prune(
         &self,
@@ -311,7 +341,13 @@ impl PortzillaMcpServer {
     }
 
     #[tool(
-        description = "Read the bounded lease and guard event history, newest first. Filters are combined with AND; use before as an exclusive sequence cursor. This tool is read-only and cannot clear history."
+        description = "Read the bounded lease and guard event history, newest first. Filters are combined with AND; use before as an exclusive sequence cursor. This tool is read-only and cannot clear history.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn history(
         &self,
@@ -462,6 +498,67 @@ mod tests {
                 tool.description.as_ref().is_some_and(|d| !d.is_empty()),
                 "tool {} must have a non-empty description",
                 tool.name
+            );
+        }
+    }
+
+    // ---- tool annotations ----
+
+    /// Every tool must declare all four behaviour hints explicitly, because
+    /// OpenAI's MCP directory rejects tools where any hint is missing, and
+    /// hosts use them to warn users before invoking. The values are pinned
+    /// per tool and must match the handler's actual behaviour:
+    /// - read-only: `who`, `ls`, `history` never mutate the store.
+    /// - destructive: `release` deletes a lease even while its owner is
+    ///   alive (no confirmation), `prune` deletes leases whose owner died,
+    ///   and `claim` is purely additive — it never displaces a live lease,
+    ///   so it is the only non-destructive mutator.
+    /// - idempotent: repeating any call with the same args has no further
+    ///   effect (`claim` on a live own lease returns the same port;
+    ///   `release`/`prune` become no-ops once the leases are gone).
+    /// - open-world: false everywhere — portzilla only touches local ports,
+    ///   processes, and its own store; there is no external domain.
+    #[test]
+    fn every_tool_declares_all_four_behaviour_hints() {
+        let (server, _dir) = server_with_tempdir();
+        let tools = server.tool_router.list_all();
+        let expected: [(&str, bool, bool, bool, bool); 6] = [
+            // name       read-only  destructive  idempotent  open-world
+            ("claim", false, false, true, false),
+            ("who", true, false, true, false),
+            ("ls", true, false, true, false),
+            ("release", false, true, true, false),
+            ("prune", false, true, true, false),
+            ("history", true, false, true, false),
+        ];
+        for (name, read_only, destructive, idempotent, open_world) in expected {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} tool must be registered"));
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must declare tool annotations"));
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(read_only),
+                "{name} read_only_hint"
+            );
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(destructive),
+                "{name} destructive_hint"
+            );
+            assert_eq!(
+                annotations.idempotent_hint,
+                Some(idempotent),
+                "{name} idempotent_hint"
+            );
+            assert_eq!(
+                annotations.open_world_hint,
+                Some(open_world),
+                "{name} open_world_hint"
             );
         }
     }
