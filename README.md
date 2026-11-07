@@ -13,6 +13,7 @@
   <a href="https://crates.io/crates/portzilla"><img src="https://img.shields.io/crates/v/portzilla" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/portzilla"><img src="https://img.shields.io/npm/v/portzilla" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="https://m8ven.ai/mcp/011010/portzilla?s=readme"><img src="https://m8ven.ai/badge/mcp/011010/portzilla" alt="M8ven Trust Index"></a>
 </p>
 
 > AI coding agents (Claude Code, Cursor, etc.) run parallel sessions in git worktrees — each starting its own dev server. Today they coordinate by killing whatever is on a port. `portzilla` is the layer that **prevents the conflict**.
