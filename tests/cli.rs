@@ -115,6 +115,48 @@ fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
     panic!("could not reserve adjacent test ports");
 }
 
+/// Mirrors the store's `is_os_port_free` probe: wildcard + loopback in
+/// both families, with unbindable IPv6 treated as unprobeable rather than
+/// occupied. `reserve_adjacent_ports` only checks 127.0.0.1, which is not
+/// enough when a test asserts where the conflict walk lands: on macOS CI
+/// runners the walk also skips ports occupied on `0.0.0.0`/`::`/`::1`, so
+/// a merely-IPv4-free "next" port gets passed over.
+fn is_os_free_like_portzilla(port: u16) -> bool {
+    ["0.0.0.0", "127.0.0.1"]
+        .into_iter()
+        .all(|address| TcpListener::bind((address, port)).is_ok())
+        && ["::", "::1"]
+            .into_iter()
+            .all(|address| match TcpListener::bind((address, port)) {
+                Ok(_) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ),
+            })
+}
+
+/// Two adjacent ports that are OS-free on every address family portzilla
+/// probes. The listeners are never returned: the ports are validated and
+/// released, so the caller's claims see exactly the occupancy the probe
+/// promised.
+fn reserve_adjacent_os_free_ports() -> (u16, u16) {
+    for _ in 0..100 {
+        let base = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if let Some(successor) = base.checked_add(1)
+            && is_os_free_like_portzilla(base)
+            && is_os_free_like_portzilla(successor)
+        {
+            return (base, successor);
+        }
+    }
+    panic!("could not find two adjacent OS-free test ports");
+}
+
 fn free_test_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -788,16 +830,13 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
     let parent_pid = std::os::unix::process::parent_id();
     let stale_pid = "4000000010";
 
-    // Two ports that are actually OS-free when the test starts. Hard-coded
-    // numbers collide with whatever happens to listen on the dev machine —
-    // e.g. Docker Desktop binding 6001 makes the conflict-walk skip past it
-    // and breaks every assertion about "the next port". Reserve them via
-    // bind-and-hold, then release: ephemeral-range ports are very unlikely
-    // to be reused mid-test.
-    let (base_guard, successor_guard, base) = reserve_adjacent_ports();
-    let next = base.checked_add(1).expect("test needs room for base + 1");
-    drop(base_guard);
-    drop(successor_guard);
+    // Two ports that are OS-free on every family portzilla probes when the
+    // test starts. Hard-coded numbers collide with whatever happens to listen
+    // on the dev machine — e.g. Docker Desktop binding 6001 makes the
+    // conflict-walk skip past it and breaks every assertion about "the next
+    // port". Ephemeral ports verified across all probe families are very
+    // unlikely to be reused in the window before the claims below.
+    let (base, next) = reserve_adjacent_os_free_ports();
 
     // 1. Claim `base` for a PID that is alive for the whole test (this process).
     cmd(dir.path())
