@@ -24,6 +24,18 @@
 //! a crashed session keeps its file until the TTL lapses, which bounds the
 //! damage without adding a moving part. `claim` reaps expired records under the
 //! lock, so the file does not accumulate stale entries forever.
+//!
+//! # Reaping versus the lease store
+//!
+//! `claim` drops expired records for every key while it holds the lock. That is
+//! a deliberate divergence from [`Store`](crate::store::Store), which exposes an
+//! explicit `prune` instead of pruning as a side effect of `claim`. The
+//! tradeoff: reaping keeps `intents.json` bounded without a daemon and without a
+//! separate command for users to remember, at the cost of a mutating call doing
+//! housekeeping. That is only sound while `claim` is the store's only mutation
+//! path. If a second path is added (an `intent prune` command, a transfer, a
+//! bulk import), the reaping must move into that explicit operation and `claim`
+//! must stop doing it.
 
 use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
@@ -64,8 +76,7 @@ impl Intent {
     /// The boundary is exclusive: an intent with `expires_at == now` is
     /// already expired. Using one rule for both `list` and `claim` keeps
     /// "visible" and "stealable" from disagreeing at the exact second.
-    #[allow(dead_code)]
-    pub fn is_live_at(&self, now: u64) -> bool {
+    fn is_live_at(&self, now: u64) -> bool {
         now < self.expires_at
     }
 }
@@ -673,9 +684,26 @@ mod tests {
     fn release_only_by_owner() {
         let store = temp_store();
         store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
-        assert!(store.release("repo:a.rs", "session-b").is_err());
+        let err = store.release("repo:a.rs", "session-b").unwrap_err();
+        assert!(matches!(
+            err,
+            IntentError::NotOwner { ref session, expires_at }
+                if session == "session-a" && expires_at == 1_800
+        ));
         store.release("repo:a.rs", "session-a").unwrap();
         assert!(store.get("repo:a.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn release_of_an_absent_key_is_idempotent() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        let before = fs::read(store.state_file_path()).unwrap();
+        assert!(matches!(
+            store.release("repo:never-claimed.rs", "any-session"),
+            Ok(None)
+        ));
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
     }
 
     #[test]
@@ -697,6 +725,63 @@ mod tests {
         let listed = store.list(1_600).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "repo:live.rs");
+    }
+
+    #[test]
+    fn list_does_not_persist_pruning() {
+        let store = temp_store();
+        store
+            .claim("repo:live.rs", "session-a", 1_000, 3_000)
+            .unwrap();
+        store
+            .claim("repo:stale.rs", "session-b", 1_000, 1_500)
+            .unwrap();
+        let before = fs::read(store.state_file_path()).unwrap();
+        assert_eq!(store.list(2_000).unwrap().len(), 1);
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn claiming_one_key_reaps_expired_records_but_keeps_live_ones() {
+        let store = temp_store();
+        store
+            .claim("repo:expired.rs", "session-b", 1_000, 1_500)
+            .unwrap();
+        store
+            .claim("repo:live.rs", "session-c", 1_000, 3_000)
+            .unwrap();
+        store
+            .claim("repo:claimed.rs", "session-a", 1_600, 2_000)
+            .unwrap();
+
+        // The first record is gone from disk, not just from a listing.
+        assert!(store.get("repo:expired.rs").unwrap().is_none());
+        assert!(store.get("repo:live.rs").unwrap().is_some());
+        assert_eq!(
+            store.get("repo:claimed.rs").unwrap().unwrap().session,
+            "session-a"
+        );
+    }
+
+    #[test]
+    fn intents_file_uses_the_versioned_envelope() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        let path = store.state_file_path();
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "intents.json");
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["format_version", "intents"]);
+        assert_eq!(value["format_version"].as_u64(), Some(1));
+        assert_eq!(value["intents"].as_array().unwrap().len(), 1);
     }
 
     /// A repository plus one linked worktree, both containing `src/auth.rs`.
@@ -767,6 +852,16 @@ mod tests {
         let main_key = key_for_file(&repo.main, Path::new("src/auth.rs"));
         let linked_key = key_for_file(&repo.linked, Path::new("src/auth.rs"));
         assert_eq!(main_key, linked_key);
+
+        // Repository identity is the common dir, not the worktree root: the key
+        // must be rooted at the main checkout's `.git`, which is exactly what a
+        // swap from `--git-common-dir` to `--show-toplevel` would break.
+        let common_dir = fs::canonicalize(repo.main.join(".git")).unwrap();
+        assert!(
+            main_key.starts_with(&format!("{}:", common_dir.display())),
+            "key {main_key} should be rooted at the common dir {}",
+            common_dir.display()
+        );
         assert!(
             main_key.ends_with(":src/auth.rs"),
             "unexpected key {main_key}"
@@ -777,7 +872,10 @@ mod tests {
     fn outside_git_falls_back_to_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let k = key_for_file(dir.path(), Path::new("notes.md"));
-        assert!(Path::new(&k).is_absolute() || k.contains(":/"));
+        // The cwd is canonicalized before the file is joined onto it, so on
+        // macOS the `/var` → `/private/var` symlink is already resolved here.
+        let expected = fs::canonicalize(dir.path()).unwrap().join("notes.md");
+        assert_eq!(k, expected.to_string_lossy());
     }
 
     #[test]
