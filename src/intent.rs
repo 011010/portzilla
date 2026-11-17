@@ -25,7 +25,7 @@
 //! damage without adding a moving part. `claim` reaps expired records under the
 //! lock, so the file does not accumulate stale entries forever.
 
-use crate::store::Store;
+use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -36,6 +36,12 @@ use std::path::{Path, PathBuf};
 /// changes incompatibly so an older binary refuses to touch a newer file
 /// instead of corrupting it.
 const INTENT_FORMAT_VERSION: u32 = 1;
+
+/// Upper bound on a normalized intent key, in CHARACTERS. A key normally
+/// holds a repository path plus a relative path; 8192 characters is far
+/// beyond any legitimate value and keeps a hostile hook payload from growing
+/// `intents.json` (and every listing) without limit.
+pub const MAX_INTENT_KEY_CHARS: usize = 8192;
 
 /// A claim that `session` is editing `key` until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,23 +177,57 @@ impl IntentStore {
 
     /// Records `session` as the editor of `key` until `expires_at`.
     ///
-    /// Task 1 skeleton: this upserts unconditionally. Conflict, refresh, and
-    /// expiry rules are added with their tests.
+    /// The rules, applied while the exclusive lock is held:
+    ///
+    /// - no record, or an expired one: open a new window starting at `now`
+    /// - the same session on a live record: refresh `expires_at` and keep the
+    ///   original `created_at`, so the age of the claim stays visible
+    /// - a different session on a live record: refuse with
+    ///   [`IntentError::HeldBy`], naming the current holder
+    ///
+    /// While the file is open for writing, expired records for other keys are
+    /// dropped too. `claim` is the only mutation path, so it doubles as the
+    /// reaper; that is what keeps `intents.json` bounded without a background
+    /// task.
     pub fn claim(
         &self,
         key: &str,
         session: &str,
-        created_at: u64,
+        now: u64,
         expires_at: u64,
     ) -> IntentResult<Intent> {
+        validate_claim_inputs(key, session, now, expires_at)?;
         let _guard = self.lock_exclusive()?;
         let mut intents = self.read_intents_unlocked()?;
-        let intent = Intent {
-            key: key.to_string(),
-            session: session.to_string(),
-            created_at,
-            expires_at,
+        let existing = intents
+            .iter()
+            .find(|intent| intent.key == key)
+            .map(|intent| (intent.session.clone(), intent.created_at, intent.expires_at));
+        let intent = match existing {
+            Some((holder, _, holder_expires_at))
+                if holder_expires_at > now && holder != session =>
+            {
+                return Err(IntentError::HeldBy {
+                    session: holder,
+                    expires_at: holder_expires_at,
+                });
+            }
+            Some((_, created_at, holder_expires_at)) if holder_expires_at > now => Intent {
+                key: key.to_string(),
+                session: session.to_string(),
+                created_at,
+                expires_at,
+            },
+            _ => Intent {
+                key: key.to_string(),
+                session: session.to_string(),
+                created_at: now,
+                expires_at,
+            },
         };
+        // Expired entries are reaped here, including an expired record for
+        // `key`, which the new intent below replaces.
+        intents.retain(|stored| stored.key == key || stored.is_live_at(now));
         match intents.iter().position(|stored| stored.key == key) {
             Some(index) => intents[index] = intent.clone(),
             None => intents.push(intent.clone()),
@@ -299,6 +339,47 @@ impl IntentStore {
     }
 }
 
+/// Rejects claim inputs before anything is read or written, so a refused claim
+/// never touches the store. An empty or absurdly long key/session is refused
+/// for the same reason the lease store bounds its tags: these values are
+/// persisted and echoed back by every listing. `expires_at` must be in the
+/// future, otherwise the "claim" would be born expired and could never bind.
+fn validate_claim_inputs(
+    key: &str,
+    session: &str,
+    now: u64,
+    expires_at: u64,
+) -> IntentResult<()> {
+    if key.is_empty() {
+        return Err(IntentError::Invalid(
+            "intent key must not be empty".to_string(),
+        ));
+    }
+    if key.chars().count() > MAX_INTENT_KEY_CHARS {
+        return Err(IntentError::Invalid(format!(
+            "invalid intent key: at most {MAX_INTENT_KEY_CHARS} characters, got {}",
+            key.chars().count()
+        )));
+    }
+    if session.is_empty() {
+        return Err(IntentError::Invalid(
+            "intent session must not be empty".to_string(),
+        ));
+    }
+    if session.chars().count() > MAX_SESSION_CHARS {
+        return Err(IntentError::Invalid(format!(
+            "invalid intent session: at most {MAX_SESSION_CHARS} characters, got {}",
+            session.chars().count()
+        )));
+    }
+    if expires_at <= now {
+        return Err(IntentError::Invalid(format!(
+            "intent expiry {expires_at} must be after the claim time {now}"
+        )));
+    }
+    Ok(())
+}
+
 /// Rejects a persisted file with two records for one key: the store's core
 /// invariant is one owner per key, so such a file is corrupt rather than a
 /// list of competing claims. The file is left untouched on rejection.
@@ -347,6 +428,28 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
+
+    /// Owns the temporary directory alongside the store so the directory
+    /// outlives every operation the test performs on it.
+    struct TempStore {
+        _dir: tempfile::TempDir,
+        store: IntentStore,
+    }
+
+    impl Deref for TempStore {
+        type Target = IntentStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.store
+        }
+    }
+
+    fn temp_store() -> TempStore {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
+        TempStore { _dir: dir, store }
+    }
 
     #[test]
     fn claim_then_get_returns_the_same_intent() {
@@ -356,5 +459,31 @@ mod tests {
         let got = store.get("repo:src/auth.rs").unwrap().unwrap();
         assert_eq!(got.session, "session-a");
         assert_eq!(got.expires_at, 1_800);
+    }
+
+    #[test]
+    fn other_session_cannot_claim_a_live_intent() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        let err = store.claim("repo:a.rs", "session-b", 1_100, 1_900).unwrap_err();
+        assert!(matches!(err, IntentError::HeldBy { ref session, .. } if session == "session-a"));
+    }
+
+    #[test]
+    fn same_session_refreshes_its_own_intent() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store.claim("repo:a.rs", "session-a", 1_500, 2_300).unwrap();
+        let got = store.get("repo:a.rs").unwrap().unwrap();
+        assert_eq!(got.expires_at, 2_300);
+        assert_eq!(got.created_at, 1_000);
+    }
+
+    #[test]
+    fn expired_intent_can_be_taken_by_another_session() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store.claim("repo:a.rs", "session-b", 1_801, 3_601).unwrap();
+        assert_eq!(store.get("repo:a.rs").unwrap().unwrap().session, "session-b");
     }
 }
