@@ -139,7 +139,6 @@ impl FileOps for RealFileOps {
 /// silently invisible.
 ///
 /// Keys are opaque and must never be parsed; see the module documentation.
-#[allow(dead_code)]
 pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     let cwd = canonicalize_or_owned(cwd);
     let absolute = canonicalize_deepest_existing(&absolute_path(&cwd, file));
