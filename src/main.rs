@@ -6,6 +6,7 @@ mod gemini;
 mod guard;
 mod guard_cmd;
 mod hook_common;
+mod intent;
 mod kimi;
 mod lease;
 mod mcp;
