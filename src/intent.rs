@@ -173,6 +173,14 @@ pub fn key_for_file(cwd: &Path, file: &Path) -> String {
 /// Plumbing variables are cleared from the child environment so a hook fired
 /// inside git tooling cannot override `-C` and change the resulting key.
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    // A fork that lands while another thread holds a TCP listener duplicates
+    // that fd until the child execs, so the parent's `drop` cannot release the
+    // port and the next bind reports it occupied. In tests this makes the
+    // socket-based assertions flaky under load; serialize forks against those
+    // tests by taking the same lock. Production never shares its process with
+    // them, so the guard compiles out.
+    #[cfg(test)]
+    let _fork_guard = crate::store::port_test_support::lock();
     let output = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
