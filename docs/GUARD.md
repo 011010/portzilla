@@ -101,11 +101,17 @@ $ portzilla init opencode
 
 prints the full source of the `portzilla.js` plugin shim to save as `.opencode/plugin/portzilla.js` (project) or `~/.config/opencode/plugin/portzilla.js` (user), then restart OpenCode — plugins load once at startup, not hot-reloaded. Your editor needs `portzilla` on PATH. OpenCode hooks run in-process as JS/TS plugin modules, which is why this harness uses a shim instead of running `portzilla` as the hook directly.
 
-The shim hooks `tool.execute.before` for the `bash` tool, shells out to `portzilla hook opencode`, and throws with the deny reason (OpenCode surfaces it to the model as a tool error) or defers a warn to `tool.execute.after` so the model sees it on the tool result without blocking. Because the shim also adds a `shell.env` hook that injects `PORTZILLA_SESSION` into every bash subprocess, this is the only non-Claude harness where end-to-end own-lease recognition works:
+The shim uses OpenCode's **V2** plugin shape (`export default { id, async setup(ctx) }`). OpenCode 2.3.0 rejects the V1 shape — an async function returning a hooks object — with `Plugin must export a default definition with an id and an effect or setup function`, so a V1 shim silently does not load.
 
-```console
-$ portzilla claim 3000 --tag "vite dev" --session "$PORTZILLA_SESSION"
-```
+It registers one `ctx.tool.hook("execute.before", ...)` and branches on the tool:
+
+- `write` / `edit`: asks for a file intent on `event.input.path`. A file held by another live session throws before the edit runs (see [File intents](../README.md#file-intents-opencode)).
+- `shell`: asks the kill guard about `event.input.command`.
+- Anything else: returns untouched.
+
+A deny throws, and OpenCode surfaces the reason to the model as a tool error. There is no model-visible warn channel before execution in V2, so a warn goes to the OpenCode log via `console.warn` instead of reaching the model.
+
+`shell.create.before` is deliberately not registered: its event carries no session id, so a shell command cannot be attributed to a session and the `PORTZILLA_SESSION` handoff used by the V1 shim has no V2 equivalent. Claims made from OpenCode's shell therefore get no own-lease recognition from the kill guard. File intents are unaffected, because the edit hook receives `sessionID` directly.
 
 This section covers kill-guard setup only. The `portzilla` agent skill (starting servers with `portzilla run`) is installed separately and explicitly — `mkdir -p .opencode/skills/portzilla && portzilla init skill > .opencode/skills/portzilla/SKILL.md` — because `init skill` prints the skill file to stdout instead of writing configuration. The skill never sets up kill protection; explicit kill-guard requests go through `portzilla init opencode` on this page.
 

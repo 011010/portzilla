@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added file-intent leases: the OpenCode shim denies a `write`/`edit` on a file another live session is editing, keyed by repository plus relative path so two worktrees of one repository collide while unrelated repositories do not.
+- Rewrote the OpenCode plugin shim for the V2 plugin API. OpenCode 2.3.0 rejects the V1 shape, so the previous shim did not load.
+- Dropped the OpenCode `shell.env` / `PORTZILLA_SESSION` injection: V2 has no equivalent, and it never applied to the file-intent path, which uses the session id the edit hook already provides.
+- Made the test suite deterministic: dedicated non-ephemeral test-port ranges, per-test serialization, and a probe that no longer blocks its own loopback check.
+
 ## 0.4.0
 
 - Added a bounded session flight recorder with structured audit events for lease claims, releases, transfers, pruning, and guard decisions.

@@ -109,6 +109,12 @@ Two more adapters over the same unchanged `src/guard.rs` core, both built on wir
 
 ### OpenCode
 
+> **Superseded:** OpenCode 2.3.0 rejects the V1 plugin shape described in this
+> section, and V2 has no `shell.env` equivalent, so the `PORTZILLA_SESSION`
+> handoff below no longer exists. The shim was rewritten to the V2 API and now
+> guards file edits as well; see the README's file-intents section and
+> `docs/GUARD.md`.
+
 An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire contract verified against the current OpenCode plugins hooks reference before implementing. This one required a structural first: OpenCode hooks are in-process JS/TS plugin modules, not external processes invoked with a JSON payload on stdin, so `portzilla` cannot run as the hook directly the way it does for Claude Code/Codex/Kimi.
 
 | Item | Status |
