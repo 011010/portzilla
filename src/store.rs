@@ -3687,6 +3687,11 @@ pub(crate) mod port_test_support {
     }
 
     /// Returns a port that is free by the same probe the product uses.
+    ///
+    /// Currently unused: tests script occupancy through the injected probe
+    /// instead. Retained for future socket-level tests that need a really
+    /// free port.
+    #[allow(dead_code)]
     pub(crate) fn unused_port() -> u16 {
         for port in candidates() {
             if is_os_port_free(port) {
