@@ -220,7 +220,7 @@ Recognizes `kill <pid>`, `pkill`/`killall`, `lsof -ti:<port> | xargs kill`, `fus
 | **Windsurf** | `pre_run_command` — `portzilla hook windsurf` | Yes (stderr) | No |
 | **Anything else** | `portzilla guard -- <cmd>` | N/A (exit 2) | **Yes** (`--session` / `$PORTZILLA_SESSION`) |
 
-Setup: `portzilla init <harness>` prints the snippet to add — never writes files for you. Guard fails open by default; `PORTZILLA_FAIL_CLOSED=1` opts into fail-closed.
+Setup: `portzilla init <harness>` prints the snippet to add — never writes files for you. The snippet goes to stdout and the instructions to stderr, so a redirect such as `portzilla init opencode > .opencode/plugin/portzilla.js` saves exactly the file. Guard fails open by default; `PORTZILLA_FAIL_CLOSED=1` opts into fail-closed.
 
 Full harness setup, `sh -c` unwrapping rules, and fail-open/closed semantics → **[docs/GUARD.md](docs/GUARD.md)**.
 

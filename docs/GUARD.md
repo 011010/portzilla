@@ -101,6 +101,14 @@ $ portzilla init opencode
 
 prints the full source of the `portzilla.js` plugin shim to save as `.opencode/plugin/portzilla.js` (project) or `~/.config/opencode/plugin/portzilla.js` (user), then restart OpenCode — plugins load once at startup, not hot-reloaded. Your editor needs `portzilla` on PATH. OpenCode hooks run in-process as JS/TS plugin modules, which is why this harness uses a shim instead of running `portzilla` as the hook directly.
 
+The shim itself is the only thing on stdout; the instructions around it go to stderr. Save it directly with a redirect:
+
+```console
+$ mkdir -p .opencode/plugin && portzilla init opencode > .opencode/plugin/portzilla.js
+```
+
+Piping the command's whole terminal output into the file used to drag the prose into the module, which then failed to build — silently, because the guard is fail-open by design.
+
 The shim uses OpenCode's **V2** plugin shape (`export default { id, async setup(ctx) }`). OpenCode 2.3.0 rejects the V1 shape — an async function returning a hooks object — with `Plugin must export a default definition with an id and an effect or setup function`, so a V1 shim silently does not load.
 
 It registers one `ctx.tool.hook("execute.before", ...)` and branches on the tool:
