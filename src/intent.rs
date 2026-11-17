@@ -52,6 +52,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// Version of the `intents.json` envelope. Bump it when the stored shape
 /// changes incompatibly so an older binary refuses to touch a newer file
@@ -98,6 +99,26 @@ impl Intent {
 struct StoredIntents {
     format_version: u32,
     intents: Vec<Intent>,
+}
+
+/// Filesystem seam mirroring the lease store's: production code writes and
+/// renames for real, while a test can inject a rename failure and prove that a
+/// failed commit leaves the previous `intents.json` bytes untouched.
+trait FileOps: Send + Sync {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()>;
+}
+
+struct RealFileOps;
+
+impl FileOps for RealFileOps {
+    fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes).map_err(Into::into)
+    }
+
+    fn rename_temp(&self, from: &Path, to: &Path) -> Result<()> {
+        fs::rename(from, to).map_err(Into::into)
+    }
 }
 
 /// Returns the intent key for `file` as seen from `cwd`.
@@ -336,6 +357,7 @@ pub type IntentResult<T> = std::result::Result<T, IntentError>;
 #[allow(dead_code)]
 pub struct IntentStore {
     data_dir: PathBuf,
+    file_ops: Arc<dyn FileOps>,
 }
 
 #[allow(dead_code)]
@@ -350,7 +372,10 @@ impl IntentStore {
             std::env::var("XDG_DATA_HOME").ok(),
             std::env::var("HOME").ok(),
         )?;
-        let store = Self { data_dir };
+        let store = Self {
+            data_dir,
+            file_ops: Arc::new(RealFileOps),
+        };
         store.ensure_data_dir()?;
         Ok(store)
     }
@@ -561,21 +586,25 @@ impl IntentStore {
             intents: intents.to_vec(),
         })
         .context("failed to serialize file intents to JSON")?;
-        fs::write(&tmp_path, &json).with_context(|| {
-            format!(
-                "failed to write temporary intents file at {}",
-                tmp_path.display()
-            )
-        })?;
+        self.file_ops
+            .write_temp(&tmp_path, &json)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary intents file at {}",
+                    tmp_path.display()
+                )
+            })?;
         // Harden before the rename: rename preserves the mode, so this also
         // leaves the final `intents.json` owner-only (0600).
         harden_file_permissions(&tmp_path)?;
-        fs::rename(&tmp_path, &path).with_context(|| {
-            format!(
-                "failed to atomically replace intents file at {}",
-                path.display()
-            )
-        })?;
+        self.file_ops
+            .rename_temp(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace intents file at {}",
+                    path.display()
+                )
+            })?;
         Ok(())
     }
 }
@@ -891,6 +920,36 @@ mod tests {
         assert_eq!(value["intents"].as_array().unwrap().len(), 1);
     }
 
+    struct RenameFailFileOps;
+
+    impl FileOps for RenameFailFileOps {
+        fn write_temp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+            fs::write(path, bytes).map_err(Into::into)
+        }
+
+        fn rename_temp(&self, _from: &Path, _to: &Path) -> Result<()> {
+            anyhow::bail!("injected rename failure")
+        }
+    }
+
+    #[test]
+    fn rename_failure_preserves_previous_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        let before = fs::read(store.state_file_path()).unwrap();
+
+        let failing = IntentStore {
+            data_dir: dir.path().to_path_buf(),
+            file_ops: Arc::new(RenameFailFileOps),
+        };
+        let err = failing
+            .claim("repo:b.rs", "session-b", 1_000, 1_800)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("injected rename failure"));
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+    }
+
     #[test]
     fn a_new_key_is_refused_when_the_store_is_full() {
         let store = temp_store();
@@ -984,7 +1043,9 @@ mod tests {
         fs::write(store.state_file_path(), &original).unwrap();
 
         let err = store.get("repo:a.rs").unwrap_err();
-        let message = format!("{err:#}");
+        // `Display` itself must carry the anyhow context chain, so a plain
+        // `to_string()` is enough; callers do not need `{:#}`.
+        let message = err.to_string();
         assert!(
             message.contains("contains invalid JSON"),
             "unexpected error: {message}"
