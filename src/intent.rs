@@ -1237,8 +1237,11 @@ mod tests {
             "key {main_key} should be rooted at the common dir {}",
             common_dir.display()
         );
+        // Path::display() prints the stored spelling, so build the tail with
+        // join(), which uses the platform separator the key actually holds.
+        let expected_tail = Path::new("src").join("auth.rs");
         assert!(
-            main_key.ends_with(&format!(":{}", Path::new("src/auth.rs").display())),
+            main_key.ends_with(&format!(":{}", expected_tail.display())),
             "unexpected key {main_key}"
         );
     }
@@ -1298,8 +1301,9 @@ mod tests {
 
         assert_eq!(relative, absolute);
         assert_eq!(relative, unresolved);
+        let expected_tail = Path::new("src").join("brand_new.rs");
         assert!(
-            relative.ends_with(&format!(":{}", Path::new("src/brand_new.rs").display())),
+            relative.ends_with(&format!(":{}", expected_tail.display())),
             "unexpected key {relative}"
         );
     }
