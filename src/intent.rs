@@ -247,6 +247,50 @@ impl IntentStore {
         Ok(intents.into_iter().find(|intent| intent.key == key))
     }
 
+    /// Returns every intent that is still live at `now`.
+    ///
+    /// Expired records are filtered in memory, NOT persisted. A read holding
+    /// the lock for a moment is fine; turning it into a write would make a
+    /// monitoring call contend with real claims and widen the window for a
+    /// failed rename. The next `claim` reaps the entries under the lock, so the
+    /// file still stays bounded.
+    pub fn list(&self, now: u64) -> IntentResult<Vec<Intent>> {
+        let _guard = self.lock_exclusive()?;
+        let intents = self.read_intents_unlocked()?;
+        Ok(intents
+            .into_iter()
+            .filter(|intent| intent.is_live_at(now))
+            .collect())
+    }
+
+    /// Removes the record for `key` when `session` owns it.
+    ///
+    /// Returns `Ok(None)` when no record exists: release is idempotent, so a
+    /// session retrying after a crash does not have to tell "already gone" from
+    /// success. A different session is refused with [`IntentError::NotOwner`],
+    /// naming the current holder.
+    ///
+    /// Expiry is not consulted here because the call carries no clock. That is
+    /// harmless: a lapsed record blocks nothing, since the next claim takes it
+    /// over, and its owner may still release it early.
+    pub fn release(&self, key: &str, session: &str) -> IntentResult<Option<Intent>> {
+        let _guard = self.lock_exclusive()?;
+        let mut intents = self.read_intents_unlocked()?;
+        let Some(index) = intents.iter().position(|intent| intent.key == key) else {
+            return Ok(None);
+        };
+        let existing = &intents[index];
+        if existing.session != session {
+            return Err(IntentError::NotOwner {
+                session: existing.session.clone(),
+                expires_at: existing.expires_at,
+            });
+        }
+        let removed = intents.remove(index);
+        self.write_intents_unlocked(&intents)?;
+        Ok(Some(removed))
+    }
+
     /// Ensures the data directory exists and is owner-only (`0700` on Unix),
     /// matching the lease store. Intent keys reveal repository and file names,
     /// so this file is not world-readable.
@@ -485,5 +529,31 @@ mod tests {
         store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
         store.claim("repo:a.rs", "session-b", 1_801, 3_601).unwrap();
         assert_eq!(store.get("repo:a.rs").unwrap().unwrap().session, "session-b");
+    }
+
+    #[test]
+    fn release_only_by_owner() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        assert!(store.release("repo:a.rs", "session-b").is_err());
+        store.release("repo:a.rs", "session-a").unwrap();
+        assert!(store.get("repo:a.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_drops_expired_entries_on_read() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        assert!(store.list(2_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_keeps_live_entries_while_dropping_expired_ones() {
+        let store = temp_store();
+        store.claim("repo:live.rs", "session-a", 1_000, 1_800).unwrap();
+        store.claim("repo:stale.rs", "session-b", 500, 1_500).unwrap();
+        let listed = store.list(1_600).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "repo:live.rs");
     }
 }
