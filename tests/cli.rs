@@ -1756,6 +1756,58 @@ fn init_opencode_prints_the_plugin_snippet() {
         .stdout(predicate::str::contains("Bun.spawn"));
 }
 
+// The stdout/stderr contract (issue #28): stdout is exactly what a user saves
+// or pastes verbatim; instructions and caveats go to stderr. A redirect such
+// as `portzilla init opencode > .opencode/plugin/portzilla.js` must produce a
+// file that loads, which the prose mixed into stdout used to break.
+#[test]
+fn init_opencode_stdout_is_only_the_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "opencode"])
+        .assert()
+        .success()
+        // The snippet, whole and alone on stdout.
+        .stdout(predicate::str::starts_with(
+            "// portzilla guard for OpenCode",
+        ))
+        .stdout(predicate::str::ends_with("};\n"))
+        .stdout(predicate::str::contains("export default {"))
+        // Every prose marker must be gone from stdout.
+        .stdout(predicate::str::contains("How it works:").not())
+        .stdout(predicate::str::contains("Save the file below as").not())
+        .stdout(predicate::str::contains("Fail-open:").not())
+        // And must have moved to stderr instead of disappearing.
+        .stderr(predicate::str::contains("Save the file below as"))
+        .stderr(predicate::str::contains("How it works:"));
+}
+
+#[test]
+fn init_claude_code_stdout_is_only_the_settings_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "claude-code"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("{\n"))
+        .stdout(predicate::str::contains("How it works:").not())
+        .stdout(predicate::str::contains("Add the following").not())
+        .stderr(predicate::str::contains("Add the following"));
+}
+
+#[test]
+fn init_skill_stdout_is_only_the_skill_file() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["init", "skill"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("---"))
+        // `init skill` always printed only the file body; this pins that the
+        // contract holds for the subcommand the docs redirect directly.
+        .stdout(predicate::str::contains("Add the following").not());
+}
+
 // ---- hook windsurf / init windsurf ----
 
 fn windsurf_pre_run_command_json(command: &str, trajectory_id: &str) -> String {
@@ -1889,7 +1941,7 @@ fn init_windsurf_prints_the_hooks_json_snippet() {
         .success()
         .stdout(predicate::str::contains("pre_run_command"))
         .stdout(predicate::str::contains("portzilla hook windsurf"))
-        .stdout(predicate::str::contains(".windsurf/hooks.json"));
+        .stderr(predicate::str::contains(".windsurf/hooks.json"));
 }
 
 // ---- guard ----

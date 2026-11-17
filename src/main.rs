@@ -1321,172 +1321,190 @@ fn exit_with_child_status(status: std::process::ExitStatus) -> ! {
 }
 
 fn print_init_cursor() {
-    println!("Add the following to your Cursor hooks config (.cursor/hooks.json for a project,");
-    println!("or ~/.cursor/hooks.json for your user) to register portzilla's kill-guard as a");
-    println!("beforeShellExecution hook:");
-    println!();
+    eprintln!("Add the following to your Cursor hooks config (.cursor/hooks.json for a project,");
+    eprintln!("or ~/.cursor/hooks.json for your user) to register portzilla's kill-guard as a");
+    eprintln!("beforeShellExecution hook:");
+    eprintln!();
     println!("{}", cursor::HOOKS_SNIPPET);
-    println!();
-    println!("If you already have hooks.json, merge the \"beforeShellExecution\" entry above");
-    println!("into your existing hooks array instead of overwriting the file.");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!("Note: Cursor does not currently expose the conversation id to the shell commands it");
-    println!(
+    eprintln!();
+    eprintln!("If you already have hooks.json, merge the \"beforeShellExecution\" entry above");
+    eprintln!("into your existing hooks array instead of overwriting the file.");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!(
+        "Note: Cursor does not currently expose the conversation id to the shell commands it"
+    );
+    eprintln!(
         "runs, only to the hook payload itself, so claims made from a Cursor session cannot be"
     );
-    println!("tagged with a matching --session. This hook still protects against killing another");
-    println!("session's live process; it just can't yet recognize a lease as your own.");
+    eprintln!("tagged with a matching --session. This hook still protects against killing another");
+    eprintln!("session's live process; it just can't yet recognize a lease as your own.");
 }
 
 fn print_init_gemini() {
-    println!("Add the following to your Gemini CLI settings (.gemini/settings.json for a");
-    println!("project, or ~/.gemini/settings.json for your user) to register portzilla's");
-    println!("kill-guard as a BeforeTool hook scoped to the shell tool:");
-    println!();
+    eprintln!("Add the following to your Gemini CLI settings (.gemini/settings.json for a");
+    eprintln!("project, or ~/.gemini/settings.json for your user) to register portzilla's");
+    eprintln!("kill-guard as a BeforeTool hook scoped to the shell tool:");
+    eprintln!();
     println!("{}", gemini::SETTINGS_SNIPPET);
-    println!();
-    println!("If you already have a \"hooks\" key in settings.json, merge the \"BeforeTool\"");
-    println!("entry above into your existing hooks instead of overwriting the file.");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!("Note: Gemini CLI's run_shell_command tool only sets GEMINI_CLI=1 in the commands it");
-    println!(
+    eprintln!();
+    eprintln!("If you already have a \"hooks\" key in settings.json, merge the \"BeforeTool\"");
+    eprintln!("entry above into your existing hooks instead of overwriting the file.");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!(
+        "Note: Gemini CLI's run_shell_command tool only sets GEMINI_CLI=1 in the commands it"
+    );
+    eprintln!(
         "runs, not a session id, so claims made from a Gemini CLI session cannot be tagged with"
     );
-    println!(
+    eprintln!(
         "a matching --session. This hook still protects against killing another session's live"
     );
-    println!("process; it just can't yet recognize a lease as your own.");
+    eprintln!("process; it just can't yet recognize a lease as your own.");
 }
 
 fn print_init_opencode() {
-    println!("portzilla's guard for OpenCode is a plugin shim, because OpenCode hooks run");
-    println!("in-process as JavaScript/TypeScript plugin modules — it cannot run `portzilla`");
-    println!("directly as the hook the way Claude Code/Codex/Kimi can. Save the file below as:");
-    println!();
-    println!("  .opencode/plugin/portzilla.js        (project level)");
-    println!("  ~/.config/opencode/plugin/portzilla.js   (user level)");
-    println!();
-    println!(
+    eprintln!("portzilla's guard for OpenCode is a plugin shim, because OpenCode hooks run");
+    eprintln!("in-process as JavaScript/TypeScript plugin modules — it cannot run `portzilla`");
+    eprintln!("directly as the hook the way Claude Code/Codex/Kimi can. Save the file below as:");
+    eprintln!();
+    eprintln!("  .opencode/plugin/portzilla.js        (project level)");
+    eprintln!("  ~/.config/opencode/plugin/portzilla.js   (user level)");
+    eprintln!();
+    eprintln!(
         "Then QUIT AND RESTART opencode — plugins are loaded once at startup, not hot-reloaded."
     );
-    println!();
+    eprintln!();
     println!("{}", opencode::PLUGIN_SNIPPET);
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the plugin's guard checks to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!("How it works:");
-    println!(
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the plugin's guard checks to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!("How it works:");
+    eprintln!(
         "  - tool.execute.before: intercepts write/edit and shell calls, asks `portzilla hook"
     );
-    println!("    opencode` for a verdict, and throws on deny before anything runs — the reason");
-    println!("    reaches the model as a tool error.");
-    println!(
+    eprintln!("    opencode` for a verdict, and throws on deny before anything runs — the reason");
+    eprintln!("    reaches the model as a tool error.");
+    eprintln!(
         "  - write/edit: the edited file is claimed as a file intent, so a second session that"
     );
-    println!("    tries to edit the same file is denied instead of silently clobbering it.");
-    println!("  - shell: a command that would kill a process leased to another session is denied.");
-    println!("  - warn verdicts (a kill by process name, which cannot be resolved to a lease) are");
-    println!("    written to OpenCode's log; they never block the call.");
-    println!();
-    println!("Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,");
-    println!("the tool call is allowed — a portzilla problem never blocks your session.");
+    eprintln!("    tries to edit the same file is denied instead of silently clobbering it.");
+    eprintln!(
+        "  - shell: a command that would kill a process leased to another session is denied."
+    );
+    eprintln!(
+        "  - warn verdicts (a kill by process name, which cannot be resolved to a lease) are"
+    );
+    eprintln!("    written to OpenCode's log; they never block the call.");
+    eprintln!();
+    eprintln!(
+        "Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,"
+    );
+    eprintln!("the tool call is allowed — a portzilla problem never blocks your session.");
 }
 
 fn print_init_codex() {
-    println!("Add the following to your Codex hooks config (.codex/hooks.json for a project,");
-    println!("or ~/.codex/hooks.json for your user) to register portzilla's kill-guard as a");
-    println!("PreToolUse hook on the Bash tool:");
-    println!();
+    eprintln!("Add the following to your Codex hooks config (.codex/hooks.json for a project,");
+    eprintln!("or ~/.codex/hooks.json for your user) to register portzilla's kill-guard as a");
+    eprintln!("PreToolUse hook on the Bash tool:");
+    eprintln!();
     println!("{}", codex::HOOKS_SNIPPET);
-    println!();
-    println!("If you already have hooks.json, merge the \"PreToolUse\" entry above into your");
-    println!("existing hooks array instead of overwriting the file.");
-    println!();
-    println!("Note: project-level hooks are only loaded after the project .codex/ layer is");
-    println!("trusted; Codex will ask you to review/trust new hooks (see its /hooks command).");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!("Note: Codex does not currently expose the session id to the shell commands it runs,");
-    println!(
+    eprintln!();
+    eprintln!("If you already have hooks.json, merge the \"PreToolUse\" entry above into your");
+    eprintln!("existing hooks array instead of overwriting the file.");
+    eprintln!();
+    eprintln!("Note: project-level hooks are only loaded after the project .codex/ layer is");
+    eprintln!("trusted; Codex will ask you to review/trust new hooks (see its /hooks command).");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!(
+        "Note: Codex does not currently expose the session id to the shell commands it runs,"
+    );
+    eprintln!(
         "only to the hook payload itself, so claims made from a Codex session cannot be tagged"
     );
-    println!(
+    eprintln!(
         "with a matching --session. This hook still protects against killing another session's"
     );
-    println!("live process; it just can't yet recognize a lease as your own.");
+    eprintln!("live process; it just can't yet recognize a lease as your own.");
 }
 
 fn print_init_kimi() {
-    println!("Add the following to your Kimi CLI config (~/.kimi/config.toml) to register");
-    println!("portzilla's kill-guard as a PreToolUse hook scoped to the Shell tool:");
-    println!();
+    eprintln!("Add the following to your Kimi CLI config (~/.kimi/config.toml) to register");
+    eprintln!("portzilla's kill-guard as a PreToolUse hook scoped to the Shell tool:");
+    eprintln!();
     println!("{}", kimi::CONFIG_SNIPPET);
-    println!();
-    println!("If you already have a [[hooks]] array in config.toml, append the entry above to it");
-    println!("instead of overwriting the file. `timeout` is Kimi's hook timeout in seconds");
-    println!("(default 30); portzilla's own stdin cap is 1 MiB.");
-    println!();
-    println!("Note: only user-level registration (~/.kimi/config.toml) is verified; Kimi's");
-    println!("project-level hook configuration is not positively documented, so this snippet");
-    println!("targets the user-level file.");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!(
+    eprintln!();
+    eprintln!("If you already have a [[hooks]] array in config.toml, append the entry above to it");
+    eprintln!("instead of overwriting the file. `timeout` is Kimi's hook timeout in seconds");
+    eprintln!("(default 30); portzilla's own stdin cap is 1 MiB.");
+    eprintln!();
+    eprintln!("Note: only user-level registration (~/.kimi/config.toml) is verified; Kimi's");
+    eprintln!("project-level hook configuration is not positively documented, so this snippet");
+    eprintln!("targets the user-level file.");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!(
         "Note: Kimi CLI does not currently expose the session id to the shell commands it runs,"
     );
-    println!(
+    eprintln!(
         "only to the hook payload itself, so claims made from a Kimi session cannot be tagged"
     );
-    println!(
+    eprintln!(
         "with a matching --session. This hook still protects against killing another session's"
     );
-    println!("live process; it just can't yet recognize a lease as your own.");
-    println!();
-    println!(
+    eprintln!("live process; it just can't yet recognize a lease as your own.");
+    eprintln!();
+    eprintln!(
         "Note: Kimi CLI's hooks system is Beta, and Kimi CLI is transitioning to Kimi Code CLI"
     );
-    println!("as its successor project — re-verify this integration when adopting the successor.");
+    eprintln!("as its successor project — re-verify this integration when adopting the successor.");
 }
 
 fn print_init_windsurf() {
-    println!("Add the following to your `.windsurf/hooks.json` (workspace) to register");
-    println!("portzilla's kill-guard as a pre_run_command hook (blocks dangerous commands like");
-    println!("kills of other sessions' processes):");
-    println!();
+    eprintln!("Add the following to your `.windsurf/hooks.json` (workspace) to register");
+    eprintln!("portzilla's kill-guard as a pre_run_command hook (blocks dangerous commands like");
+    eprintln!("kills of other sessions' processes):");
+    eprintln!();
     println!("{}", windsurf::CONFIG_SNIPPET);
-    println!();
-    println!("Alternatively, place the same file at ~/.codeium/windsurf/hooks.json (user level),");
-    println!("or at a system-level path (see the Cascade Hooks docs). If you already have a");
-    println!("hooks.json, merge the \"pre_run_command\" entry into the existing \"hooks\" object");
-    println!("instead of overwriting the file.");
-    println!();
-    println!("`show_output: true` prints portzilla's deny/warning text in the Cascade UI (a deny");
-    println!("reaches the agent regardless via stderr; warnings are human-visible ONLY — Windsurf");
-    println!("has no non-blocking channel the model sees, so a warn never blocks the command).");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
-    println!();
-    println!("Note: Windsurf does not currently expose the trajectory id to the shell commands it");
-    println!("runs, only to the hook payload itself, so claims made from a Cascade session cannot");
-    println!(
+    eprintln!();
+    eprintln!("Alternatively, place the same file at ~/.codeium/windsurf/hooks.json (user level),");
+    eprintln!("or at a system-level path (see the Cascade Hooks docs). If you already have a");
+    eprintln!("hooks.json, merge the \"pre_run_command\" entry into the existing \"hooks\" object");
+    eprintln!("instead of overwriting the file.");
+    eprintln!();
+    eprintln!("`show_output: true` prints portzilla's deny/warning text in the Cascade UI (a deny");
+    eprintln!(
+        "reaches the agent regardless via stderr; warnings are human-visible ONLY — Windsurf"
+    );
+    eprintln!("has no non-blocking channel the model sees, so a warn never blocks the command).");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
+    eprintln!();
+    eprintln!(
+        "Note: Windsurf does not currently expose the trajectory id to the shell commands it"
+    );
+    eprintln!(
+        "runs, only to the hook payload itself, so claims made from a Cascade session cannot"
+    );
+    eprintln!(
         "be tagged with a matching --session. This hook still protects against killing another"
     );
-    println!("session's live process; it just can't yet recognize a lease as your own.");
-    println!();
-    println!("Note: Cascade hooks do not load or run while a workspace is open in Restricted");
-    println!("Mode — the guard is absent there by design.");
+    eprintln!("session's live process; it just can't yet recognize a lease as your own.");
+    eprintln!();
+    eprintln!("Note: Cascade hooks do not load or run while a workspace is open in Restricted");
+    eprintln!("Mode — the guard is absent there by design.");
 }
 
 /// Prints the `portzilla` agent skill verbatim: stdout is byte-for-byte
@@ -1500,21 +1518,21 @@ fn print_init_skill() {
 }
 
 fn print_init_claude_code() {
-    println!(
+    eprintln!(
         "Add the following to your Claude Code settings (.claude/settings.json for a project,"
     );
-    println!("or ~/.claude/settings.json for your user) to register portzilla's kill-guard as a");
-    println!("PreToolUse hook on the Bash tool:");
-    println!();
+    eprintln!("or ~/.claude/settings.json for your user) to register portzilla's kill-guard as a");
+    eprintln!("PreToolUse hook on the Bash tool:");
+    eprintln!();
     println!("{}", claude_code::SETTINGS_SNIPPET);
-    println!();
-    println!(
+    eprintln!();
+    eprintln!(
         "If you already have a \"hooks\" key in settings.json, merge the \"PreToolUse\" entry"
     );
-    println!("above into your existing hooks instead of overwriting the file.");
-    println!();
-    println!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
-    println!("Verify with: portzilla --version");
+    eprintln!("above into your existing hooks instead of overwriting the file.");
+    eprintln!();
+    eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
+    eprintln!("Verify with: portzilla --version");
 }
 
 /// Resolves the default PID to attribute a claim to: the parent process
