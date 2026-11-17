@@ -216,13 +216,28 @@ Recognizes `kill <pid>`, `pkill`/`killall`, `lsof -ti:<port> | xargs kill`, `fus
 | **Gemini CLI** | `BeforeTool` — `portzilla hook gemini` | Yes (Deny), no Warn channel | No |
 | **Codex CLI** | `PreToolUse` — `portzilla hook codex` | Yes (Deny + Warn via `additionalContext`) | No |
 | **Kimi CLI** | `PreToolUse` — `portzilla hook kimi` | Yes (stderr on exit 2) | No |
-| **OpenCode** | Plugin shim — `portzilla init opencode` | Yes (Deny + Warn) | **Yes** (`$PORTZILLA_SESSION`) |
+| **OpenCode** | Plugin shim, V2 API — `portzilla init opencode` | Yes (Deny) | No (V2 gives no session id to shell commands) |
 | **Windsurf** | `pre_run_command` — `portzilla hook windsurf` | Yes (stderr) | No |
 | **Anything else** | `portzilla guard -- <cmd>` | N/A (exit 2) | **Yes** (`--session` / `$PORTZILLA_SESSION`) |
 
 Setup: `portzilla init <harness>` prints the snippet to add — never writes files for you. Guard fails open by default; `PORTZILLA_FAIL_CLOSED=1` opts into fail-closed.
 
 Full harness setup, `sh -c` unwrapping rules, and fail-open/closed semantics → **[docs/GUARD.md](docs/GUARD.md)**.
+
+### File intents (OpenCode)
+
+Agents in parallel worktrees also collide on *files*: two sessions editing `src/auth.rs` produce a merge conflict that only surfaces at review time. File intents are the same lease idea applied to a path.
+
+The OpenCode shim asks for an intent on every `write`/`edit` before the tool runs:
+
+- The first session to edit a file claims it for 30 minutes (`PORTZILLA_INTENT_TTL_SECS` overrides the window).
+- A session that edits it again refreshes its own claim.
+- A *different* live session is denied, with a reason naming the file and the holding session. The edit never runs.
+- A denied attempt claims nothing, so a blocked session cannot take the file by retrying.
+
+The key is `<git-common-dir>:<repo-relative-path>`. The same relative file in two worktrees of one repository is one key; the same absolute path in a different repository is not. Outside a repository the key is the canonical absolute path.
+
+Limits, stated plainly: this is **deny-only** — an edit that would have merged cleanly is still blocked while another session holds the file. Only OpenCode is covered today; the other harnesses still get the kill guard alone.
 
 ## Data file & config
 

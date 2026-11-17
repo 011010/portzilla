@@ -161,6 +161,8 @@ mod tests {
         test_support::{AlivePids, AlwaysAlive, AlwaysDead},
     };
     use crate::store::Store;
+    use crate::store::probe_test_support::AllPortsFree;
+    use std::sync::Arc;
 
     #[test]
     fn cycle_removes_dead_leases_and_returns_them() {
@@ -199,7 +201,11 @@ mod tests {
     #[test]
     fn cycle_leaves_live_leases_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
+        // Seed the lease through a store whose probe reports every port free,
+        // so this test never binds sockets; the cycle below only prunes and
+        // never probes ports either.
+        let store =
+            Store::open_with_probe(Some(dir.path().to_path_buf()), Arc::new(AllPortsFree)).unwrap();
         store
             .claim(27002, 100, "live".to_string(), None, &AlwaysAlive)
             .unwrap();

@@ -438,20 +438,33 @@ fn not_found_error(port: u16) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    // Port-sensitive tests hold a std `MutexGuard` across `.await` so the
-    // port stays free for the whole test body. `#[tokio::test]` uses a
-    // current-thread runtime here, so the guard never crosses a thread and
-    // cannot deadlock; blocking a competing test thread until the test ends is
-    // exactly the serialization these tests need.
+    // No test here holds a lock across `.await`: claims run against an
+    // injected probe, so no real port has to stay free for the test body.
+    // The allowance stays so a future socket-level test can hold the test
+    // port lock across an await without tripping the lint; `#[tokio::test]`
+    // uses a current-thread runtime here, so the guard never crosses a
+    // thread and cannot deadlock.
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+    use crate::store::PortProbe;
+    use crate::store::probe_test_support::{AllPortsFree, OccupiedPorts};
     use rmcp::model::ErrorCode;
+    use std::sync::Arc;
+
+    fn server_with_probe_tempdir(
+        probe: Arc<dyn PortProbe>,
+    ) -> (PortzillaMcpServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Claims run against the injected probe so this binary never binds
+        // real sockets; the production OsPortProbe is covered by the store
+        // unit tests and the integration suite.
+        let store = Store::open_with_probe(Some(dir.path().to_path_buf()), probe).unwrap();
+        (PortzillaMcpServer::new(store), dir)
+    }
 
     fn server_with_tempdir() -> (PortzillaMcpServer, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
-        (PortzillaMcpServer::new(store), dir)
+        server_with_probe_tempdir(Arc::new(AllPortsFree))
     }
 
     fn structured(result: &CallToolResult) -> &serde_json::Value {
@@ -459,12 +472,6 @@ mod tests {
             .structured_content
             .as_ref()
             .expect("expected structured_content on the tool result")
-    }
-
-    fn unused_test_port() -> u16 {
-        // Shares the store's dedicated test-range allocator so tests in this
-        // binary cannot be handed a port another test is about to bind.
-        crate::store::port_test_support::unused_port()
     }
 
     // ---- tool descriptions ----
@@ -572,9 +579,8 @@ mod tests {
 
     #[tokio::test]
     async fn claim_on_a_free_port_returns_success_with_the_ls_plus_reassigned_shape() {
-        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
-        let port = unused_test_port();
+        let port: u16 = 4210;
         let result = server
             .claim(Parameters(ClaimParams {
                 port,
@@ -597,9 +603,8 @@ mod tests {
 
     #[tokio::test]
     async fn claim_without_pid_defaults_to_the_server_pid_and_adds_a_note() {
-        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
-        let port = unused_test_port();
+        let port: u16 = 4211;
         let result = server
             .claim(Parameters(ClaimParams {
                 port,
@@ -620,9 +625,8 @@ mod tests {
 
     #[tokio::test]
     async fn claim_with_explicit_pid_has_no_note_field() {
-        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
-        let port = unused_test_port();
+        let port: u16 = 4212;
         let result = server
             .claim(Parameters(ClaimParams {
                 port,
@@ -642,9 +646,8 @@ mod tests {
 
     #[tokio::test]
     async fn claim_conflicting_with_a_live_pid_reassigns() {
-        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
-        let port = unused_test_port();
+        let port: u16 = 4213;
         let own_pid = std::process::id();
         server
             .claim(Parameters(ClaimParams {
@@ -675,10 +678,10 @@ mod tests {
 
     #[tokio::test]
     async fn claim_on_an_os_occupied_unregistered_port_reports_os_occupied() {
-        let _ports = crate::store::port_test_support::lock();
-        let (server, _dir) = server_with_tempdir();
-        let base = unused_test_port();
-        let listener = std::net::TcpListener::bind(("127.0.0.1", base)).unwrap();
+        // Script the OS side: the injected probe reports `base` occupied by
+        // an unregistered process, so the claim must walk forward.
+        let base: u16 = 4214;
+        let (server, _dir) = server_with_probe_tempdir(Arc::new(OccupiedPorts([base].into())));
 
         let result = server
             .claim(Parameters(ClaimParams {
@@ -689,8 +692,6 @@ mod tests {
             }))
             .await
             .unwrap();
-
-        drop(listener);
 
         let value = structured(&result);
         assert!(value["port"].as_u64().unwrap() > base as u64);

@@ -1693,17 +1693,67 @@ fn hook_opencode_warns_on_process_name_kill() {
 }
 
 #[test]
+fn hook_opencode_denies_an_edit_of_a_file_held_by_another_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let file_input = |session: &str| {
+        serde_json::json!({
+            "session_id": session,
+            "file": "src/auth.rs",
+            "cwd": project.path().to_string_lossy(),
+        })
+        .to_string()
+    };
+
+    let ask = |session: &str| {
+        let output = cmd(dir.path())
+            .args(["hook", "opencode"])
+            .write_stdin(file_input(session))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).expect("stdout must be valid JSON")
+    };
+
+    // The first session claims the file by editing it.
+    assert_eq!(ask("session-a")["action"], "allow");
+
+    // A second session is denied, and the reason names the file and the holder.
+    let denied = ask("session-b");
+    assert_eq!(denied["action"], "deny");
+    let reason = denied["reason"].as_str().expect("reason must be a string");
+    assert!(
+        reason.contains("src/auth.rs"),
+        "unexpected reason: {reason}"
+    );
+    assert!(reason.contains("session-a"), "unexpected reason: {reason}");
+
+    // The holding session may keep editing.
+    assert_eq!(ask("session-a")["action"], "allow");
+
+    // The intent store lives under PORTZILLA_DATA_DIR, like the lease store,
+    // and the denied session never got a record.
+    let intents =
+        std::fs::read_to_string(dir.path().join("intents.json")).expect("intents.json must exist");
+    assert!(intents.contains("session-a"));
+    assert!(!intents.contains("session-b"));
+}
+
+#[test]
 fn init_opencode_prints_the_plugin_snippet() {
     let dir = tempfile::tempdir().unwrap();
     cmd(dir.path())
         .args(["init", "opencode"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tool.execute.before"))
-        .stdout(predicate::str::contains("tool.execute.after"))
-        .stdout(predicate::str::contains("shell.env"))
+        .stdout(predicate::str::contains(r#"id: "portzilla""#))
+        .stdout(predicate::str::contains("async setup(ctx)"))
+        .stdout(predicate::str::contains("execute.before"))
         .stdout(predicate::str::contains("portzilla hook opencode"))
-        .stdout(predicate::str::contains("PORTZILLA_SESSION"));
+        .stdout(predicate::str::contains("Bun.spawn"));
 }
 
 // ---- hook windsurf / init windsurf ----
