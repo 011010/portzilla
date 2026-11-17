@@ -91,19 +91,32 @@ pub trait PidChecker {
 /// Real liveness checker backed by `sysinfo`'s process table.
 pub struct SystemPidChecker;
 
+/// Opens a fresh process table.
+///
+/// `sysinfo` 0.40 makes construction fallible. A table that cannot be opened
+/// behaves like a table with no entries — the codebase already treats
+/// "identity could not be resolved" as not-alive and no-start-time (see the
+/// unverified/dead lease records), so this keeps one rule for both cases
+/// instead of inventing a new "unknown" state.
+pub(crate) fn fresh_process_table() -> Option<sysinfo::System> {
+    sysinfo::System::new().ok()
+}
+
 impl PidChecker for SystemPidChecker {
     fn is_alive(&self, pid: u32) -> bool {
-        use sysinfo::{Pid, ProcessesToUpdate, System};
+        use sysinfo::{Pid, ProcessesToUpdate};
 
-        let mut system = System::new();
+        let Some(mut system) = fresh_process_table() else {
+            return false;
+        };
         system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
         system.process(Pid::from_u32(pid)).is_some()
     }
 
     fn process_start_time(&self, pid: u32) -> Option<u64> {
-        use sysinfo::{Pid, ProcessesToUpdate, System};
+        use sysinfo::{Pid, ProcessesToUpdate};
 
-        let mut system = System::new();
+        let mut system = fresh_process_table()?;
         system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
         system
             .process(Pid::from_u32(pid))
