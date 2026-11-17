@@ -1539,12 +1539,14 @@ fn print_init_claude_code() {
 /// (the shell or agent invoking `portzilla`). Falls back to this process's
 /// own PID if the parent cannot be determined.
 fn default_pid() -> u32 {
-    use sysinfo::{ProcessesToUpdate, System, get_current_pid};
+    use sysinfo::{ProcessesToUpdate, get_current_pid};
 
     let Ok(current) = get_current_pid() else {
         return std::process::id();
     };
-    let mut system = System::new();
+    let Some(mut system) = crate::lease::fresh_process_table() else {
+        return std::process::id();
+    };
     system.refresh_processes(ProcessesToUpdate::Some(&[current]), true);
     system
         .process(current)
