@@ -48,6 +48,15 @@ When the check proves the edit clean, the caller is allowed but told why it is s
 
 Prerequisite spike: verify that `tool.execute.after` receives a **mutable** result in OpenCode 2.3.0. The earlier spike confirmed the hook fires but not that mutating `output` reaches the model. If it does not, the fallback is `console.warn` (log-only), which weakens the feature to "allow silently" and must be stated in the docs.
 
+## Spike result (2026-11-17)
+
+`execute.after` in OpenCode 2.3.0 receives `{ tool, sessionID, agent, messageID, id, input, status, result }`, where `result` has `output`, `content`, and `metadata`.
+
+- `result.output` is **not** a string: for the `read` tool it is an object (`{ type: "file", uri, name, … }`). Mutating it does not reach the model.
+- `result.content` is an **array**, and pushing `{ type: "text", text }` into it **does** reach the model. Verified with a marker that appeared verbatim in the model's reply.
+
+Consequence for the warn slice: the shim appends the warning as a text content part on `event.result.content` (guarded by `Array.isArray`), and falls back to `console.warn` otherwise. The call identifier on the event is `event.id`, not `callID`.
+
 ## Data flow
 
 ```

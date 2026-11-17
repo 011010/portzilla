@@ -49,17 +49,9 @@ export default {
 };
 ```
 
-**Step 2:** Confirm the model's tool result actually contains `SPIKE-MARKER`.
+**Step 2 (done):** confirmed. `result.output` is an object, not a string, and mutating it does nothing; `result.content` is an array and pushing `{ type: "text", text }` reaches the model (marker observed verbatim in the reply). Task 5 must use `result.content`, not `result.output`.
 
-- If **yes**: Task 5 appends the warn to `output.output` (or `result.output` — record the exact field name the hook received).
-- If **no**: Task 5 falls back to `console.warn` and the docs must say the warning is log-only.
-
-**Step 3:** Record the finding in `docs/plans/2026-11-17-intent-cli-and-conflict-aware-guard-design.md` under a new `## Spike result` heading, and commit.
-
-```bash
-git add docs/plans/2026-11-17-intent-cli-and-conflict-aware-guard-design.md
-git commit -m "docs: record the V2 after-hook mutability spike"
-```
+**Step 3 (done):** recorded under `## Spike result` in the design doc and committed with `docs: record the V2 after-hook mutability spike`.
 
 ---
 
@@ -333,7 +325,7 @@ git commit -m "feat(cli): add intent claim, who, ls and release"
 
 **Step 1: Failing assertions**
 
-- The snippet sends `call_id` and, for `write`, `content: event.input?.content`; for `edit`, `edit: { old: event.input?.oldString, new: event.input?.newString }`.
+- The snippet sends `call_id: event.id` and, for `write`, `content: event.input?.content`; for `edit`, `edit: { old: event.input?.oldString, new: event.input?.newString }`.
 - The snippet registers `tool.execute.after` and appends the stashed warn to the tool result.
 - The snippet must **not** claim anything on warn (no store writes from the shim; it has none by design).
 
@@ -342,7 +334,7 @@ git commit -m "feat(cli): add intent claim, who, ls and release"
 **Step 3: Implement**
 
 - Add `call_id: event.callID ?? null` and the edit payload to the existing `askPortzilla` call.
-- Keep a `pendingWarnings` map keyed by `callID`; in `execute.after`, append `"\n\nportzilla: " + reason` to the mutable result **if Task 0 proved mutability**; otherwise `console.warn` and say so in the snippet comment.
+- Keep a `pendingWarnings` map keyed by the before-hook's `event.id`; in `execute.after` the event exposes `id` (not `callID`) and `result.content`. Append the warning by pushing `{ type: "text", text: "portzilla: " + reason }` when `Array.isArray(event.result.content)`, and fall back to `console.warn` otherwise (spike-verified: `result.output` is an object and mutating it is invisible to the model).
 - Keep the 5 s timeout and fail-open behaviour.
 
 **Step 4:** `cargo test -p portzilla opencode` → green.
