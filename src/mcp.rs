@@ -15,7 +15,7 @@ use crate::view::{to_claim_view, to_view};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -376,8 +376,8 @@ impl PortzillaMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PortzillaMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             // Deliberately NOT `Implementation::from_build_env()`: that
             // function's `env!()` calls are compiled into the `rmcp` crate
             // itself, so it always reports the SDK's own name/version
@@ -438,6 +438,13 @@ fn not_found_error(port: u16) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    // Port-sensitive tests hold a std `MutexGuard` across `.await` so the
+    // port stays free for the whole test body. `#[tokio::test]` uses a
+    // current-thread runtime here, so the guard never crosses a thread and
+    // cannot deadlock; blocking a competing test thread until the test ends is
+    // exactly the serialization these tests need.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use rmcp::model::ErrorCode;
 
@@ -455,11 +462,9 @@ mod tests {
     }
 
     fn unused_test_port() -> u16 {
-        std::net::TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        // Shares the store's dedicated test-range allocator so tests in this
+        // binary cannot be handed a port another test is about to bind.
+        crate::store::port_test_support::unused_port()
     }
 
     // ---- tool descriptions ----
@@ -567,6 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_on_a_free_port_returns_success_with_the_ls_plus_reassigned_shape() {
+        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
         let port = unused_test_port();
         let result = server
@@ -591,6 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_without_pid_defaults_to_the_server_pid_and_adds_a_note() {
+        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
         let port = unused_test_port();
         let result = server
@@ -613,6 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_with_explicit_pid_has_no_note_field() {
+        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
         let port = unused_test_port();
         let result = server
@@ -634,6 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_conflicting_with_a_live_pid_reassigns() {
+        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
         let port = unused_test_port();
         let own_pid = std::process::id();
@@ -666,6 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_on_an_os_occupied_unregistered_port_reports_os_occupied() {
+        let _ports = crate::store::port_test_support::lock();
         let (server, _dir) = server_with_tempdir();
         let base = unused_test_port();
         let listener = std::net::TcpListener::bind(("127.0.0.1", base)).unwrap();

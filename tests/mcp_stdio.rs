@@ -9,18 +9,56 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// Dedicated, non-ephemeral range for MCP wire tests.
+///
+/// `bind(("127.0.0.1", 0))` returns the port to the shared pool the moment the
+/// listener drops, so a concurrent test can take the port this file is about
+/// to assert on. This range is outside every platform's ephemeral range and
+/// disjoint from the ranges used by the CLI and unit test binaries.
+const TEST_PORT_BASE: u16 = 31_200;
+const TEST_PORT_SPAN: u32 = 800;
+/// Ports advance in pairs so a single-port handout never collides with the
+/// successor another handout reserved for an adjacent-pair test.
+const TEST_PORT_STRIDE: u32 = 2;
+
+static NEXT_TEST_PORT: AtomicU32 = AtomicU32::new(0);
+static TEST_PORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes the tests in this file, all of which drive a real subprocess that
+/// probes the same loopback port space.
+fn lock_test_ports() -> MutexGuard<'static, ()> {
+    TEST_PORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn next_test_port() -> u16 {
+    let offset = NEXT_TEST_PORT.fetch_add(TEST_PORT_STRIDE, Ordering::Relaxed);
+    assert!(
+        offset < TEST_PORT_SPAN,
+        "MCP test port pool exhausted: more than {} handouts in one run",
+        TEST_PORT_SPAN / TEST_PORT_STRIDE
+    );
+    TEST_PORT_BASE + offset as u16
+}
+
 fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
-    for _ in 0..100 {
-        let requested = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let base = requested.local_addr().unwrap().port();
-        if let Some(successor) = base
-            .checked_add(1)
-            .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
-        {
-            return (requested, successor, base);
-        }
+    for _ in 0..TEST_PORT_SPAN {
+        let base = next_test_port();
+        let Some(successor_port) = base.checked_add(1) else {
+            continue;
+        };
+        let (Ok(requested), Ok(successor)) = (
+            TcpListener::bind(("127.0.0.1", base)),
+            TcpListener::bind(("127.0.0.1", successor_port)),
+        ) else {
+            continue;
+        };
+        return (requested, successor, base);
     }
     panic!("could not reserve adjacent test ports");
 }
@@ -141,6 +179,7 @@ impl Drop for McpSession {
 
 #[test]
 fn initialize_tools_list_and_tools_call_over_real_stdio() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let mut session = McpSession::start(dir.path());
 
@@ -241,6 +280,7 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
 #[test]
 #[cfg(unix)]
 fn claim_reassignment_reason_is_exposed_over_real_stdio() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let mut session = McpSession::start(dir.path());
     session.initialize();
@@ -270,6 +310,7 @@ fn claim_reassignment_reason_is_exposed_over_real_stdio() {
 
 #[test]
 fn os_occupied_reassignment_reason_is_exposed_over_real_stdio() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let mut session = McpSession::start(dir.path());
     session.initialize();
@@ -299,6 +340,7 @@ fn os_occupied_reassignment_reason_is_exposed_over_real_stdio() {
 /// portzilla itself could not do its job.
 #[test]
 fn corrupt_state_file_surfaces_as_a_real_json_rpc_protocol_error() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("leases.json"), b"{ not valid json").unwrap();
 
