@@ -1,4 +1,4 @@
-//! OpenCode adapter for the kill-guard.
+//! OpenCode adapter: kill-guard for shell commands, file intents for edits.
 //!
 //! There are two halves to this adapter, because OpenCode's extensibility
 //! model is fundamentally different from the other harnesses': OpenCode
@@ -11,14 +11,12 @@
 //! the guard core; OpenCode cannot run `portzilla` as the hook directly, so:
 //!
 //! 1. **The shim** — a small JS plugin (`portzilla init opencode` prints
-//!    its full source) that hooks `tool.execute.before`, and shells out to
-//!    `portzilla hook opencode` with the command and session id. It turns
-//!    a deny into `throw new Error(reason)` (which OpenCode surfaces to the
-//!    model as a tool error), and defers warn text to `tool.execute.after`,
-//!    where appending to the tool result's `output` puts it in front of the
-//!    model without blocking anything (verified: `tool.execute.after`
-//!    receives a mutable `{ title, output, metadata }` whose content
-//!    becomes the tool result).
+//!    its full source) in OpenCode's V2 plugin shape (`id` + `setup`). It
+//!    registers `tool.execute.before`, translates `write`/`edit` into a
+//!    file-intent check and `shell` into a kill-guard check, shells out to
+//!    `portzilla hook opencode`, and turns a deny into
+//!    `throw new Error(reason)` (which OpenCode surfaces to the model as a
+//!    tool error; the tool does not run). See [`PLUGIN_SNIPPET`].
 //! 2. **This module** — the binary-side verdict protocol the shim calls:
 //!    stdin JSON `{ "session_id": ..., "command": ... }` for a shell command
 //!    or `{ "session_id": ..., "file": ..., "cwd": ... }` for an edit,
@@ -42,27 +40,23 @@
 //! catching a peer that reaches the file seconds after the first edit; it is
 //! why the deny text tells the caller to wait rather than to retry.
 //!
-//! # Own-lease recognition: unique among the non-Claude harnesses
+//! # Own-lease recognition
 //!
-//! OpenCode's `shell.env` hook receives the session id and can inject
-//! environment variables into every bash subprocess the agent runs
-//! (verified: the bash subprocess env is `{ ...process.env, ...extra.env }`
-//! where `extra.env` is built from `shell.env` outputs). The shim injects
-//! `PORTZILLA_SESSION`, so an agent can claim with
-//! `--session "$PORTZILLA_SESSION"` and the guard side (which receives the
-//! session id through `tool.execute.before`'s `sessionID` field) recognizes
-//! the lease as its own. This is the only non-Claude-Code harness where
-//! end-to-end own-lease recognition works today.
+//! `tool.execute.before` carries OpenCode's `sessionID` and the shim forwards
+//! it, so a lease claimed with `--session <that id>` is recognized as the
+//! caller's own. OpenCode's V1 `shell.env` hook — which let the old shim
+//! inject `PORTZILLA_SESSION` into every shell subprocess — does not exist in
+//! the V2 plugin API, so nothing here can hand the session id to the agent's
+//! environment; a claim is only recognized as own when its session id matches
+//! the id OpenCode reports for the call.
 //!
 //! # No pre-execution model-visible warn channel
 //!
-//! `tool.execute.before` is binary: return = allow, throw = deny — there is
-//! no documented non-blocking pre-execution channel the model sees. The
-//! shim therefore surfaces [`Verdict::Warn`] *after* the command ran, by
-//! appending to the tool result via `tool.execute.after` (keyed on the
-//! call id so the warning lands on the right tool call). This is a
-//! deliberate, documented tradeoff: the warning never blocks, and it
-//! reaches the model on the very tool result the command produced.
+//! `tool.execute.before` is binary: return = allow, throw = deny. V1 deferred
+//! warn text to `tool.execute.after`; the V2 registration for that event has
+//! not been verified, and a hook that fails to register can keep the whole
+//! plugin from loading, so the shim logs a warn to OpenCode's console instead
+//! of the model. The warning still never blocks.
 //!
 //! # Fail-open, concretely
 //!
@@ -71,7 +65,7 @@
 //! session id for an edit, unreadable store, panic — see `main.rs`'s
 //! `catch_unwind`), with a diagnostic on stderr. The shim also fails open on
 //! its own side (any spawn/parse/timeout problem allows), so a portzilla
-//! problem can never block an OpenCode bash call. Note that OpenCode itself
+//! problem can never block an OpenCode tool call. Note that OpenCode itself
 //! has no hook timeout — the shim enforces its own (5000 ms) around the
 //! subprocess.
 //!
@@ -354,60 +348,115 @@ fn intent_ttl_secs() -> u64 {
 /// The full source of the OpenCode plugin shim, printed by `portzilla init
 /// opencode`. Save it as `.opencode/plugin/portzilla.js` (project) or
 /// `~/.config/opencode/plugin/portzilla.js` (user) — OpenCode
-/// auto-discovers `*.js`/`*.ts` files in those directories. The plugin
-/// exports a function returning hooks (the documented plugin shape) and
-/// uses Bun's `$` shell API (provided in the plugin context) with its own
-/// 5000 ms timeout, since OpenCode applies no timeout to plugin hooks.
-pub const PLUGIN_SNIPPET: &str = r#"// portzilla kill-guard for opencode.
+/// auto-discovers `*.js`/`*.ts` files in those directories. The plugin uses
+/// the V2 shape (a default export with `id` + `setup`), registers one
+/// `tool.execute.before` hook, and enforces its own 5000 ms timeout around
+/// the subprocess, since OpenCode applies no timeout to plugin hooks.
+pub const PLUGIN_SNIPPET: &str = r#"// portzilla guard for OpenCode 2.x.
+//
 // Save as .opencode/plugin/portzilla.js (project) or
-// ~/.config/opencode/plugin/portzilla.js (user) — opencode auto-discovers
+// ~/.config/opencode/plugin/portzilla.js (user) — OpenCode auto-discovers
 // *.js/*.ts files in those directories. Requires `portzilla` on PATH.
-// Restart opencode after saving for the plugin to load.
-export default async ({ $ }) => {
-  const CHECK_TIMEOUT_MS = 5000;
+// Quit and restart OpenCode after saving; plugins load once at startup.
+//
+// This is the V2 plugin shape: a default export with an `id` and a `setup`
+// function. The V1 shape — an async function that receives `$` and returns a
+// hooks object — is rejected by OpenCode 2.3.0 with "Plugin must export a
+// default definition with an id and an effect or setup function".
+//
+// One hook, `tool.execute.before`, with three branches:
+//   - write / edit: ask portzilla for a file intent on the path being
+//     edited. If another live session holds that file, the tool call throws
+//     and the file is not modified.
+//   - shell: ask portzilla's kill-guard about the command. A command that
+//     would kill another session's leased process throws before it runs.
+//   - anything else: not ours, return.
+//
+// Any portzilla-side problem (binary missing, non-zero exit, unparseable
+// output, the 5000 ms timeout) allows the tool call: a guard that breaks the
+// session is worse than no guard.
+//
+// The subprocess is spawned with Bun.spawn rather than the `$` helper: `$`
+// came with the V1 plugin context and is not part of the documented V2
+// `setup(ctx)` context, while OpenCode runs plugins in Bun. Only
+// askPortzilla would need to change if that moves.
+//
+// A `shell.create.before` hook is deliberately NOT registered: it carries no
+// session id, so a shell command cannot be attributed to a session, and V2
+// has no `shell.env` equivalent to inject one. File intents and the lease
+// kill-guard both work from `execute.before` alone.
+export default {
+  id: "portzilla",
+  async setup(ctx) {
+    const CHECK_TIMEOUT_MS = 5000;
 
-  // callID -> warn reason, surfaced by tool.execute.after so the model
-  // sees it on the tool result without the command being blocked.
-  const pendingWarnings = new Map();
-
-  const checkCommand = async (command, sessionID) => {
-    const payload = JSON.stringify({ session_id: sessionID ?? null, command });
-    try {
-      const result = await $({ timeout: CHECK_TIMEOUT_MS, nothrow: true })`portzilla hook opencode`.input(payload);
-      if (result.exitCode !== 0) return { action: "allow" };
-      const text = new TextDecoder().decode(result.stdout ?? new Uint8Array());
-      const parsed = JSON.parse(text);
-      if (parsed.action === "deny" || parsed.action === "warn") return parsed;
-      return { action: "allow" };
-    } catch (err) {
-      console.error(`portzilla: guard check failed, allowing (${err})`);
-      return { action: "allow" };
-    }
-  };
-
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (input.tool !== "bash") return;
-      const command = output.args?.command;
-      if (typeof command !== "string" || command.trim() === "") return;
-      const verdict = await checkCommand(command, input.sessionID);
-      if (verdict.action === "deny") throw new Error(verdict.reason);
-      if (verdict.action === "warn") pendingWarnings.set(input.callID, verdict.reason);
-    },
-    "shell.env": async (input, output) => {
-      if (input.sessionID) output.env.PORTZILLA_SESSION = input.sessionID;
-    },
-    "tool.execute.after": async (input, output) => {
-      if (input.tool !== "bash") return;
-      const reason = pendingWarnings.get(input.callID);
-      if (reason) {
-        pendingWarnings.delete(input.callID);
-        if (typeof output.output === "string") {
-          output.output += "\n\nportzilla warning: " + reason;
-        }
+    // Sends one payload to `portzilla hook opencode` and parses the verdict.
+    // Returns null for anything that is not a usable verdict; callers treat
+    // null as allow.
+    const askPortzilla = async (payload) => {
+      let proc;
+      try {
+        proc = Bun.spawn(["portzilla", "hook", "opencode"], {
+          stdin: new TextEncoder().encode(JSON.stringify(payload)),
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+      } catch (err) {
+        console.error(`portzilla: could not spawn the guard, allowing (${err})`);
+        return null;
       }
-    },
-  };
+
+      // OpenCode applies no timeout to plugin hooks, so enforce one here.
+      const timer = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {
+          // Already exited; nothing to kill.
+        }
+      }, CHECK_TIMEOUT_MS);
+
+      try {
+        const text = await new Response(proc.stdout).text();
+        const exitCode = await proc.exited;
+        if (exitCode !== 0) return null;
+        return JSON.parse(text);
+      } catch (err) {
+        console.error(`portzilla: guard returned no usable verdict, allowing (${err})`);
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (event.tool === "write" || event.tool === "edit") {
+        const file = event.input?.path;
+        if (typeof file !== "string" || file.trim() === "") return;
+
+        const verdict = await askPortzilla({
+          session_id: event.sessionID ?? null,
+          file: file,
+          cwd: ctx.directory ?? null,
+        });
+        if (verdict?.action === "deny") throw new Error(verdict.reason);
+        return;
+      }
+
+      if (event.tool === "shell") {
+        const command = event.input?.command;
+        if (typeof command !== "string" || command.trim() === "") return;
+
+        const verdict = await askPortzilla({
+          session_id: event.sessionID ?? null,
+          command: command,
+        });
+        if (verdict?.action === "deny") throw new Error(verdict.reason);
+        // No verified non-blocking hook in V2 appends to the tool result, so
+        // a warn goes to OpenCode's console instead of the model.
+        if (verdict?.action === "warn") console.warn(`portzilla: ${verdict.reason}`);
+      }
+    });
+  },
 };"#;
 
 #[cfg(test)]
@@ -911,19 +960,36 @@ mod tests {
     }
 
     #[test]
-    fn plugin_snippet_is_a_valid_js_module_with_all_three_hooks() {
+    fn plugin_snippet_is_a_v2_plugin_guarding_edits_and_shell_commands() {
         // The shim is the load-bearing half of this adapter: these are the
-        // exact strings OpenCode's plugin loader and the guard protocol
-        // depend on. The snippet must export a function (plugin shape),
-        // hook all three events, shell out to the binary, throw on deny,
-        // and inject the session id.
-        assert!(PLUGIN_SNIPPET.contains("export default async"));
-        assert!(PLUGIN_SNIPPET.contains("\"tool.execute.before\""));
-        assert!(PLUGIN_SNIPPET.contains("\"tool.execute.after\""));
-        assert!(PLUGIN_SNIPPET.contains("\"shell.env\""));
+        // exact strings OpenCode's V2 plugin loader and the guard protocol
+        // depend on. It must export an id + setup definition, register
+        // `execute.before`, route write/edit to the file-intent payload and
+        // shell to the command payload, shell out to the binary, and throw
+        // on deny.
+        assert!(PLUGIN_SNIPPET.contains(r#"id: "portzilla""#));
+        assert!(PLUGIN_SNIPPET.contains("async setup(ctx)"));
+        assert!(PLUGIN_SNIPPET.contains("export default {"));
+        assert_eq!(
+            PLUGIN_SNIPPET.matches("ctx.tool.hook(").count(),
+            1,
+            "only execute.before is registered"
+        );
+        assert!(PLUGIN_SNIPPET.contains(r#"ctx.tool.hook("execute.before""#));
+        assert!(PLUGIN_SNIPPET.contains(r#"event.tool === "write" || event.tool === "edit""#));
+        assert!(PLUGIN_SNIPPET.contains(r#"event.tool === "shell""#));
+        assert!(PLUGIN_SNIPPET.contains("event.input?.path"));
+        assert!(PLUGIN_SNIPPET.contains("file: file"));
+        assert!(PLUGIN_SNIPPET.contains("cwd: ctx.directory"));
         assert!(PLUGIN_SNIPPET.contains("portzilla hook opencode"));
+        assert!(PLUGIN_SNIPPET.contains("Bun.spawn"));
+        assert!(PLUGIN_SNIPPET.contains("CHECK_TIMEOUT_MS"));
         assert!(PLUGIN_SNIPPET.contains("throw new Error"));
-        assert!(PLUGIN_SNIPPET.contains("PORTZILLA_SESSION"));
-        assert!(PLUGIN_SNIPPET.contains("input.tool !== \"bash\""));
+
+        // The V1 shapes must not come back: this plugin does not load on
+        // OpenCode 2.x, and the removed env injection would be dead code.
+        assert!(!PLUGIN_SNIPPET.contains("export default async"));
+        assert!(!PLUGIN_SNIPPET.contains("output.env.PORTZILLA_SESSION"));
+        assert!(!PLUGIN_SNIPPET.contains(r#""bash""#));
     }
 }

@@ -1719,12 +1719,14 @@ fn init_opencode_prints_the_plugin_snippet() {
         .args(["init", "opencode"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tool.execute.before"))
-        .stdout(predicate::str::contains("tool.execute.after"))
-        .stdout(predicate::str::contains("shell.env"))
+        .stdout(predicate::str::contains(r#"id: "portzilla""#))
+        .stdout(predicate::str::contains("async setup(ctx)"))
+        .stdout(predicate::str::contains("execute.before"))
         .stdout(predicate::str::contains("portzilla hook opencode"))
-        .stdout(predicate::str::contains("PORTZILLA_SESSION"));
+        .stdout(predicate::str::contains("Bun.spawn"));
 }
+
+// ---- hook windsurf / init windsurf ----
 
 fn windsurf_pre_run_command_json(command: &str, trajectory_id: &str) -> String {
     serde_json::json!({

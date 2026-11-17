@@ -1365,7 +1365,7 @@ fn print_init_gemini() {
 }
 
 fn print_init_opencode() {
-    println!("portzilla's kill-guard for OpenCode is a plugin shim, because OpenCode hooks run");
+    println!("portzilla's guard for OpenCode is a plugin shim, because OpenCode hooks run");
     println!("in-process as JavaScript/TypeScript plugin modules — it cannot run `portzilla`");
     println!("directly as the hook the way Claude Code/Codex/Kimi can. Save the file below as:");
     println!();
@@ -1383,24 +1383,20 @@ fn print_init_opencode() {
     println!();
     println!("How it works:");
     println!(
-        "  - tool.execute.before: intercepts bash calls, asks `portzilla hook opencode` for a"
+        "  - tool.execute.before: intercepts write/edit and shell calls, asks `portzilla hook"
     );
-    println!("    verdict; a deny throws, and the reason reaches the model as a tool error.");
+    println!("    opencode` for a verdict, and throws on deny before anything runs — the reason");
+    println!("    reaches the model as a tool error.");
     println!(
-        "  - tool.execute.after: Warn verdicts are appended to the tool result the model reads"
+        "  - write/edit: the edited file is claimed as a file intent, so a second session that"
     );
-    println!("    (OpenCode has no non-blocking model-visible warn channel before execution).");
-    println!("  - shell.env: injects PORTZILLA_SESSION into every bash subprocess, so claims made");
-    println!("    from OpenCode sessions can tag their leases and kill-guard recognizes them as");
-    println!(
-        "    your own — the only non-Claude harness where own-lease recognition works end to end."
-    );
-    println!(
-        "    Claim like: portzilla claim 3000 --tag \"vite dev\" --session \"$PORTZILLA_SESSION\""
-    );
+    println!("    tries to edit the same file is denied instead of silently clobbering it.");
+    println!("  - shell: a command that would kill a process leased to another session is denied.");
+    println!("  - warn verdicts (a kill by process name, which cannot be resolved to a lease) are");
+    println!("    written to OpenCode's log; they never block the call.");
     println!();
     println!("Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,");
-    println!("the command is allowed — a portzilla problem never blocks your session.");
+    println!("the tool call is allowed — a portzilla problem never blocks your session.");
 }
 
 fn print_init_codex() {
