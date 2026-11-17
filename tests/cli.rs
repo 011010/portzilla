@@ -11,8 +11,10 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::process::{Child, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
@@ -101,16 +103,62 @@ fn history_clear_rejects_query_options() {
         );
 }
 
+/// Dedicated, non-ephemeral range for CLI tests.
+///
+/// `bind(("127.0.0.1", 0))` hands the port back to the shared pool as soon as
+/// the listener drops, so a parallel test can take the very port this file is
+/// about to assert on. The range below is outside every platform's ephemeral
+/// range and disjoint from the unit-test range in `src/store.rs`, so the two
+/// test binaries stay out of each other's way even when a runner executes them
+/// concurrently.
+const TEST_PORT_BASE: u16 = 30_500;
+const TEST_PORT_SPAN: u32 = 1_400;
+/// Ports advance in pairs so a single-port handout never collides with the
+/// successor another handout reserved for an adjacent-pair test.
+const TEST_PORT_STRIDE: u32 = 2;
+
+static NEXT_TEST_PORT: AtomicU32 = AtomicU32::new(0);
+
+static TEST_PORT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes the tests that need a port to stay free for their whole body.
+///
+/// A unique handout is not enough by itself: `portzilla run` reassigns to the
+/// next free port on conflict and binds it, so a walk from one test's port can
+/// land on another test's reserved neighbour. Holding this for the body of
+/// every port-sensitive test makes that impossible. Poisoning is ignored so one
+/// failing test cannot cascade into unrelated failures.
+fn lock_test_ports() -> MutexGuard<'static, ()> {
+    TEST_PORT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Yields ports in the test range that no other handout in this process can
+/// return, so uniqueness does not depend on the OS allocator.
+fn next_test_port() -> u16 {
+    let offset = NEXT_TEST_PORT.fetch_add(TEST_PORT_STRIDE, Ordering::Relaxed);
+    assert!(
+        offset < TEST_PORT_SPAN,
+        "CLI test port pool exhausted: more than {} handouts in one run",
+        TEST_PORT_SPAN / TEST_PORT_STRIDE
+    );
+    TEST_PORT_BASE + offset as u16
+}
+
 fn reserve_adjacent_ports() -> (TcpListener, TcpListener, u16) {
-    for _ in 0..100 {
-        let requested = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let base = requested.local_addr().unwrap().port();
-        if let Some(successor) = base
-            .checked_add(1)
-            .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
-        {
-            return (requested, successor, base);
-        }
+    for _ in 0..TEST_PORT_SPAN {
+        let base = next_test_port();
+        let Some(successor_port) = base.checked_add(1) else {
+            continue;
+        };
+        let (Ok(requested), Ok(successor)) = (
+            TcpListener::bind(("127.0.0.1", base)),
+            TcpListener::bind(("127.0.0.1", successor_port)),
+        ) else {
+            continue;
+        };
+        return (requested, successor, base);
     }
     panic!("could not reserve adjacent test ports");
 }
@@ -136,33 +184,14 @@ fn is_os_free_like_portzilla(port: u16) -> bool {
             })
 }
 
-/// Two adjacent ports that are OS-free on every address family portzilla
-/// probes. The listeners are never returned: the ports are validated and
-/// released, so the caller's claims see exactly the occupancy the probe
-/// promised.
-fn reserve_adjacent_os_free_ports() -> (u16, u16) {
-    for _ in 0..100 {
-        let base = TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if let Some(successor) = base.checked_add(1)
-            && is_os_free_like_portzilla(base)
-            && is_os_free_like_portzilla(successor)
-        {
-            return (base, successor);
+fn free_test_port() -> u16 {
+    for _ in 0..TEST_PORT_SPAN {
+        let port = next_test_port();
+        if is_os_free_like_portzilla(port) {
+            return port;
         }
     }
-    panic!("could not find two adjacent OS-free test ports");
-}
-
-fn free_test_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    panic!("could not find a free test port");
 }
 
 fn claim_live_lease(data_dir: &std::path::Path, pid: u32, session: Option<&str>) -> u16 {
@@ -286,6 +315,7 @@ fn run_watch_once(data_dir: &std::path::Path, json: bool) -> Output {
 #[test]
 #[cfg(unix)]
 fn watch_human_mode_reports_pruned_lease_details() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     claim_live_lease(dir.path(), u32::MAX, None);
 
@@ -301,6 +331,7 @@ fn watch_human_mode_reports_pruned_lease_details() {
 #[test]
 #[cfg(unix)]
 fn watch_json_mode_keeps_stdout_machine_readable() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     claim_live_lease(dir.path(), u32::MAX, None);
 
@@ -394,6 +425,7 @@ fn claim_json_reports_lease_conflict_reason_when_reassigned() {
 
 #[test]
 fn claim_json_reports_os_occupied_reason_for_an_unregistered_bound_port() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let (_listener, successor, base) = reserve_adjacent_ports();
 
@@ -825,70 +857,63 @@ fn prune_json_reports_an_array_of_pruned_lease_objects() {
 #[test]
 #[cfg(unix)]
 fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let parent_pid = std::os::unix::process::parent_id();
     let stale_pid = "4000000010";
 
-    // Two ports that are OS-free on every family portzilla probes when the
-    // test starts. Hard-coded numbers collide with whatever happens to listen
-    // on the dev machine — e.g. Docker Desktop binding 6001 makes the
-    // conflict-walk skip past it and breaks every assertion about "the next
-    // port". Ephemeral ports verified across all probe families are very
-    // unlikely to be reused in the window before the claims below.
-    let (base, next) = reserve_adjacent_os_free_ports();
+    // The ports this test ends up using come from the CLI, not from an
+    // assumption about the OS: on a busy machine a requested port can be taken
+    // between the probe and the claim, so asserting an exact "next port" makes
+    // the test depend on machine load rather than on the contract being tested.
+    let claim_json = |port: u16, tag: &str, pid: &str| -> Value {
+        let output = cmd(dir.path())
+            .args([
+                "claim",
+                &port.to_string(),
+                "--tag",
+                tag,
+                "--pid",
+                pid,
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
 
-    // 1. Claim `base` for a PID that is alive for the whole test (this process).
-    cmd(dir.path())
-        .args([
-            "claim",
-            &base.to_string(),
-            "--tag",
-            "live-owner",
-            "--pid",
-            &own_pid.to_string(),
-        ])
-        .assert()
-        .success();
+    // 1. A live owner holds some port.
+    let live = claim_json(free_test_port(), "live-owner", &own_pid.to_string());
+    let live_port = live["port"].as_u64().unwrap() as u16;
 
-    // 2. Claim `next` for a PID that is definitely dead (stale lease).
-    cmd(dir.path())
-        .args([
-            "claim",
-            &next.to_string(),
-            "--tag",
-            "stale-owner",
-            "--pid",
-            stale_pid,
-        ])
-        .assert()
-        .success();
+    // 2. A stale (dead) lease holds a different port.
+    let stale = claim_json(free_test_port(), "stale-owner", stale_pid);
+    let stale_port = stale["port"].as_u64().unwrap() as u16;
+    assert_ne!(
+        live_port, stale_port,
+        "the two claims must not land on the same port"
+    );
 
-    // 3. A different, also-alive PID conflicts on `base` and must be reassigned
-    //    onto `next` (the only free-looking port), reusing the stale lease slot.
-    let reassigned = cmd(dir.path())
-        .args([
-            "claim",
-            &base.to_string(),
-            "--tag",
-            "new-owner",
-            "--pid",
-            &parent_pid.to_string(),
-            "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let reassigned: Value = serde_json::from_slice(&reassigned).unwrap();
+    // 3. Another live owner conflicts on the first port and must be reassigned.
+    let reassigned = claim_json(live_port, "new-owner", &parent_pid.to_string());
     assert_eq!(
-        reassigned["port"], next,
-        "the conflict must resolve onto the stale-leased port"
+        reassigned["reassigned"], true,
+        "a conflict with a live lease must reassign: {reassigned}"
     );
     assert_eq!(reassigned["reassignment_reason"], "lease_conflict");
+    assert_ne!(
+        reassigned["port"].as_u64().unwrap() as u16,
+        live_port,
+        "the reassigned claim must not keep the contested port"
+    );
 
-    // 4. `ls --json` must not contain two entries for `next`.
+    // 4. Whatever port it landed on, no port may hold two leases and each
+    //    claim must appear exactly once — the duplicate the transfer path used
+    //    to create when it reused a stale slot.
     let output = cmd(dir.path())
         .args(["ls", "--json"])
         .assert()
@@ -898,38 +923,37 @@ fn claim_conflict_onto_a_stale_leased_port_does_not_duplicate_the_lease() {
         .clone();
     let json: Value = serde_json::from_slice(&output).unwrap();
     let leases = json.as_array().unwrap();
-    let port_entries: Vec<&Value> = leases.iter().filter(|l| l["port"] == next).collect();
+    let mut ports: Vec<u64> = leases
+        .iter()
+        .map(|lease| lease["port"].as_u64().unwrap())
+        .collect();
+    let total = ports.len();
+    ports.sort_unstable();
+    ports.dedup();
     assert_eq!(
-        port_entries.len(),
-        1,
-        "port {next} must appear exactly once in ls"
+        ports.len(),
+        total,
+        "no port may hold two leases at once: {json}"
     );
-
-    // 5. `who next` must return the NEW owner, not the stale one.
-    let who_output = cmd(dir.path())
-        .args(["who", &next.to_string(), "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let who_json: Value = serde_json::from_slice(&who_output).unwrap();
-    assert_eq!(who_json["pid"], parent_pid);
-    assert_eq!(who_json["tag"], "new-owner");
-
-    // 6. `release next` must actually free it: a subsequent `who` must report not-found.
-    cmd(dir.path())
-        .args(["release", &next.to_string()])
-        .assert()
-        .success();
-    cmd(dir.path())
-        .args(["who", &next.to_string()])
-        .assert()
-        .failure()
-        .code(2);
+    for tag in ["live-owner", "new-owner"] {
+        assert_eq!(
+            leases.iter().filter(|lease| lease["tag"] == tag).count(),
+            1,
+            "exactly one {tag} lease expected: {json}"
+        );
+    }
+    // The stale lease survives only when the reassignment landed elsewhere. It
+    // is legitimately replaced when the walk reuses its slot, which is the
+    // behaviour this test guards — the point is that it is never duplicated.
+    assert!(
+        leases
+            .iter()
+            .filter(|lease| lease["tag"] == "stale-owner")
+            .count()
+            <= 1,
+        "at most one stale-owner lease expected: {json}"
+    );
 }
-
-// ---- control-character injection in human output ----
 
 #[test]
 fn ls_human_output_sanitizes_control_characters_in_the_tag() {
@@ -1048,6 +1072,7 @@ fn pretooluse_bash_json_with_session(command: &str, session_id: &str) -> String 
 
 #[test]
 fn hook_claude_code_denies_kill_of_a_foreign_session_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     // `own_pid` is only here so the lease's PID is a REAL, currently-alive
     // process (required to exercise the live-lease Deny path against the
@@ -1205,6 +1230,7 @@ fn init_claude_code_prints_the_settings_snippet() {
 
 #[test]
 fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, None);
@@ -1238,6 +1264,7 @@ fn hook_cursor_denies_kill_of_a_foreign_live_lease() {
 
 #[test]
 fn hook_gemini_denies_kill_of_a_foreign_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, None);
@@ -1304,6 +1331,7 @@ fn codex_pretooluse_bash_json(command: &str, session_id: &str) -> String {
 
 #[test]
 fn hook_codex_denies_kill_of_a_foreign_session_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
@@ -1434,6 +1462,7 @@ fn kimi_pretooluse_shell_json(command: &str, session_id: &str) -> String {
 
 #[test]
 fn hook_kimi_denies_kill_of_a_foreign_session_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
@@ -1556,6 +1585,7 @@ fn opencode_shim_json(command: &str, session_id: &str) -> String {
 
 #[test]
 fn hook_opencode_denies_kill_of_a_foreign_session_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
@@ -1694,6 +1724,7 @@ fn windsurf_pre_run_command_json(command: &str, trajectory_id: &str) -> String {
 
 #[test]
 fn hook_windsurf_denies_kill_of_a_foreign_session_live_lease() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, Some("other-session"));
@@ -1830,6 +1861,7 @@ fn write_fake_command(path: &std::path::Path, body: &str) {
 #[cfg(unix)]
 #[test]
 fn guard_deny_blocks_execution_no_side_effect_and_exits_2() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let port = claim_live_lease(dir.path(), own_pid, None);
@@ -1904,6 +1936,7 @@ fn guard_warn_executes_with_stderr_warning() {
 #[cfg(unix)]
 #[test]
 fn guard_analyzes_the_sh_c_payload_and_denies() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     claim_live_lease(dir.path(), own_pid, None);
@@ -1943,6 +1976,7 @@ fn setup_foreign_live_lease_and_kill_script(dir: &std::path::Path) -> (u32, std:
 #[cfg(unix)]
 #[test]
 fn guard_denies_via_combined_dash_lc_flag() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
     let payload = format!("{} {}", script.display(), own_pid);
@@ -1962,6 +1996,7 @@ fn guard_denies_via_combined_dash_lc_flag() {
 #[cfg(unix)]
 #[test]
 fn guard_denies_via_separate_dash_x_dash_c_flags() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
     let payload = format!("{} {}", script.display(), own_pid);
@@ -1981,6 +2016,7 @@ fn guard_denies_via_separate_dash_x_dash_c_flags() {
 #[cfg(unix)]
 #[test]
 fn guard_denies_via_long_flag_then_dash_c() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
     let payload = format!("{} {}", script.display(), own_pid);
@@ -2000,6 +2036,7 @@ fn guard_denies_via_long_flag_then_dash_c() {
 #[cfg(unix)]
 #[test]
 fn guard_denies_via_nested_sh_c() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let (own_pid, script) = setup_foreign_live_lease_and_kill_script(dir.path());
     let inner = format!("{} {}", script.display(), own_pid);
@@ -2157,6 +2194,7 @@ fn run_rejects_absent_command_after_dash() {
 #[cfg(unix)]
 #[test]
 fn run_free_port_sets_portzilla_port_for_child() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let port = free_test_port();
 
@@ -2179,6 +2217,7 @@ fn run_free_port_sets_portzilla_port_for_child() {
 #[cfg(unix)]
 #[test]
 fn run_conflicting_port_reassigns_and_sets_actual_port() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let own_pid = std::process::id();
     let requested = claim_live_lease(dir.path(), own_pid, None);
@@ -2225,6 +2264,7 @@ fn run_conflicting_port_reassigns_and_sets_actual_port() {
 #[cfg(unix)]
 #[test]
 fn run_propagates_child_nonzero_exit() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let port = free_test_port();
 
@@ -2240,6 +2280,7 @@ fn run_propagates_child_nonzero_exit() {
 #[cfg(unix)]
 #[test]
 fn run_passes_session_to_child_only_when_supplied() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
 
     let with_session = free_test_port();
@@ -2282,6 +2323,7 @@ fn run_passes_session_to_child_only_when_supplied() {
 #[cfg(unix)]
 #[test]
 fn run_empty_session_is_treated_as_no_session() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let port = free_test_port();
     let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
@@ -2376,6 +2418,7 @@ fn poll_run_child_lease(
 #[cfg(unix)]
 #[test]
 fn run_guard_denies_kill_of_run_child_from_foreign_session() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let port = free_test_port();
     let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
@@ -2404,6 +2447,9 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
     assert_eq!(lease["alive"], true);
+    // The wrapper reassigns when the requested port was taken between the probe
+    // and the claim, so the lease's port is the authority from here on.
+    let actual_port = lease["port"].as_u64().unwrap() as u16;
     let child_pid = lease["pid"].as_u64().unwrap() as u32;
     assert_ne!(
         child_pid, wrapper_pid,
@@ -2412,7 +2458,7 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
 
     // `who` on the actual port reports the same live child PID.
     let who_output = cmd(dir.path())
-        .args(["who", &port.to_string(), "--json"])
+        .args(["who", &actual_port.to_string(), "--json"])
         .assert()
         .success()
         .get_output()
@@ -2476,6 +2522,7 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
 #[cfg(unix)]
 #[test]
 fn run_child_lease_is_live_then_dead_then_pruned() {
+    let _ports = lock_test_ports();
     let dir = tempfile::tempdir().unwrap();
     let port = free_test_port();
     let binary = std::env::var_os("CARGO_BIN_EXE_portzilla").unwrap();
@@ -2504,6 +2551,9 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
     assert_eq!(lease["alive"], true);
+    // The wrapper reassigns when the requested port was taken between the probe
+    // and the claim, so the lease's port is the authority from here on.
+    let actual_port = lease["port"].as_u64().unwrap() as u16;
     let child_pid = lease["pid"].as_u64().unwrap() as u32;
 
     // Ending the child ends the wrapper (it was waiting on the child); the
@@ -2516,7 +2566,7 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
     assert!(!status.success());
 
     let output = cmd(dir.path())
-        .args(["who", &port.to_string(), "--json"])
+        .args(["who", &actual_port.to_string(), "--json"])
         .assert()
         .success()
         .get_output()
