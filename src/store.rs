@@ -1153,9 +1153,15 @@ pub(crate) fn find_next_available_port(
 /// reliable localhost coordination. IPv6 is optional on some platforms, so
 /// unavailable IPv6 addresses are treated as unprobeable rather than occupied.
 pub(crate) fn is_os_port_free(port: u16) -> bool {
-    if TcpListener::bind(("0.0.0.0", port)).is_err()
-        || TcpListener::bind(("127.0.0.1", port)).is_err()
-    {
+    // One listener at a time: holding the wildcard listener while probing the
+    // loopback address makes the second bind fail with `AddrInUse` on the very
+    // port this call just proved free, so a free port was reported occupied
+    // whenever another caller probed the same port concurrently. Each listener
+    // is therefore dropped before the next probe starts.
+    if TcpListener::bind(("0.0.0.0", port)).is_err() {
+        return false;
+    }
+    if TcpListener::bind(("127.0.0.1", port)).is_err() {
         return false;
     }
 
@@ -1211,34 +1217,18 @@ mod tests {
         SystemPidChecker,
         test_support::{AlivePids, AliveWithoutIdentity, AlwaysAlive, AlwaysDead, ProcessIdentity},
     };
-    use std::net::TcpListener;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
     fn unused_test_port() -> u16 {
-        TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        super::port_test_support::unused_port()
     }
 
     fn unused_adjacent_test_ports() -> (u16, u16) {
-        for _ in 0..100 {
-            let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let base = first.local_addr().unwrap().port();
-            if let Some(second) = base
-                .checked_add(1)
-                .and_then(|port| TcpListener::bind(("127.0.0.1", port)).ok())
-            {
-                drop(second);
-                drop(first);
-                return (base, base + 1);
-            }
-        }
-        panic!("could not select adjacent test ports");
+        super::port_test_support::unused_adjacent_ports()
     }
 
     // ---- resolve_data_dir ----
@@ -1465,6 +1455,7 @@ mod tests {
 
     #[test]
     fn claim_persists_and_is_visible_from_a_new_store_instance() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let port = unused_test_port();
         let store_a = Store::open(Some(dir.path().to_path_buf())).unwrap();
@@ -1481,6 +1472,7 @@ mod tests {
 
     #[test]
     fn state_file_writes_a_versioned_envelope() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let port = unused_test_port();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
@@ -1533,6 +1525,7 @@ mod tests {
 
     #[test]
     fn verified_identity_persists_and_remains_alive_after_reload() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let checker = ProcessIdentity {
             pid: 100,
@@ -1557,6 +1550,7 @@ mod tests {
 
     #[test]
     fn unresolved_identity_persists_as_unverified_and_is_not_alive_after_reload() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let port = unused_test_port();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
@@ -1577,6 +1571,7 @@ mod tests {
 
     #[test]
     fn nonexistent_pid_claim_is_persisted_as_unverified_and_dead() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let port = unused_test_port();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
@@ -1600,6 +1595,7 @@ mod tests {
 
     #[test]
     fn dead_requested_lease_is_removed_when_its_port_is_os_occupied() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let requested_port = unused_test_port();
         let listener = TcpListener::bind(("127.0.0.1", requested_port)).unwrap();
@@ -1708,7 +1704,7 @@ mod tests {
 
     #[test]
     fn is_os_port_free_reports_ipv4_loopback_listener_as_taken() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener = super::port_test_support::bind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
         let port = listener.local_addr().unwrap().port();
 
         assert!(!is_os_port_free(port));
@@ -1718,7 +1714,7 @@ mod tests {
 
     #[test]
     fn is_os_port_free_reports_ipv4_wildcard_listener_as_taken() {
-        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let listener = super::port_test_support::bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).unwrap();
         let port = listener.local_addr().unwrap().port();
 
         assert!(!is_os_port_free(port));
@@ -1728,17 +1724,9 @@ mod tests {
 
     #[test]
     fn is_os_port_free_reports_ipv6_wildcard_listener_as_taken() {
-        let listener = match std::net::TcpListener::bind(("::", 0)) {
-            Ok(listener) => listener,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-                ) =>
-            {
-                return;
-            }
-            Err(error) => panic!("failed to bind IPv6 wildcard test listener: {error}"),
+        let Some(listener) = super::port_test_support::bind(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        else {
+            return;
         };
         let port = listener.local_addr().unwrap().port();
 
@@ -1749,17 +1737,8 @@ mod tests {
 
     #[test]
     fn is_os_port_free_reports_ipv6_loopback_listener_as_taken() {
-        let listener = match std::net::TcpListener::bind(("::1", 0)) {
-            Ok(listener) => listener,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-                ) =>
-            {
-                return;
-            }
-            Err(error) => panic!("failed to bind IPv6 loopback test listener: {error}"),
+        let Some(listener) = super::port_test_support::bind(IpAddr::V6(Ipv6Addr::LOCALHOST)) else {
+            return;
         };
         let port = listener.local_addr().unwrap().port();
 
@@ -1822,6 +1801,7 @@ mod tests {
 
     #[test]
     fn claim_free_port_creates_a_lease() {
+        let _ports = super::port_test_support::lock();
         let mut leases = vec![];
         let port = unused_test_port();
         let outcome = claim_in_place(
@@ -1842,6 +1822,7 @@ mod tests {
 
     #[test]
     fn claim_os_occupied_port_reassigns_and_reports_os_occupancy() {
+        let _ports = super::port_test_support::lock();
         let base = unused_test_port();
         let listener = TcpListener::bind(("127.0.0.1", base)).unwrap();
         let mut leases = vec![];
@@ -1888,6 +1869,7 @@ mod tests {
 
     #[test]
     fn claim_records_the_target_process_identity() {
+        let _ports = super::port_test_support::lock();
         let mut leases = vec![];
         let port = unused_test_port();
         let outcome = claim_in_place(
@@ -1908,6 +1890,7 @@ mod tests {
 
     #[test]
     fn claim_without_resolved_process_identity_is_not_alive() {
+        let _ports = super::port_test_support::lock();
         let mut leases = vec![];
         let port = unused_test_port();
         let outcome = claim_in_place(
@@ -1925,6 +1908,7 @@ mod tests {
 
     #[test]
     fn claim_replaces_a_dead_lease_on_the_same_port() {
+        let _ports = super::port_test_support::lock();
         let port = unused_test_port();
         let mut leases = vec![Lease::new(port, 999, "stale-owner", None)];
         let outcome = claim_in_place(
@@ -1986,6 +1970,7 @@ mod tests {
 
     #[test]
     fn claim_with_recycled_pid_replaces_stale_same_pid_lease() {
+        let _ports = super::port_test_support::lock();
         let port = unused_test_port();
         let mut leases = vec![Lease::new_with_process_start_time(
             port,
@@ -2036,6 +2021,7 @@ mod tests {
 
     #[test]
     fn claim_reassignment_reuses_a_port_whose_lease_is_dead() {
+        let _ports = super::port_test_support::lock();
         let base = unused_test_port();
         // base: live lease owned by someone else (conflict).
         // base + 1: dead lease candidate; OS occupancy may move the claim farther.
@@ -2223,6 +2209,7 @@ mod tests {
 
     #[test]
     fn store_prune_persists_removal_of_dead_leases_only() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let (alive_port, dead_port) = unused_adjacent_test_ports();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
@@ -2261,6 +2248,7 @@ mod tests {
 
     #[test]
     fn store_prune_with_nothing_dead_returns_empty_and_exits_cleanly() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         store
@@ -2305,6 +2293,7 @@ mod tests {
 
     #[test]
     fn claim_accepts_a_tag_at_exactly_the_limit() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
 
@@ -2340,6 +2329,7 @@ mod tests {
 
     #[test]
     fn claim_accepts_a_session_at_exactly_the_limit() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
 
@@ -2384,6 +2374,7 @@ mod tests {
 
     #[test]
     fn claim_limits_count_characters_not_bytes() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
 
@@ -2406,6 +2397,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claim_leaves_the_data_dir_and_state_file_with_owner_only_permissions() {
+        let _ports = super::port_test_support::lock();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2856,6 +2848,7 @@ mod tests {
 
     #[test]
     fn claim_reports_created_without_prior_lease() {
+        let _ports = super::port_test_support::lock();
         let port = unused_test_port();
         let mutation = assert_claim_disposition(
             Vec::new(),
@@ -2870,6 +2863,7 @@ mod tests {
 
     #[test]
     fn claim_reports_updated_with_prior_lease() {
+        let _ports = super::port_test_support::lock();
         let port = unused_test_port();
         let prior = Lease::new(port, 100, "old", None);
         let mutation = assert_claim_disposition(
@@ -2885,6 +2879,7 @@ mod tests {
 
     #[test]
     fn claim_reports_replaced_dead_with_prior_lease() {
+        let _ports = super::port_test_support::lock();
         for _ in 0..100 {
             let port = unused_test_port();
             let prior = Lease::new(port, 100, "old", None);
@@ -2910,6 +2905,7 @@ mod tests {
 
     #[test]
     fn claim_reports_reassigned_lease_conflict() {
+        let _ports = super::port_test_support::lock();
         let (port, _) = unused_adjacent_test_ports();
         let prior = Lease::new(port, 100, "old", None);
         let mutation = assert_claim_disposition(
@@ -2925,6 +2921,7 @@ mod tests {
 
     #[test]
     fn claim_reports_reassigned_os_occupied() {
+        let _ports = super::port_test_support::lock();
         let (port, _) = unused_adjacent_test_ports();
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let mutation = assert_claim_disposition(
@@ -2940,6 +2937,7 @@ mod tests {
 
     #[test]
     fn claim_reassignment_preserves_stale_destination_snapshot() {
+        let _ports = super::port_test_support::lock();
         for _ in 0..100 {
             let (requested_port, destination_port) = unused_adjacent_test_ports();
             let prior = Lease::new(requested_port, 100, "requested", None);
@@ -2962,6 +2960,7 @@ mod tests {
 
     #[test]
     fn claim_persists_lease_and_claim_event_together() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         let port = unused_test_port();
@@ -3006,6 +3005,7 @@ mod tests {
 
     #[test]
     fn claim_with_invalid_actor_does_not_write_lease_or_event() {
+        let _ports = super::port_test_support::lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(Some(dir.path().to_path_buf())).unwrap();
         let original = write_v3_fixture(&store, 1, &[]);
@@ -3484,5 +3484,109 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(store.state_file_path()).unwrap(), original);
+    }
+}
+
+/// Test-only port allocator over a dedicated, non-ephemeral range.
+///
+/// Tests that need a port to stay free cannot use OS-assigned ephemeral
+/// ports. `bind(("127.0.0.1", 0))` returns the port to the shared pool the
+/// moment the listener drops, so a parallel test can take it before the
+/// caller's assertion runs. That race made the full suite fail intermittently
+/// (see issue #17) even though nothing was wrong with the product.
+///
+/// Candidates come from a process-wide counter, so no two tests in one run are
+/// ever handed the same port. The range sits outside every platform's
+/// ephemeral range (49152-65535 on macOS and Windows, 32768-60999 on Linux),
+/// so an unrelated `bind(..., 0)` in this process or another one cannot land on
+/// a port handed out here. It also stays clear of the fixed ports other tests
+/// pin (21000, 22000, 24000-24300, 25100, and the 4xxx ports the CLI tests use).
+#[cfg(test)]
+pub(crate) mod port_test_support {
+    use super::is_os_port_free;
+    use std::net::{IpAddr, SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    const BASE: u16 = 10_000;
+    const SPAN: u32 = 10_000;
+    /// Ports advance in pairs so a single-port handout can never collide with
+    /// the successor of another handout, and an adjacent pair can never
+    /// overlap a neighbour. Without that, `unused_port()` returning `X` and
+    /// `unused_adjacent_ports()` returning `(X, X + 1)` are each unique but
+    /// `unused_port()` returning `X + 1` breaks the pair's promise.
+    const STRIDE: u32 = 2;
+
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes the tests that need a port to stay free.
+    ///
+    /// A unique handout is not enough on its own: the product's conflict walk
+    /// can move an actual bind from the port a test asked for onto a
+    /// neighbour, which may be another test's reserved successor. Holding this
+    /// for the body of every port-sensitive test makes the whole class of
+    /// interference impossible, at the cost of running those tests one at a
+    /// time. Poisoning is ignored: one failing test must not cascade into
+    /// unrelated failures.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        PORT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns the next test-range slot, panicking on exhaustion instead of
+    /// wrapping onto a port an earlier handout may still be using.
+    fn next_slot() -> u16 {
+        let offset = NEXT.fetch_add(STRIDE, Ordering::Relaxed);
+        assert!(
+            offset < SPAN,
+            "test port pool exhausted: more than {} handouts in one run",
+            SPAN / STRIDE
+        );
+        BASE + offset as u16
+    }
+
+    /// Yields candidates no other handout in this process can return.
+    fn candidates() -> impl Iterator<Item = u16> {
+        (0..SPAN / STRIDE).map(|_| next_slot())
+    }
+
+    /// Returns a port that is free by the same probe the product uses.
+    pub(crate) fn unused_port() -> u16 {
+        for port in candidates() {
+            if is_os_port_free(port) {
+                return port;
+            }
+        }
+        panic!(
+            "no free port in the {BASE}..{} test range",
+            BASE + SPAN as u16
+        );
+    }
+
+    /// Returns two adjacent ports, both free by the product probe.
+    pub(crate) fn unused_adjacent_ports() -> (u16, u16) {
+        for port in candidates() {
+            let second = port + 1;
+            if is_os_port_free(port) && is_os_port_free(second) {
+                return (port, second);
+            }
+        }
+        panic!(
+            "no adjacent free ports in the {BASE}..{} test range",
+            BASE + SPAN as u16
+        );
+    }
+
+    /// Binds a listener on a dedicated test port. `None` means the address is
+    /// unavailable on this host (for example IPv6 disabled).
+    pub(crate) fn bind(address: IpAddr) -> Option<TcpListener> {
+        for port in candidates() {
+            if let Ok(listener) = TcpListener::bind(SocketAddr::new(address, port)) {
+                return Some(listener);
+            }
+        }
+        None
     }
 }
