@@ -691,6 +691,12 @@ mod tests {
         }
     }
 
+    impl TempStore {
+        fn dir_path(&self) -> PathBuf {
+            self._dir.path().to_path_buf()
+        }
+    }
+
     fn temp_store() -> TempStore {
         let dir = tempfile::tempdir().unwrap();
         let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
@@ -920,6 +926,169 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn claim_inputs_at_the_limits_are_accepted() {
+        let store = temp_store();
+        let max_key = "k".repeat(MAX_INTENT_KEY_CHARS);
+        let max_session = "s".repeat(MAX_SESSION_CHARS);
+
+        store.claim(&max_key, &max_session, 1_000, 1_800).unwrap();
+        assert_eq!(store.get(&max_key).unwrap().unwrap().session, max_session);
+    }
+
+    #[test]
+    fn claim_inputs_beyond_the_limits_are_rejected() {
+        let store = temp_store();
+        let long_key = "k".repeat(MAX_INTENT_KEY_CHARS + 1);
+        let long_session = "s".repeat(MAX_SESSION_CHARS + 1);
+
+        let err = store
+            .claim(&long_key, "session-a", 1_000, 1_800)
+            .unwrap_err();
+        assert!(matches!(err, IntentError::Invalid(message) if message.contains("at most")));
+
+        let err = store
+            .claim("repo:a.rs", &long_session, 1_000, 1_800)
+            .unwrap_err();
+        assert!(matches!(err, IntentError::Invalid(message) if message.contains("at most")));
+    }
+
+    #[test]
+    fn empty_inputs_and_a_non_future_expiry_are_rejected() {
+        let store = temp_store();
+        assert!(matches!(
+            store.claim("", "session-a", 1_000, 1_800).unwrap_err(),
+            IntentError::Invalid(message) if message.contains("key must not be empty")
+        ));
+        assert!(matches!(
+            store.claim("repo:a.rs", "", 1_000, 1_800).unwrap_err(),
+            IntentError::Invalid(message) if message.contains("session must not be empty")
+        ));
+        for expires_at in [1_000, 999] {
+            let err = store
+                .claim("repo:a.rs", "session-a", 1_000, expires_at)
+                .unwrap_err();
+            assert!(
+                matches!(err, IntentError::Invalid(message) if message.contains("must be after"))
+            );
+        }
+        assert!(store.get("repo:a.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_intents_file_reports_the_cause_chain_without_panicking() {
+        let store = temp_store();
+        let original = b"{ this is not json".to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        let err = store.get("repo:a.rs").unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("contains invalid JSON"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn unsupported_format_version_is_rejected_without_rewriting() {
+        let store = temp_store();
+        let original = br#"{"format_version":99,"intents":[]}"#.to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        let err = store.get("repo:a.rs").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported intents file format version 99"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_stored_keys_are_rejected_without_rewriting() {
+        let store = temp_store();
+        let original = br#"{"format_version":1,"intents":[
+            {"key":"repo:a.rs","session":"session-a","created_at":1,"expires_at":1800},
+            {"key":"repo:a.rs","session":"session-b","created_at":2,"expires_at":1800}
+        ]}"#
+        .to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        // Use the write path to prove a rejected read never clobbers the file.
+        let err = store
+            .claim("repo:new.rs", "session-c", 1_000, 2_000)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("duplicate intent key"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn expiry_boundary_is_exclusive_for_list_and_claim() {
+        let store = temp_store();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+
+        // At exactly `expires_at` the record is no longer visible...
+        assert!(store.list(1_800).unwrap().is_empty());
+        // ...and a different session may take it at that instant.
+        store.claim("repo:a.rs", "session-b", 1_800, 2_800).unwrap();
+        assert_eq!(
+            store.get("repo:a.rs").unwrap().unwrap().session,
+            "session-b"
+        );
+    }
+
+    #[test]
+    fn a_second_store_handle_sees_claims_from_the_first() {
+        let store = temp_store();
+        let peer = IntentStore::open(Some(store.dir_path())).unwrap();
+        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+
+        let got = peer.get("repo:a.rs").unwrap().unwrap();
+        assert_eq!(got.session, "session-a");
+    }
+
+    const RACING_SESSIONS: usize = 8;
+
+    #[test]
+    fn concurrent_claims_of_one_key_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let store = temp_store();
+        let shared = Arc::new(store.store.clone());
+        let barrier = Arc::new(Barrier::new(RACING_SESSIONS));
+        let handles: Vec<_> = (0..RACING_SESSIONS)
+            .map(|index| {
+                let store = Arc::clone(&shared);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let session = format!("session-{index}");
+                    store
+                        .claim("repo:a.rs", &session, 1_000, 1_800)
+                        .map(|_| session)
+                })
+            })
+            .collect();
+
+        let winners: Vec<String> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "expected exactly one winner, got {winners:?}"
+        );
+
+        let raw = fs::read_to_string(store.state_file_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["intents"].as_array().unwrap().len(), 1);
+        assert_eq!(store.get("repo:a.rs").unwrap().unwrap().session, winners[0]);
     }
 
     /// A repository plus one linked worktree, both containing `src/auth.rs`.
