@@ -1238,7 +1238,7 @@ mod tests {
             common_dir.display()
         );
         assert!(
-            main_key.ends_with(":src/auth.rs"),
+            main_key.ends_with(&format!(":{}", Path::new("src/auth.rs").display())),
             "unexpected key {main_key}"
         );
     }
@@ -1299,7 +1299,7 @@ mod tests {
         assert_eq!(relative, absolute);
         assert_eq!(relative, unresolved);
         assert!(
-            relative.ends_with(":src/brand_new.rs"),
+            relative.ends_with(&format!(":{}", Path::new("src/brand_new.rs").display())),
             "unexpected key {relative}"
         );
     }
