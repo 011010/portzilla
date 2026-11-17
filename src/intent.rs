@@ -59,10 +59,15 @@ use std::process::Command;
 const INTENT_FORMAT_VERSION: u32 = 1;
 
 /// Upper bound on a normalized intent key, in CHARACTERS. A key normally
-/// holds a repository path plus a relative path; 8192 characters is far
-/// beyond any legitimate value and keeps a hostile hook payload from growing
-/// `intents.json` (and every listing) without limit.
+/// holds a repository path plus a relative path; 8192 characters is far beyond
+/// any legitimate value. This bounds the size of a single record, not the file:
+/// the number of records is bounded separately by [`MAX_INTENTS`] and reaping.
 pub const MAX_INTENT_KEY_CHARS: usize = 8192;
+
+/// Maximum number of records `intents.json` may hold. Matches the 65,536-entry
+/// port-space precedent: far beyond the number of files a set of agent sessions
+/// edits inside one TTL window, while keeping a single listing bounded.
+const MAX_INTENTS: usize = 65_536;
 
 /// A claim that `session` is editing `key` until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +271,8 @@ pub enum IntentError {
         requester: String,
         expires_at: u64,
     },
+    /// The store already holds the maximum number of records.
+    Capacity { max: usize },
     /// The caller passed an input this store refuses.
     Invalid(String),
     /// The underlying locked store failed.
@@ -289,6 +296,10 @@ impl fmt::Display for IntentError {
             } => write!(
                 formatter,
                 "cannot release file intent for {key}: it is owned by session {holder}, not by session {requester}"
+            ),
+            Self::Capacity { max } => write!(
+                formatter,
+                "intent store already holds the maximum of {max} records"
             ),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Store(error) => write!(formatter, "{error:#}"),
@@ -365,7 +376,9 @@ impl IntentStore {
     ///
     /// While the file is open for writing, expired records for other keys are
     /// dropped too. `claim` is the only operation allowed to delete records it
-    /// does not own, so it doubles as the reaper.
+    /// does not own, so it doubles as the reaper. A new key is refused once the
+    /// store holds [`MAX_INTENTS`] records; refreshing an existing key still
+    /// works at the cap because it replaces its own record.
     pub fn claim(
         &self,
         key: &str,
@@ -404,6 +417,9 @@ impl IntentStore {
         // Expired entries are reaped here, including an expired record for
         // `key`, which the new intent below replaces.
         intents.retain(|stored| stored.key == key || stored.is_live_at(now));
+        if position.is_none() && intents.len() >= MAX_INTENTS {
+            return Err(IntentError::Capacity { max: MAX_INTENTS });
+        }
         match intents.iter().position(|stored| stored.key == key) {
             Some(index) => intents[index] = intent.clone(),
             None => intents.push(intent.clone()),
@@ -600,10 +616,19 @@ fn validate_claim_inputs(key: &str, session: &str, now: u64, expires_at: u64) ->
     Ok(())
 }
 
-/// Rejects a persisted file with two records for one key: the store's core
-/// invariant is one owner per key, so such a file is corrupt rather than a
-/// list of competing claims. The file is left untouched on rejection.
+/// Rejects a persisted file that violates the store's invariants: more records
+/// than [`MAX_INTENTS`], or two records for one key. The first is a resource
+/// bound, so a corrupted or hostile file cannot force `list` to materialize
+/// millions of entries; the second is the single-owner rule, so such a file is
+/// corrupt rather than a list of competing claims. The file is left untouched
+/// on rejection.
 fn validate_stored_intents(intents: &[Intent], path: &Path) -> Result<()> {
+    if intents.len() > MAX_INTENTS {
+        bail!(
+            "intents file at {} contains more than {MAX_INTENTS} records and was not modified",
+            path.display()
+        );
+    }
     let mut keys = std::collections::HashSet::with_capacity(intents.len());
     for intent in intents {
         if !keys.insert(intent.key.as_str()) {
@@ -670,6 +695,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
         TempStore { _dir: dir, store }
+    }
+
+    /// Writes `count` synthetic records directly, bypassing `claim` so a full
+    /// store can be reached without thousands of write cycles.
+    fn seed_intents_file(store: &IntentStore, count: usize, expires_at: u64) {
+        let intents: Vec<Intent> = (0..count)
+            .map(|index| Intent {
+                key: format!("repo:file{index}.rs"),
+                session: format!("session-{index}"),
+                created_at: 1_000,
+                expires_at,
+            })
+            .collect();
+        let json = serde_json::to_vec(&StoredIntents {
+            format_version: INTENT_FORMAT_VERSION,
+            intents,
+        })
+        .unwrap();
+        fs::write(store.state_file_path(), json).unwrap();
     }
 
     #[test]
@@ -839,6 +883,43 @@ mod tests {
         assert_eq!(keys, ["format_version", "intents"]);
         assert_eq!(value["format_version"].as_u64(), Some(1));
         assert_eq!(value["intents"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_new_key_is_refused_when_the_store_is_full() {
+        let store = temp_store();
+        seed_intents_file(&store, MAX_INTENTS, 10_000);
+        let before = fs::read(store.state_file_path()).unwrap();
+
+        let err = store
+            .claim("repo:new.rs", "session-new", 1_000, 2_000)
+            .unwrap_err();
+        assert!(matches!(err, IntentError::Capacity { max: MAX_INTENTS }));
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+
+        // An existing key still refreshes: it replaces its own record, so the
+        // record count does not grow.
+        store
+            .claim("repo:file0.rs", "session-0", 1_000, 20_000)
+            .unwrap();
+        assert_eq!(
+            store.get("repo:file0.rs").unwrap().unwrap().expires_at,
+            20_000
+        );
+    }
+
+    #[test]
+    fn a_file_above_the_record_cap_reads_as_an_error() {
+        let store = temp_store();
+        seed_intents_file(&store, MAX_INTENTS + 1, 10_000);
+        let before = fs::read(store.state_file_path()).unwrap();
+
+        let err = store.list(1_000).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("more than 65536 records"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
     }
 
     /// A repository plus one linked worktree, both containing `src/auth.rs`.
