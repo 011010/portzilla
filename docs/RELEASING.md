@@ -6,6 +6,17 @@ Add an npm granular access token scoped to the `portzilla` package with Read and
 
 Leave either variable unset or set it to `false` to skip that registry. The release workflow will still build, smoke-test, and upload all binary assets.
 
+## Dependency policy
+
+The RustSec audit step in `ci.yml` reads a database that changes independently of this repository. A commit that was green yesterday can turn red today with no code change: that is exactly what happened in #15 and again in #19, when three advisories for the same `rmcp` release appeared at once.
+
+The policy is therefore to stay *ahead* of the database rather than react to it:
+
+- **Cargo dependencies** get a weekly grouped Dependabot PR (minor and patch together, major versions separate) so a routine week is one reviewable diff. Security updates are deliberately left ungrouped: they should stand out in the PR list, not hide inside a routine bump.
+- **GitHub Actions** are bumped monthly. A stale action is the same supply-chain risk one layer up.
+- **Advisories are never ignored in bulk.** If an advisory must be ignored, add it to the audit step with a comment naming the reason and the version that removes the need, and open an issue to track it. An ignore with no expiry is how a real vulnerability gets forgotten.
+- **A red audit blocks the merge.** Do not `--admin` past it and do not mark the step `continue-on-error`: the failure is the signal that a dependency needs bumping, and the fix is a one-line PR like #20.
+
 ## Release checklist
 
 1. Update the version in `Cargo.toml` and `package.json` to the same value, then let Cargo update the root package entry in `Cargo.lock`.

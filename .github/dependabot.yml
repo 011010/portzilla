@@ -1,0 +1,44 @@
+version: 2
+
+updates:
+  # Cargo dependencies. Weekly, grouped so a typical week produces one reviewable
+  # PR instead of a dozen. Security advisories are patched by the ecosystem's own
+  # release cadence; the point of this entry is to be *current* so that a new
+  # RustSec advisory lands against a version we have already left behind.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: fix(deps)
+      prefix-development: chore(deps)
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # Security updates stay ungrouped: they should be obvious in the PR list,
+    # not folded into a routine bump.
+    allow:
+      - dependency-type: all
+
+  # GitHub Actions used by this repository. A stale action is a supply-chain
+  # risk of the same kind the RustSec audit exists to catch, one layer up.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      github-actions:
+        patterns:
+          - "*"
