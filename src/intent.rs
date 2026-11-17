@@ -30,7 +30,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 /// Version of the `intents.json` envelope. Bump it when the stored shape
 /// changes incompatibly so an older binary refuses to touch a newer file
@@ -73,6 +74,140 @@ impl Intent {
 struct StoredIntents {
     format_version: u32,
     intents: Vec<Intent>,
+}
+
+/// Returns the intent key for `file` as seen from `cwd`.
+///
+/// Inside a git work tree the key is `<git-common-dir>:<repo-relative-path>`.
+/// Repository identity is the *common* dir, not the worktree root, so the same
+/// relative file in two linked worktrees of one repository produces one key —
+/// the collision this store exists to catch. Outside a git repository, or when
+/// any git call fails, the key is the normalized absolute path of `file`.
+///
+/// `git rev-parse --git-common-dir` may print a path relative to the current
+/// directory: `.git` at the top of the main worktree, `../../.git` from a
+/// nested one. The output is therefore joined onto `cwd` and canonicalized
+/// before it becomes part of a key. Without that resolution the main worktree
+/// and its linked worktrees would spell the same common dir differently and
+/// never collide. `--show-toplevel` is canonicalized for the same reason: git
+/// reports a resolved root (on macOS `/var` becomes `/private/var`) while a
+/// caller-supplied path may still hold symlinks.
+///
+/// The file does not need to exist yet — claiming a file about to be created is
+/// normal — so only the repository paths are canonicalized. A file outside the
+/// repository therefore keeps the caller's absolute path, lexically normalized;
+/// two callers that reach the same outside file through different symlinked
+/// spellings would produce different keys, which is an accepted limitation of
+/// the non-git fallback.
+#[allow(dead_code)]
+pub fn key_for_file(cwd: &Path, file: &Path) -> Result<String> {
+    let cwd = canonicalize_or_owned(cwd);
+    let absolute = absolute_path(&cwd, file);
+    let outside_git = || Ok(absolute.to_string_lossy().into_owned());
+
+    let Some(toplevel) = git_stdout(&cwd, &["rev-parse", "--show-toplevel"]) else {
+        return outside_git();
+    };
+    let Some(common_dir) = git_stdout(&cwd, &["rev-parse", "--git-common-dir"]) else {
+        return outside_git();
+    };
+
+    let toplevel = canonicalize_or_owned(Path::new(&toplevel));
+    let Some(relative) =
+        relative_to(&absolute, &toplevel).filter(|relative| !relative.as_os_str().is_empty())
+    else {
+        return outside_git();
+    };
+    let common_dir = resolve_common_dir(&cwd, Path::new(&common_dir));
+    Ok(format!(
+        "{}:{}",
+        common_dir.to_string_lossy(),
+        relative.to_string_lossy()
+    ))
+}
+
+/// Runs `git -C cwd <args>` and returns its output with the trailing newline
+/// removed. Returns `None` when git is missing, exits non-zero, or prints
+/// nothing: outside a repository that is a normal fallback, not an error.
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.trim_end_matches(['\r', '\n']);
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// Resolves the path printed by `rev-parse --git-common-dir`. Relative output
+/// is relative to `cwd` (the directory git was pointed at), and the result is
+/// canonicalized so every worktree of one repository agrees on one string.
+fn resolve_common_dir(cwd: &Path, printed: &Path) -> PathBuf {
+    if printed.is_absolute() {
+        canonicalize_or_owned(printed)
+    } else {
+        canonicalize_or_owned(&cwd.join(printed))
+    }
+}
+
+/// Returns the absolute, lexically normalized form of `file` relative to
+/// `cwd`. Symlinks inside the path are not resolved here; a file that does not
+/// exist yet cannot be canonicalized, and callers still need a stable key.
+fn absolute_path(cwd: &Path, file: &Path) -> PathBuf {
+    if file.is_absolute() {
+        return normalize_path(file);
+    }
+    // A relative `cwd` (rare, but valid) is first anchored to the process
+    // directory so the fallback key is always absolute.
+    let base = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(cwd))
+            .unwrap_or_else(|_| cwd.to_path_buf())
+    };
+    normalize_path(&base.join(file))
+}
+
+/// Lexically removes `.` and `..` components. Lexical resolution keeps a
+/// non-existent file claimable; a `..` that crosses a symlink can name a
+/// different directory than the OS would follow, which git's canonicalized
+/// toplevel corrects for in the common case of a relative key.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Returns `file` relative to `toplevel`, if it is inside. The direct attempt
+/// covers caller paths that are already resolved; canonicalizing the file is
+/// the fallback for a caller that reached the same file through a symlinked
+/// root.
+fn relative_to(file: &Path, toplevel: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = file.strip_prefix(toplevel) {
+        return Some(relative.to_path_buf());
+    }
+    let canonical = fs::canonicalize(file).ok()?;
+    canonical.strip_prefix(toplevel).ok().map(Path::to_path_buf)
+}
+
+/// Canonicalizes `path`, falling back to its lexical normalization when it
+/// cannot be resolved (for example because it does not exist yet).
+fn canonicalize_or_owned(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 /// Why an intent operation was refused.
@@ -388,12 +523,7 @@ impl IntentStore {
 /// for the same reason the lease store bounds its tags: these values are
 /// persisted and echoed back by every listing. `expires_at` must be in the
 /// future, otherwise the "claim" would be born expired and could never bind.
-fn validate_claim_inputs(
-    key: &str,
-    session: &str,
-    now: u64,
-    expires_at: u64,
-) -> IntentResult<()> {
+fn validate_claim_inputs(key: &str, session: &str, now: u64, expires_at: u64) -> IntentResult<()> {
     if key.is_empty() {
         return Err(IntentError::Invalid(
             "intent key must not be empty".to_string(),
@@ -473,6 +603,7 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::ops::Deref;
+    use std::process::Command;
 
     /// Owns the temporary directory alongside the store so the directory
     /// outlives every operation the test performs on it.
@@ -499,7 +630,9 @@ mod tests {
     fn claim_then_get_returns_the_same_intent() {
         let dir = tempfile::tempdir().unwrap();
         let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
-        store.claim("repo:src/auth.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:src/auth.rs", "session-a", 1_000, 1_800)
+            .unwrap();
         let got = store.get("repo:src/auth.rs").unwrap().unwrap();
         assert_eq!(got.session, "session-a");
         assert_eq!(got.expires_at, 1_800);
@@ -509,7 +642,9 @@ mod tests {
     fn other_session_cannot_claim_a_live_intent() {
         let store = temp_store();
         store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
-        let err = store.claim("repo:a.rs", "session-b", 1_100, 1_900).unwrap_err();
+        let err = store
+            .claim("repo:a.rs", "session-b", 1_100, 1_900)
+            .unwrap_err();
         assert!(matches!(err, IntentError::HeldBy { ref session, .. } if session == "session-a"));
     }
 
@@ -528,7 +663,10 @@ mod tests {
         let store = temp_store();
         store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
         store.claim("repo:a.rs", "session-b", 1_801, 3_601).unwrap();
-        assert_eq!(store.get("repo:a.rs").unwrap().unwrap().session, "session-b");
+        assert_eq!(
+            store.get("repo:a.rs").unwrap().unwrap().session,
+            "session-b"
+        );
     }
 
     #[test]
@@ -550,10 +688,111 @@ mod tests {
     #[test]
     fn list_keeps_live_entries_while_dropping_expired_ones() {
         let store = temp_store();
-        store.claim("repo:live.rs", "session-a", 1_000, 1_800).unwrap();
-        store.claim("repo:stale.rs", "session-b", 500, 1_500).unwrap();
+        store
+            .claim("repo:live.rs", "session-a", 1_000, 1_800)
+            .unwrap();
+        store
+            .claim("repo:stale.rs", "session-b", 500, 1_500)
+            .unwrap();
         let listed = store.list(1_600).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "repo:live.rs");
+    }
+
+    /// A repository plus one linked worktree, both containing `src/auth.rs`.
+    struct GitRepo {
+        root: tempfile::TempDir,
+        main: PathBuf,
+        linked: PathBuf,
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git must be installed to run the file-intent key tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_repo_with_worktree() -> GitRepo {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        fs::create_dir(&main).unwrap();
+        run_git(&main, &["init", "--quiet"]);
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(main.join("src/auth.rs"), "fn auth() {}\n").unwrap();
+        run_git(&main, &["add", "."]);
+        // Identity and signing flags are passed explicitly so a developer's
+        // global git config cannot make the fixture commit fail.
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.email=portzilla@example.com",
+                "-c",
+                "user.name=Portzilla Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        );
+        let linked = root.path().join("linked");
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked-worktree",
+                linked.to_str().unwrap(),
+            ],
+        );
+        GitRepo { root, main, linked }
+    }
+
+    #[test]
+    fn same_relative_file_in_two_worktrees_shares_a_key() {
+        let repo = git_repo_with_worktree();
+        let main_key = key_for_file(&repo.main, Path::new("src/auth.rs")).unwrap();
+        let linked_key = key_for_file(&repo.linked, Path::new("src/auth.rs")).unwrap();
+        assert_eq!(main_key, linked_key);
+        assert!(
+            main_key.ends_with(":src/auth.rs"),
+            "unexpected key {main_key}"
+        );
+    }
+
+    #[test]
+    fn outside_git_falls_back_to_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = key_for_file(dir.path(), Path::new("notes.md")).unwrap();
+        assert!(Path::new(&k).is_absolute() || k.contains(":/"));
+    }
+
+    #[test]
+    fn file_outside_the_repository_falls_back_to_its_absolute_path() {
+        let repo = git_repo_with_worktree();
+        let outside = repo.root.path().join("notes.md");
+        let key = key_for_file(&repo.main, &outside).unwrap();
+        assert_eq!(key, normalize_path(&outside).to_string_lossy());
+    }
+
+    #[test]
+    fn relative_paths_are_normalized_against_the_given_cwd() {
+        let repo = git_repo_with_worktree();
+        let from_root = key_for_file(&repo.main, Path::new("src/auth.rs")).unwrap();
+        let from_subdir = key_for_file(&repo.main.join("src"), Path::new("./auth.rs")).unwrap();
+        assert_eq!(from_root, from_subdir);
     }
 }
