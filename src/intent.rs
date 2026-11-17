@@ -34,12 +34,16 @@
 //! `claim` drops expired records for every key while it holds the lock. That is
 //! a deliberate divergence from [`Store`](crate::store::Store), which exposes an
 //! explicit `prune` instead of pruning as a side effect of `claim`. The
-//! tradeoff: reaping keeps `intents.json` bounded without a daemon and without a
-//! separate command for users to remember, at the cost of a mutating call doing
-//! housekeeping. That is only sound while `claim` is the store's only mutation
-//! path. If a second path is added (an `intent prune` command, a transfer, a
-//! bulk import), the reaping must move into that explicit operation and `claim`
-//! must stop doing it.
+//! tradeoff: reaping keeps `intents.json` free of stale entries without a daemon
+//! and without a separate command for users to remember, at the cost of a
+//! mutating call doing housekeeping.
+//!
+//! The safety rule is narrower than "only one mutation path": `claim` is the
+//! only operation allowed to delete records it does not own. `release` also
+//! mutates the file, but it removes only the caller's own record. If another
+//! operation ever needs to delete records it does not own (an `intent prune`
+//! command, a transfer, a bulk import), the reaping must move into that
+//! explicit operation and `claim` must stop doing it.
 
 use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
@@ -250,9 +254,18 @@ fn canonicalize_or_owned(path: &Path) -> PathBuf {
 #[allow(dead_code)]
 pub enum IntentError {
     /// Another live session owns the key.
-    HeldBy { session: String, expires_at: u64 },
+    HeldBy {
+        key: String,
+        holder: String,
+        expires_at: u64,
+    },
     /// A release was attempted by a session that does not own the key.
-    NotOwner { session: String, expires_at: u64 },
+    NotOwner {
+        key: String,
+        holder: String,
+        requester: String,
+        expires_at: u64,
+    },
     /// The caller passed an input this store refuses.
     Invalid(String),
     /// The underlying locked store failed.
@@ -262,22 +275,23 @@ pub enum IntentError {
 impl fmt::Display for IntentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HeldBy {
-                session,
-                expires_at,
-            } => write!(
-                formatter,
-                "file intent is held by session {session} until {expires_at}"
-            ),
+            Self::HeldBy { key, holder, .. } => {
+                write!(
+                    formatter,
+                    "file intent for {key} is held by session {holder}"
+                )
+            }
             Self::NotOwner {
-                session,
-                expires_at,
+                key,
+                holder,
+                requester,
+                ..
             } => write!(
                 formatter,
-                "file intent is held by session {session} until {expires_at}, not by the releasing session"
+                "cannot release file intent for {key}: it is owned by session {holder}, not by session {requester}"
             ),
             Self::Invalid(message) => formatter.write_str(message),
-            Self::Store(error) => write!(formatter, "{error}"),
+            Self::Store(error) => write!(formatter, "{error:#}"),
         }
     }
 }
@@ -343,16 +357,15 @@ impl IntentStore {
     ///
     /// The rules, applied while the exclusive lock is held:
     ///
-    /// - no record, or an expired one: open a new window starting at `now`
+    /// - no record, or a record that is not live at `now`: open a new window
+    ///   starting at `now`
     /// - the same session on a live record: refresh `expires_at` and keep the
     ///   original `created_at`, so the age of the claim stays visible
-    /// - a different session on a live record: refuse with
-    ///   [`IntentError::HeldBy`], naming the current holder
+    /// - a different live session: refuse with [`IntentError::HeldBy`]
     ///
     /// While the file is open for writing, expired records for other keys are
-    /// dropped too. `claim` is the only mutation path, so it doubles as the
-    /// reaper; that is what keeps `intents.json` bounded without a background
-    /// task.
+    /// dropped too. `claim` is the only operation allowed to delete records it
+    /// does not own, so it doubles as the reaper.
     pub fn claim(
         &self,
         key: &str,
@@ -363,26 +376,25 @@ impl IntentStore {
         validate_claim_inputs(key, session, now, expires_at)?;
         let _guard = self.lock_exclusive()?;
         let mut intents = self.read_intents_unlocked()?;
-        let existing = intents
-            .iter()
-            .find(|intent| intent.key == key)
-            .map(|intent| (intent.session.clone(), intent.created_at, intent.expires_at));
-        let intent = match existing {
-            Some((holder, _, holder_expires_at))
-                if holder_expires_at > now && holder != session =>
-            {
+        let position = intents.iter().position(|stored| stored.key == key);
+        let live_holder = position
+            .map(|index| intents[index].clone())
+            .filter(|stored| stored.is_live_at(now));
+        let intent = match live_holder {
+            Some(holder) if holder.session != session => {
                 return Err(IntentError::HeldBy {
-                    session: holder,
-                    expires_at: holder_expires_at,
+                    key: key.to_string(),
+                    holder: holder.session,
+                    expires_at: holder.expires_at,
                 });
             }
-            Some((_, created_at, holder_expires_at)) if holder_expires_at > now => Intent {
+            Some(holder) => Intent {
                 key: key.to_string(),
                 session: session.to_string(),
-                created_at,
+                created_at: holder.created_at,
                 expires_at,
             },
-            _ => Intent {
+            None => Intent {
                 key: key.to_string(),
                 session: session.to_string(),
                 created_at: now,
@@ -402,9 +414,9 @@ impl IntentStore {
 
     /// Returns the stored record for `key`, if any.
     ///
-    /// Expiry is deliberately NOT applied here: the caller supplies the clock
-    /// (`list(now)`, `claim(..., now, ...)`) so tests and hook adapters can use
-    /// synthetic timestamps. A record returned by `get` may already be expired.
+    /// This reports the record exactly as persisted, expiry included: it takes
+    /// no clock. Liveness is a caller concern — use [`IntentStore::list`] for
+    /// the live view at a given time.
     pub fn get(&self, key: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let intents = self.read_intents_unlocked()?;
@@ -432,11 +444,14 @@ impl IntentStore {
     /// Returns `Ok(None)` when no record exists: release is idempotent, so a
     /// session retrying after a crash does not have to tell "already gone" from
     /// success. A different session is refused with [`IntentError::NotOwner`],
-    /// naming the current holder.
+    /// naming the holder and the requester.
     ///
     /// Expiry is not consulted here because the call carries no clock. That is
     /// harmless: a lapsed record blocks nothing, since the next claim takes it
     /// over, and its owner may still release it early.
+    ///
+    /// This path must never reap: deleting a record this session does not own
+    /// would break the single-owner contract that makes `claim`'s reaping safe.
     pub fn release(&self, key: &str, session: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let mut intents = self.read_intents_unlocked()?;
@@ -446,7 +461,9 @@ impl IntentStore {
         let existing = &intents[index];
         if existing.session != session {
             return Err(IntentError::NotOwner {
-                session: existing.session.clone(),
+                key: key.to_string(),
+                holder: existing.session.clone(),
+                requester: session.to_string(),
                 expires_at: existing.expires_at,
             });
         }
@@ -657,8 +674,7 @@ mod tests {
 
     #[test]
     fn claim_then_get_returns_the_same_intent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
+        let store = temp_store();
         store
             .claim("repo:src/auth.rs", "session-a", 1_000, 1_800)
             .unwrap();
@@ -674,7 +690,17 @@ mod tests {
         let err = store
             .claim("repo:a.rs", "session-b", 1_100, 1_900)
             .unwrap_err();
-        assert!(matches!(err, IntentError::HeldBy { ref session, .. } if session == "session-a"));
+        let message = err.to_string();
+        assert!(message.contains("repo:a.rs"));
+        assert!(message.contains("session-a"));
+        assert!(matches!(
+            err,
+            IntentError::HeldBy {
+                ref key,
+                ref holder,
+                expires_at,
+            } if key == "repo:a.rs" && holder == "session-a" && expires_at == 1_800
+        ));
     }
 
     #[test]
@@ -703,10 +729,23 @@ mod tests {
         let store = temp_store();
         store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
         let err = store.release("repo:a.rs", "session-b").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("repo:a.rs"));
+        assert!(message.contains("session-a"));
+        assert!(message.contains("session-b"));
+        // Absolute expiries stay structured; they are not for human prose.
+        assert!(!message.contains("1800"));
         assert!(matches!(
             err,
-            IntentError::NotOwner { ref session, expires_at }
-                if session == "session-a" && expires_at == 1_800
+            IntentError::NotOwner {
+                ref key,
+                ref holder,
+                ref requester,
+                expires_at,
+            } if key == "repo:a.rs"
+                && holder == "session-a"
+                && requester == "session-b"
+                && expires_at == 1_800
         ));
         store.release("repo:a.rs", "session-a").unwrap();
         assert!(store.get("repo:a.rs").unwrap().is_none());
