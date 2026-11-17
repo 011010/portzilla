@@ -15,7 +15,7 @@ use crate::view::{to_claim_view, to_view};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -376,8 +376,8 @@ impl PortzillaMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PortzillaMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             // Deliberately NOT `Implementation::from_build_env()`: that
             // function's `env!()` calls are compiled into the `rmcp` crate
             // itself, so it always reports the SDK's own name/version
