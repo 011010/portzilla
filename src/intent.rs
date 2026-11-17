@@ -16,6 +16,10 @@
 //! `src/auth.rs` claimed from the main checkout and from a linked worktree
 //! share one key. That is exactly the collision this store exists to catch.
 //!
+//! Keys are opaque: [`key_for_file`] produces them and the store compares them,
+//! nothing parses them. The `:` separator is ambiguous on Windows
+//! (`C:\repo\.git:src\auth.rs`), so never split a key on it.
+//!
 //! # Expiry
 //!
 //! Every intent carries a `created_at` and an `expires_at` (Unix seconds). A
@@ -93,43 +97,38 @@ struct StoredIntents {
 /// Repository identity is the *common* dir, not the worktree root, so the same
 /// relative file in two linked worktrees of one repository produces one key —
 /// the collision this store exists to catch. Outside a git repository, or when
-/// any git call fails, the key is the normalized absolute path of `file`.
+/// any git call fails, the key is the canonical absolute path of `file`.
 ///
-/// `git rev-parse --git-common-dir` may print a path relative to the current
-/// directory: `.git` at the top of the main worktree, `../../.git` from a
-/// nested one. The output is therefore joined onto `cwd` and canonicalized
-/// before it becomes part of a key. Without that resolution the main worktree
-/// and its linked worktrees would spell the same common dir differently and
-/// never collide. `--show-toplevel` is canonicalized for the same reason: git
-/// reports a resolved root (on macOS `/var` becomes `/private/var`) while a
-/// caller-supplied path may still hold symlinks.
+/// Both sides of the key are canonicalized. Git needs its relative output
+/// resolved (`--git-common-dir` prints `.git` at the top of the main worktree
+/// and `../../.git` from a nested directory), and the file is resolved through
+/// its deepest existing component so a file that does not exist yet still gets
+/// the key its future self will have. Without that, two spellings of one
+/// location — `/var` versus `/private/var`, or a path through a symlinked
+/// directory — would produce different keys, and a peer's claim would be
+/// silently invisible.
 ///
-/// The file does not need to exist yet — claiming a file about to be created is
-/// normal — so only the repository paths are canonicalized. A file outside the
-/// repository therefore keeps the caller's absolute path, lexically normalized;
-/// two callers that reach the same outside file through different symlinked
-/// spellings would produce different keys, which is an accepted limitation of
-/// the non-git fallback.
+/// Keys are opaque and must never be parsed; see the module documentation.
 #[allow(dead_code)]
 pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     let cwd = canonicalize_or_owned(cwd);
-    let absolute = absolute_path(&cwd, file);
+    let absolute = canonicalize_deepest_existing(&absolute_path(&cwd, file));
     let outside_git = || absolute.to_string_lossy().into_owned();
 
-    let Some(toplevel) = git_stdout(&cwd, &["rev-parse", "--show-toplevel"]) else {
-        return outside_git();
-    };
-    let Some(common_dir) = git_stdout(&cwd, &["rev-parse", "--git-common-dir"]) else {
-        return outside_git();
-    };
-
-    let toplevel = canonicalize_or_owned(Path::new(&toplevel));
-    let Some(relative) =
-        relative_to(&absolute, &toplevel).filter(|relative| !relative.as_os_str().is_empty())
+    let Some(git_paths) = git_stdout(&cwd, &["rev-parse", "--show-toplevel", "--git-common-dir"])
     else {
         return outside_git();
     };
-    let common_dir = resolve_common_dir(&cwd, Path::new(&common_dir));
+    let mut lines = git_paths.lines();
+    let (Some(toplevel), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return outside_git();
+    };
+
+    let toplevel = canonicalize_or_owned(Path::new(toplevel));
+    let Some(relative) = relative_to(&absolute, &toplevel) else {
+        return outside_git();
+    };
+    let common_dir = resolve_common_dir(&cwd, Path::new(common_dir));
     format!(
         "{}:{}",
         common_dir.to_string_lossy(),
@@ -137,11 +136,18 @@ pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     )
 }
 
-/// Runs `git -C cwd <args>` and returns its output with the trailing newline
-/// removed. Returns `None` when git is missing, exits non-zero, or prints
-/// nothing: outside a repository that is a normal fallback, not an error.
+/// Runs `git -C cwd <args>` and returns the non-empty stdout with trailing
+/// newlines removed. Returns `None` when git is missing, exits non-zero, or
+/// prints nothing: outside a repository that is a normal fallback, not an
+/// error.
+///
+/// Plumbing variables are cleared from the child environment so a hook fired
+/// inside git tooling cannot override `-C` and change the resulting key.
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -151,8 +157,8 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.trim_end_matches(['\r', '\n']);
-    (!line.is_empty()).then(|| line.to_string())
+    let paths = stdout.trim_end_matches(['\r', '\n']);
+    (!paths.is_empty()).then(|| paths.to_string())
 }
 
 /// Resolves the path printed by `rev-parse --git-common-dir`. Relative output
@@ -166,9 +172,9 @@ fn resolve_common_dir(cwd: &Path, printed: &Path) -> PathBuf {
     }
 }
 
-/// Returns the absolute, lexically normalized form of `file` relative to
-/// `cwd`. Symlinks inside the path are not resolved here; a file that does not
-/// exist yet cannot be canonicalized, and callers still need a stable key.
+/// Returns `file` as an absolute path relative to `cwd`, normalized lexically.
+/// Symlinks are resolved afterwards, in [`canonicalize_deepest_existing`]; this
+/// step only anchors the path and removes `.` / `..` components.
 fn absolute_path(cwd: &Path, file: &Path) -> PathBuf {
     if file.is_absolute() {
         return normalize_path(file);
@@ -185,10 +191,9 @@ fn absolute_path(cwd: &Path, file: &Path) -> PathBuf {
     normalize_path(&base.join(file))
 }
 
-/// Lexically removes `.` and `..` components. Lexical resolution keeps a
-/// non-existent file claimable; a `..` that crosses a symlink can name a
-/// different directory than the OS would follow, which git's canonicalized
-/// toplevel corrects for in the common case of a relative key.
+/// Lexically removes `.` and `..` components. `..` that crosses a symlink can
+/// name a different directory than the OS would follow; the caller resolves the
+/// existing prefix afterwards, which corrects that wherever the target exists.
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -203,16 +208,29 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Returns `file` relative to `toplevel`, if it is inside. The direct attempt
-/// covers caller paths that are already resolved; canonicalizing the file is
-/// the fallback for a caller that reached the same file through a symlinked
-/// root.
+/// Resolves `path` through its deepest existing component and appends the
+/// non-existent remainder.
+///
+/// Claims are routinely made for a file that is about to be created, so the
+/// whole path cannot be canonicalized. Resolving the part that does exist is
+/// enough to make two spellings of one location agree: `/var` versus
+/// `/private/var` on macOS, or a path that crosses a symlinked directory.
+fn canonicalize_deepest_existing(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonicalize_deepest_existing(parent).join(name),
+        _ => normalize_path(path),
+    })
+}
+
+/// Returns `file` relative to `toplevel` when it is inside. Both sides are
+/// canonical by the time this runs — `file` through its deepest existing
+/// component and `toplevel` from git — so a lexical comparison is exact and no
+/// second canonicalization pass is needed.
 fn relative_to(file: &Path, toplevel: &Path) -> Option<PathBuf> {
-    if let Ok(relative) = file.strip_prefix(toplevel) {
-        return Some(relative.to_path_buf());
-    }
-    let canonical = fs::canonicalize(file).ok()?;
-    canonical.strip_prefix(toplevel).ok().map(Path::to_path_buf)
+    file.strip_prefix(toplevel)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
 /// Canonicalizes `path`, falling back to its lexical normalization when it
@@ -869,13 +887,15 @@ mod tests {
     }
 
     #[test]
-    fn outside_git_falls_back_to_absolute_path() {
+    fn outside_git_falls_back_to_an_absolute_path_both_ways() {
         let dir = tempfile::tempdir().unwrap();
-        let k = key_for_file(dir.path(), Path::new("notes.md"));
-        // The cwd is canonicalized before the file is joined onto it, so on
-        // macOS the `/var` → `/private/var` symlink is already resolved here.
         let expected = fs::canonicalize(dir.path()).unwrap().join("notes.md");
-        assert_eq!(k, expected.to_string_lossy());
+
+        let relative = key_for_file(dir.path(), Path::new("notes.md"));
+        let absolute = key_for_file(dir.path(), &dir.path().join("notes.md"));
+
+        assert_eq!(relative, expected.to_string_lossy());
+        assert_eq!(absolute, expected.to_string_lossy());
     }
 
     #[test]
@@ -883,7 +903,9 @@ mod tests {
         let repo = git_repo_with_worktree();
         let outside = repo.root.path().join("notes.md");
         let key = key_for_file(&repo.main, &outside);
-        assert_eq!(key, normalize_path(&outside).to_string_lossy());
+        // The fallback is the deep-canonicalized path, not the caller's spelling.
+        let expected = fs::canonicalize(repo.root.path()).unwrap().join("notes.md");
+        assert_eq!(key, expected.to_string_lossy());
     }
 
     #[test]
@@ -892,5 +914,36 @@ mod tests {
         let from_root = key_for_file(&repo.main, Path::new("src/auth.rs"));
         let from_subdir = key_for_file(&repo.main.join("src"), Path::new("./auth.rs"));
         assert_eq!(from_root, from_subdir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_does_not_change_the_key() {
+        let repo = git_repo_with_worktree();
+        std::os::unix::fs::symlink(".", repo.main.join("alias")).unwrap();
+
+        let direct = key_for_file(&repo.main, Path::new("src/auth.rs"));
+        let through_alias = key_for_file(&repo.main, Path::new("alias/src/auth.rs"));
+
+        assert_eq!(through_alias, direct);
+    }
+
+    #[test]
+    fn not_yet_created_file_agrees_across_relative_and_absolute_spellings() {
+        let repo = git_repo_with_worktree();
+        let canonical_main = fs::canonicalize(&repo.main).unwrap();
+
+        let relative = key_for_file(&repo.main, Path::new("src/brand_new.rs"));
+        let absolute = key_for_file(&repo.main, &canonical_main.join("src/brand_new.rs"));
+        // The raw spelling may hold symlinked roots (macOS `/var`), which is
+        // precisely the case that used to fall back to a second key.
+        let unresolved = key_for_file(&repo.main, &repo.main.join("src/brand_new.rs"));
+
+        assert_eq!(relative, absolute);
+        assert_eq!(relative, unresolved);
+        assert!(
+            relative.ends_with(":src/brand_new.rs"),
+            "unexpected key {relative}"
+        );
     }
 }
