@@ -116,9 +116,7 @@ impl PidChecker for SystemPidChecker {
     fn process_start_time(&self, pid: u32) -> Option<u64> {
         use sysinfo::{Pid, ProcessesToUpdate};
 
-        let Some(mut system) = fresh_process_table() else {
-            return None;
-        };
+        let mut system = fresh_process_table()?;
         system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
         system
             .process(Pid::from_u32(pid))
