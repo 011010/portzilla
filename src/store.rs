@@ -206,15 +206,17 @@ pub struct ReleaseOutcome {
 /// A locked JSON-backed store of leases rooted at a resolved data directory.
 ///
 /// `Clone` is cheap and intentional: the store carries no in-memory state of
-/// its own (`data_dir` is the only field) — every read-modify-write goes
-/// through the on-disk lock, so cloning just shares the same path, the same
-/// way opening a second `Store` pointed at the same directory would. This is
-/// what lets the MCP server hand a `Store` to its `Clone`-bound handler type
-/// without wrapping it in an `Arc` for no reason.
+/// its own — every field is configuration (`data_dir`, the file seam, and
+/// the port probe) and every read-modify-write goes through the on-disk lock,
+/// so cloning just shares the same path, the same way opening a second
+/// `Store` pointed at the same directory would. This is what lets the MCP
+/// server hand a `Store` to its `Clone`-bound handler type without wrapping
+/// it in an `Arc` for no reason.
 #[derive(Clone)]
 pub struct Store {
     data_dir: PathBuf,
     file_ops: Arc<dyn FileOps>,
+    probe: Arc<dyn PortProbe>,
 }
 
 impl Store {
@@ -261,6 +263,7 @@ impl Store {
         let store = Self {
             data_dir,
             file_ops: Arc::new(RealFileOps),
+            probe: Arc::new(OsPortProbe),
         };
         store.ensure_data_dir()?;
         Ok(store)
@@ -433,6 +436,7 @@ impl Store {
                 tag,
                 session,
                 checker,
+                self.probe.as_ref(),
             )?;
             let draft = AuditEventDraft {
                 actor,
@@ -896,7 +900,15 @@ impl Store {
         let _guard = self.lock_exclusive()?;
         hook();
         let mut leases = self.read_leases()?;
-        let outcome = claim_in_place(&mut leases, requested_port, pid, tag, session, checker)?;
+        let outcome = claim_in_place(
+            &mut leases,
+            requested_port,
+            pid,
+            tag,
+            session,
+            checker,
+            self.probe.as_ref(),
+        )?;
         self.write_v2_leases(&leases)?;
         Ok(outcome.outcome)
     }
@@ -958,6 +970,7 @@ pub(crate) fn claim_in_place(
     tag: String,
     session: Option<String>,
     checker: &dyn PidChecker,
+    probe: &dyn PortProbe,
 ) -> Result<ClaimMutation> {
     let process_start_time = checker.process_start_time(pid);
     let existing_index = leases.iter().position(|l| l.port == requested_port);
@@ -965,7 +978,7 @@ pub(crate) fn claim_in_place(
     match existing_index {
         None => {
             let (port, reassignment_reason) =
-                resolve_claim_port(requested_port, leases, checker, false)?;
+                resolve_claim_port(requested_port, leases, checker, probe, false)?;
             let lease =
                 Lease::new_with_process_start_time(port, pid, tag, session, process_start_time);
             upsert_lease(leases, lease.clone());
@@ -1011,7 +1024,7 @@ pub(crate) fn claim_in_place(
         Some(index) if leases[index].is_alive(checker) => {
             let prior_lease = leases[index].clone();
             let (next_port, reassignment_reason) =
-                resolve_claim_port(requested_port, leases, checker, true)?;
+                resolve_claim_port(requested_port, leases, checker, probe, true)?;
             let replaced_lease = leases
                 .iter()
                 .find(|lease| lease.port == next_port && !lease.is_alive(checker))
@@ -1043,7 +1056,7 @@ pub(crate) fn claim_in_place(
             // Dead lease on the requested port: prune it and take over the port.
             let prior_lease = leases[existing_index.unwrap()].clone();
             let (port, reassignment_reason) =
-                resolve_claim_port(requested_port, leases, checker, false)?;
+                resolve_claim_port(requested_port, leases, checker, probe, false)?;
             if port != requested_port {
                 // The requested port is occupied by an unregistered process,
                 // so the dead declaration can no longer be reused. Remove it
@@ -1078,9 +1091,10 @@ fn resolve_claim_port(
     requested_port: u16,
     leases: &[Lease],
     checker: &dyn PidChecker,
+    probe: &dyn PortProbe,
     lease_conflict: bool,
 ) -> Result<(u16, Option<ReassignmentReason>)> {
-    if !lease_conflict && is_os_port_free(requested_port) {
+    if !lease_conflict && probe.is_port_free(requested_port) {
         return Ok((requested_port, None));
     }
 
@@ -1090,6 +1104,7 @@ fn resolve_claim_port(
             .context("no available port: requested port is already at the maximum")?,
         leases,
         checker,
+        probe,
     )
     .context(if lease_conflict {
         "no available port found while resolving a port conflict"
@@ -1134,13 +1149,14 @@ pub(crate) fn find_next_available_port(
     start: u16,
     leases: &[Lease],
     checker: &dyn PidChecker,
+    probe: &dyn PortProbe,
 ) -> Option<u16> {
     let mut candidate = start;
     loop {
         let has_live_lease = leases
             .iter()
             .any(|l| l.port == candidate && l.is_alive(checker));
-        if !has_live_lease && is_os_port_free(candidate) {
+        if !has_live_lease && probe.is_port_free(candidate) {
             return Some(candidate);
         }
         candidate = candidate.checked_add(1)?;
@@ -1179,6 +1195,31 @@ pub(crate) fn is_os_port_free(port: u16) -> bool {
             }
             Err(_) => false,
         })
+}
+
+/// Probes whether a TCP port is currently free on this machine.
+///
+/// Injected so the reassignment logic can be tested without binding real
+/// sockets: the OS port space is a shared global, and assertions like "the
+/// port I just released must be free" cannot be guaranteed when many tests
+/// probe it in parallel.
+///
+/// `Send + Sync` for the same reason as [`FileOps`]: the [`Store`] holds the
+/// probe behind an `Arc` and crosses threads with it.
+pub trait PortProbe: Send + Sync {
+    /// Returns true when nothing on this host currently binds `port`.
+    fn is_port_free(&self, port: u16) -> bool;
+}
+
+/// The production probe: binds wildcard and loopback addresses in both
+/// families. See `is_os_port_free` for why each address matters.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OsPortProbe;
+
+impl PortProbe for OsPortProbe {
+    fn is_port_free(&self, port: u16) -> bool {
+        is_os_port_free(port)
+    }
 }
 
 /// Removes the lease on `port` from `leases`, if any, and reports whether
@@ -1759,7 +1800,7 @@ mod tests {
     fn find_next_available_port_returns_start_when_nothing_blocks_it() {
         let start: u16 = 24000;
         let leases = vec![];
-        let found = find_next_available_port(start, &leases, &AlwaysAlive).unwrap();
+        let found = find_next_available_port(start, &leases, &AlwaysAlive, &OsPortProbe).unwrap();
         assert_eq!(found, start);
     }
 
@@ -1767,7 +1808,7 @@ mod tests {
     fn find_next_available_port_skips_ports_with_a_live_lease() {
         let start: u16 = 24100;
         let leases = vec![Lease::new(start, 999, "blocker", None)];
-        let found = find_next_available_port(start, &leases, &AlwaysAlive).unwrap();
+        let found = find_next_available_port(start, &leases, &AlwaysAlive, &OsPortProbe).unwrap();
         assert_eq!(found, start + 1);
     }
 
@@ -1775,7 +1816,7 @@ mod tests {
     fn find_next_available_port_reuses_ports_with_a_dead_lease() {
         let start: u16 = 24200;
         let leases = vec![Lease::new(start, 999, "stale", None)];
-        let found = find_next_available_port(start, &leases, &AlwaysDead).unwrap();
+        let found = find_next_available_port(start, &leases, &AlwaysDead, &OsPortProbe).unwrap();
         assert_eq!(found, start);
     }
 
@@ -1785,7 +1826,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", start)).unwrap();
         // No lease recorded for `start`, but the OS has it bound.
         let leases = vec![];
-        let found = find_next_available_port(start, &leases, &AlwaysAlive).unwrap();
+        let found = find_next_available_port(start, &leases, &AlwaysAlive, &OsPortProbe).unwrap();
         assert_eq!(found, start + 1);
         drop(listener);
     }
@@ -1793,7 +1834,7 @@ mod tests {
     #[test]
     fn find_next_available_port_returns_none_on_overflow() {
         let leases = vec![Lease::new(u16::MAX, 999, "blocker", None)];
-        let found = find_next_available_port(u16::MAX, &leases, &AlwaysAlive);
+        let found = find_next_available_port(u16::MAX, &leases, &AlwaysAlive, &OsPortProbe);
         assert_eq!(found, None);
     }
 
@@ -1811,6 +1852,7 @@ mod tests {
             "server".to_string(),
             None,
             &AlwaysAlive,
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1834,6 +1876,7 @@ mod tests {
             "server".to_string(),
             None,
             &AlwaysAlive,
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1858,6 +1901,7 @@ mod tests {
             "server".to_string(),
             None,
             &AlivePids(vec![999]),
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1882,6 +1926,7 @@ mod tests {
                 pid: 100,
                 start_time: Some(123),
             },
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1900,6 +1945,7 @@ mod tests {
             "server".to_string(),
             None,
             &AliveWithoutIdentity,
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1918,6 +1964,7 @@ mod tests {
             "server".to_string(),
             None,
             &AlwaysDead,
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1938,8 +1985,16 @@ mod tests {
         let base: u16 = 21000;
         let mut leases = vec![Lease::new(base, 999, "other-owner", None)];
         let checker = AlivePids(vec![999]);
-        let outcome =
-            claim_in_place(&mut leases, base, 100, "server".to_string(), None, &checker).unwrap();
+        let outcome = claim_in_place(
+            &mut leases,
+            base,
+            100,
+            "server".to_string(),
+            None,
+            &checker,
+            &OsPortProbe,
+        )
+        .unwrap();
 
         assert!(outcome.reassigned);
         assert!(outcome.lease.port > base);
@@ -1959,6 +2014,7 @@ mod tests {
             "server-renamed".to_string(),
             Some("session-x".to_string()),
             &AlwaysAlive,
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -1989,6 +2045,7 @@ mod tests {
                 pid: 100,
                 start_time: Some(456),
             },
+            &OsPortProbe,
         )
         .unwrap();
 
@@ -2010,8 +2067,16 @@ mod tests {
 
         let mut leases = vec![Lease::new(base, 999, "other-owner", None)];
         let checker = AlivePids(vec![999]);
-        let outcome =
-            claim_in_place(&mut leases, base, 100, "server".to_string(), None, &checker).unwrap();
+        let outcome = claim_in_place(
+            &mut leases,
+            base,
+            100,
+            "server".to_string(),
+            None,
+            &checker,
+            &OsPortProbe,
+        )
+        .unwrap();
 
         drop(listener);
 
@@ -2030,8 +2095,16 @@ mod tests {
             Lease::new(base + 1, 998, "stale", None),
         ];
         let checker = AlivePids(vec![999]);
-        let outcome =
-            claim_in_place(&mut leases, base, 100, "server".to_string(), None, &checker).unwrap();
+        let outcome = claim_in_place(
+            &mut leases,
+            base,
+            100,
+            "server".to_string(),
+            None,
+            &checker,
+            &OsPortProbe,
+        )
+        .unwrap();
 
         assert!(outcome.reassigned);
         assert!(outcome.lease.port > base);
@@ -2810,6 +2883,7 @@ mod tests {
         let store = Store {
             data_dir: dir.path().to_path_buf(),
             file_ops: std::sync::Arc::new(RenameFailFileOps),
+            probe: std::sync::Arc::new(OsPortProbe),
         };
         store.ensure_data_dir().unwrap();
         let original = write_v3_fixture(&store, 1, &[]);
@@ -2831,6 +2905,7 @@ mod tests {
         requested_port: u16,
         pid: u32,
         checker: &dyn PidChecker,
+        probe: &dyn PortProbe,
         expected: ClaimDisposition,
     ) -> ClaimMutation {
         let mutation = claim_in_place(
@@ -2840,6 +2915,7 @@ mod tests {
             "claimed".to_string(),
             None,
             checker,
+            probe,
         )
         .unwrap();
         assert_eq!(mutation.disposition, expected);
@@ -2855,6 +2931,7 @@ mod tests {
             port,
             100,
             &AlwaysAlive,
+            &OsPortProbe,
             ClaimDisposition::Created,
         );
         assert!(mutation.prior_lease.is_none());
@@ -2871,6 +2948,7 @@ mod tests {
             port,
             100,
             &AlwaysAlive,
+            &OsPortProbe,
             ClaimDisposition::Updated,
         );
         assert_eq!(mutation.prior_lease, Some(prior));
@@ -2890,6 +2968,7 @@ mod tests {
                 "claimed".to_string(),
                 None,
                 &AlwaysDead,
+                &OsPortProbe,
             )
             .unwrap();
             if mutation.disposition == ClaimDisposition::ReassignedOsOccupied {
@@ -2913,6 +2992,7 @@ mod tests {
             port,
             200,
             &AlivePids(vec![100, 200]),
+            &OsPortProbe,
             ClaimDisposition::ReassignedLeaseConflict,
         );
         assert_eq!(mutation.prior_lease, Some(prior));
@@ -2929,6 +3009,7 @@ mod tests {
             port,
             200,
             &AlwaysAlive,
+            &OsPortProbe,
             ClaimDisposition::ReassignedOsOccupied,
         );
         assert!(mutation.prior_lease.is_none());
@@ -2947,6 +3028,7 @@ mod tests {
                 requested_port,
                 200,
                 &AlivePids(vec![100, 200]),
+                &OsPortProbe,
                 ClaimDisposition::ReassignedLeaseConflict,
             );
             if mutation.replaced_lease.is_some() {
