@@ -100,10 +100,10 @@ struct StoredIntents {
 /// spellings would produce different keys, which is an accepted limitation of
 /// the non-git fallback.
 #[allow(dead_code)]
-pub fn key_for_file(cwd: &Path, file: &Path) -> Result<String> {
+pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     let cwd = canonicalize_or_owned(cwd);
     let absolute = absolute_path(&cwd, file);
-    let outside_git = || Ok(absolute.to_string_lossy().into_owned());
+    let outside_git = || absolute.to_string_lossy().into_owned();
 
     let Some(toplevel) = git_stdout(&cwd, &["rev-parse", "--show-toplevel"]) else {
         return outside_git();
@@ -119,11 +119,11 @@ pub fn key_for_file(cwd: &Path, file: &Path) -> Result<String> {
         return outside_git();
     };
     let common_dir = resolve_common_dir(&cwd, Path::new(&common_dir));
-    Ok(format!(
+    format!(
         "{}:{}",
         common_dir.to_string_lossy(),
         relative.to_string_lossy()
-    ))
+    )
 }
 
 /// Runs `git -C cwd <args>` and returns its output with the trailing newline
@@ -764,8 +764,8 @@ mod tests {
     #[test]
     fn same_relative_file_in_two_worktrees_shares_a_key() {
         let repo = git_repo_with_worktree();
-        let main_key = key_for_file(&repo.main, Path::new("src/auth.rs")).unwrap();
-        let linked_key = key_for_file(&repo.linked, Path::new("src/auth.rs")).unwrap();
+        let main_key = key_for_file(&repo.main, Path::new("src/auth.rs"));
+        let linked_key = key_for_file(&repo.linked, Path::new("src/auth.rs"));
         assert_eq!(main_key, linked_key);
         assert!(
             main_key.ends_with(":src/auth.rs"),
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn outside_git_falls_back_to_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
-        let k = key_for_file(dir.path(), Path::new("notes.md")).unwrap();
+        let k = key_for_file(dir.path(), Path::new("notes.md"));
         assert!(Path::new(&k).is_absolute() || k.contains(":/"));
     }
 
@@ -784,15 +784,15 @@ mod tests {
     fn file_outside_the_repository_falls_back_to_its_absolute_path() {
         let repo = git_repo_with_worktree();
         let outside = repo.root.path().join("notes.md");
-        let key = key_for_file(&repo.main, &outside).unwrap();
+        let key = key_for_file(&repo.main, &outside);
         assert_eq!(key, normalize_path(&outside).to_string_lossy());
     }
 
     #[test]
     fn relative_paths_are_normalized_against_the_given_cwd() {
         let repo = git_repo_with_worktree();
-        let from_root = key_for_file(&repo.main, Path::new("src/auth.rs")).unwrap();
-        let from_subdir = key_for_file(&repo.main.join("src"), Path::new("./auth.rs")).unwrap();
+        let from_root = key_for_file(&repo.main, Path::new("src/auth.rs"));
+        let from_subdir = key_for_file(&repo.main.join("src"), Path::new("./auth.rs"));
         assert_eq!(from_root, from_subdir);
     }
 }
