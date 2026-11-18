@@ -2748,3 +2748,298 @@ fn init_skill_prints_the_skill_file_byte_for_byte() {
          `portzilla init skill > .opencode/skills/portzilla/SKILL.md` reproduces the file"
     );
 }
+
+// ---- intent ----
+
+/// A claimed path plus the data directory, for the `intent` command tests.
+fn intent_paths() -> (tempfile::TempDir, std::path::PathBuf) {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("auth.rs");
+    (project, file)
+}
+
+#[test]
+fn intent_claim_then_who_then_release_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session-a"))
+        .stdout(predicate::str::contains("auth.rs"));
+
+    cmd(dir.path())
+        .args(["intent", "who", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session-a"))
+        .stdout(predicate::str::contains("auth.rs"));
+
+    let output = cmd(dir.path())
+        .args(["intent", "who", path, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["session"], "session-a");
+    assert_eq!(json["live"], true);
+    assert!(
+        json["key"].as_str().unwrap().contains("auth.rs"),
+        "the key must name the file: {json}"
+    );
+    assert_eq!(
+        json["file"].as_str().unwrap(),
+        _project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("auth.rs")
+            .to_str()
+            .unwrap(),
+        "the JSON file must be the located working copy"
+    );
+    assert!(json["created_at"].is_u64());
+    assert!(json["expires_at"].is_u64());
+    assert!(json["age_secs"].is_u64());
+
+    cmd(dir.path())
+        .args(["intent", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("KEY SESSION AGE EXPIRES"))
+        .stdout(predicate::str::contains("session-a"));
+
+    cmd(dir.path())
+        .args(["intent", "release", path, "--session", "session-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("released"));
+
+    // The released claim is gone: `who` reports it as absent (exit 2).
+    cmd(dir.path())
+        .args(["intent", "who", path])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("no live file intent"));
+}
+
+#[test]
+fn intent_claim_by_another_session_exits_1_and_names_the_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-b"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("session-a"))
+        .stderr(predicate::str::contains("expires in"));
+}
+
+#[test]
+fn intent_release_by_a_non_owner_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["intent", "release", path, "--session", "session-b"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("session-a"))
+        .stderr(predicate::str::contains("expires in"));
+
+    // The owner's claim survived the rejected release.
+    cmd(dir.path())
+        .args(["intent", "who", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session-a"));
+}
+
+#[test]
+fn intent_release_of_an_absent_claim_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .args(["intent", "release", path, "--session", "session-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already absent"));
+
+    let output = cmd(dir.path())
+        .args([
+            "intent",
+            "release",
+            path,
+            "--session",
+            "session-a",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    assert_eq!(json["released"], false);
+    assert!(json["key"].as_str().unwrap().contains("auth.rs"));
+}
+
+#[test]
+fn intent_claim_uses_portzilla_session_when_the_flag_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .env("PORTZILLA_SESSION", "env-session")
+        .args(["intent", "claim", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("env-session"));
+
+    let output = cmd(dir.path())
+        .args(["intent", "who", path, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["session"], "env-session");
+}
+
+#[test]
+fn intent_claim_without_any_session_errors_clearly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    cmd(dir.path())
+        .env_remove("PORTZILLA_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["intent", "claim", path])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "intent claim needs a session: pass --session or set PORTZILLA_SESSION",
+        ));
+
+    cmd(dir.path())
+        .env_remove("PORTZILLA_SESSION")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .args(["intent", "release", path])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("intent release needs a session"));
+}
+
+#[test]
+fn intent_ls_json_lists_only_live_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    // Seed one live and one expired record directly: an expired claim is
+    // invisible to `ls` but not reaped by it, which is the store's contract.
+    std::fs::write(
+        dir.path().join("intents.json"),
+        r#"{"format_version":2,"intents":[
+            {"key":"repo:live.rs","session":"session-live","created_at":1000,"expires_at":4000000000},
+            {"key":"repo:expired.rs","session":"session-expired","created_at":1000,"expires_at":1001}
+        ]}"#,
+    )
+    .unwrap();
+
+    let output = cmd(dir.path())
+        .args(["intent", "ls", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    let intents = json.as_array().unwrap();
+    assert_eq!(
+        intents.len(),
+        1,
+        "only the live claim may be listed: {json}"
+    );
+    assert_eq!(intents[0]["key"], "repo:live.rs");
+    assert_eq!(intents[0]["live"], true);
+}
+
+#[test]
+fn intent_claim_honours_ttl_secs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    let output = cmd(dir.path())
+        .args([
+            "intent",
+            "claim",
+            path,
+            "--session",
+            "session-a",
+            "--ttl-secs",
+            "120",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    let created_at = json["created_at"].as_u64().unwrap();
+    let expires_at = json["expires_at"].as_u64().unwrap();
+    assert_eq!(expires_at - created_at, 120);
+    assert_eq!(json["live"], true);
+}
+
+#[test]
+fn intent_claim_rejects_out_of_range_ttl_secs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    for ttl in ["0", "86401"] {
+        cmd(dir.path())
+            .args([
+                "intent",
+                "claim",
+                path,
+                "--session",
+                "session-a",
+                "--ttl-secs",
+                ttl,
+            ])
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("--ttl-secs must be between"));
+    }
+}

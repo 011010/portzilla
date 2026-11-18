@@ -99,7 +99,6 @@ pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
 /// check treats that as "cannot prove clean".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct IntentLocation {
     /// Canonical absolute path of the file the holder is editing.
     pub file: PathBuf,
@@ -112,7 +111,6 @@ pub struct IntentLocation {
 
 /// A claim that `session` is editing `key` until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Intent {
     pub key: String,
     pub session: String,
@@ -171,11 +169,6 @@ impl FileOps for RealFileOps {
 /// identity. See that function for the key and path-resolution rules.
 ///
 /// Keys are opaque and must never be parsed; see the module documentation.
-// The adapter and CLI resolve a key through `locate_file`, which they need for
-// the location too; this key-only wrapper is kept for callers that only need
-// identity. It is temporarily unused between the adapter's move to
-// `locate_file` and the `intent` CLI landing in the next commit.
-#[allow(dead_code)]
 pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     locate_file(cwd, file).0
 }
@@ -371,7 +364,6 @@ fn canonicalize_or_owned(path: &Path) -> PathBuf {
 /// wraps everything else (lock, I/O, malformed JSON) so short-circuiting with
 /// `?` stays ergonomic inside this module.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum IntentError {
     /// Another live session owns the key.
     HeldBy {
@@ -434,6 +426,20 @@ impl std::error::Error for IntentError {
     }
 }
 
+impl IntentError {
+    /// Absolute expiry of the claim that caused the refusal, when the variant
+    /// carries one. The CLI renders it as "expires in Ns" so a human knows how
+    /// long waiting actually takes.
+    pub(crate) fn expires_at(&self) -> Option<u64> {
+        match self {
+            Self::HeldBy { expires_at, .. } | Self::NotOwner { expires_at, .. } => {
+                Some(*expires_at)
+            }
+            Self::Capacity { .. } | Self::Invalid(_) | Self::Store(_) => None,
+        }
+    }
+}
+
 impl From<anyhow::Error> for IntentError {
     fn from(error: anyhow::Error) -> Self {
         Self::Store(error)
@@ -451,13 +457,11 @@ pub type IntentResult<T> = std::result::Result<T, IntentError>;
 /// temp file plus rename. Reads take the lock too, so a reader never observes a
 /// partially written file or races a rename.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct IntentStore {
     data_dir: PathBuf,
     file_ops: Arc<dyn FileOps>,
 }
 
-#[allow(dead_code)]
 impl IntentStore {
     /// Opens the intent store, resolving the same data directory as the lease
     /// store (`PORTZILLA_DATA_DIR`, then XDG/HOME) unless `override_dir` is

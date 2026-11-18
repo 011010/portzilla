@@ -101,7 +101,6 @@ const INTENT_TTL_ENV: &str = "PORTZILLA_INTENT_TTL_SECS";
 pub struct HookOutcome {
     pub stdout_json: String,
     pub stderr_note: Option<String>,
-    #[allow(dead_code)]
     pub(crate) audit: Option<GuardAuditDraft>,
 }
 
