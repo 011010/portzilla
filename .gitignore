@@ -1,3 +1,4 @@
 /target
+.worktrees/
 .DS_Store
 npm/vendor

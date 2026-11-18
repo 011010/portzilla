@@ -113,11 +113,13 @@ The shim uses OpenCode's **V2** plugin shape (`export default { id, async setup(
 
 It registers one `ctx.tool.hook("execute.before", ...)` and branches on the tool:
 
-- `write` / `edit`: asks for a file intent on `event.input.path`. A file held by another live session throws before the edit runs (see [File intents](../README.md#file-intents-opencode)).
+- `write` / `edit`: asks for a file intent on `event.input.path`, sending the pending edit. A file held by another live session is checked against the holder's working copy: a **proven conflict** throws before the edit runs; a **clean merge** is allowed and the holder keeps its claim; anything unprovable denies as before (see [File intents](../README.md#file-intents-opencode)).
 - `shell`: asks the kill guard about `event.input.command`.
 - Anything else: returns untouched.
 
-A deny throws, and OpenCode surfaces the reason to the model as a tool error. There is no model-visible warn channel before execution in V2, so a warn goes to the OpenCode log via `console.warn` instead of reaching the model.
+A deny throws, and OpenCode surfaces the reason to the model as a tool error. A clean-merge warning is delivered by a second hook, `ctx.tool.hook("execute.after", ...)`, which pushes a text part onto `event.result.content` — verified on OpenCode 2.3.0, where `result.output` is an object and mutating it never reaches the model. If the result has no content array the warning falls back to `console.warn` (log only).
+
+Ownership is per session, and each `opencode run` invocation starts a new one. In the TUI a conversation keeps its session; scripted runs on the same file wait for the TTL unless you free the claim with `portzilla intent release <path> --session <id>`.
 
 `shell.create.before` is deliberately not registered: its event carries no session id, so a shell command cannot be attributed to a session and the `PORTZILLA_SESSION` handoff used by the V1 shim has no V2 equivalent. Claims made from OpenCode's shell therefore get no own-lease recognition from the kill guard. File intents are unaffected, because the edit hook receives `sessionID` directly.
 

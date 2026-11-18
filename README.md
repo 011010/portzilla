@@ -259,6 +259,8 @@ released /repo/src/auth.rs for session ...
 
 Limits, stated plainly: only OpenCode is covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
 
+One consequence worth knowing: ownership is per *session*, and every `opencode run` invocation is a new session. In the TUI a conversation keeps its session for its whole life, but scripted runs block each other on the same file until the TTL lapses. `portzilla intent ls` shows the holder and `portzilla intent release <path> --session <id>` frees it immediately.
+
 ## Data file & config
 
 Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. State at `leases.json` (atomic write + `leases.json.lock`). New writes use the v3 envelope, which stores leases and bounded audit history together.

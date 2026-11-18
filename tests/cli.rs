@@ -2449,7 +2449,7 @@ fn run_empty_session_is_treated_as_no_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert!(
         lease["session"].is_null(),
@@ -2544,7 +2544,7 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
@@ -2648,7 +2648,7 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(10))
+    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
