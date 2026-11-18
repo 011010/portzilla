@@ -9,12 +9,13 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
-    # audit-check creates a check run via the Checks API; the push-to-main
-    # token needs `checks: write` explicitly or the step fails with
-    # "Resource not accessible by integration".
+    # No `checks: write`: the audit used to run through rustsec/audit-check,
+    # which created a check run via the Checks API and could fail on that call
+    # alone ("Not Found" while updating the check run) even when the audit
+    # itself was clean. The step now runs cargo-audit directly and lets its exit
+    # code do the work, so the token only needs read access to the repository.
     permissions:
       contents: read
-      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -34,10 +35,15 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+      # cargo-audit exits non-zero only for vulnerabilities; unmaintained and
+      # unsound notices are warnings, which is the behaviour the previous
+      # action had. Installing it here costs about as much as the action did
+      # (it compiled the same tool) and removes the third-party wrapper.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
       - name: Audit dependencies for security advisories (RustSec)
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
   test:
     name: Test (${{ matrix.os }})
