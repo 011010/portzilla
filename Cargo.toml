@@ -1,6 +1,6 @@
 [package]
 name = "portzilla"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Port and process lease coordinator for parallel AI coding-agent sessions"
 license = "MIT"
@@ -9,7 +9,16 @@ repository = "https://github.com/011010/portzilla"
 homepage = "https://github.com/011010/portzilla"
 keywords = ["port", "cli", "agent", "dev-tools", "process"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".atl/", ".github/", "docs/plans/", "npm/", "package.json", "scripts/"]
+exclude = [
+  ".atl/",
+  ".github/",
+  ".playwright-mcp/",
+  "docs/plans/",
+  "graphify-out/",
+  "npm/",
+  "package.json",
+  "scripts/",
+]
 
 [dependencies]
 anyhow = "1.0.104"
