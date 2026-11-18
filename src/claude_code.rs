@@ -1,36 +1,54 @@
-//! Claude Code adapter for the kill-guard.
+//! Claude Code adapter: kill guard for `Bash`, file intents for `Edit`/`Write`.
 //!
-//! Owns parsing of Claude Code's `PreToolUse` hook payload and rendering of the
-//! resulting [`crate::guard::Verdict`] into the JSON shape Claude Code expects
-//! on stdout. `hook_common::evaluate` delegates normalized command evaluation
-//! to the harness-agnostic guard core; payload parsing and wire rendering stay
-//! local to this adapter. Adding a second harness later means writing a second
-//! module like this one, not touching `guard`.
+//! Owns parsing of Claude Code's hook payloads and rendering of the resulting
+//! verdict into the JSON shape Claude Code expects on stdout. One command
+//! serves two events, dispatched on `hook_event_name`:
+//!
+//! - `PreToolUse` + `Bash`: the kill guard, unchanged.
+//! - `PreToolUse` + `Write`/`Edit`: claim the file's intent
+//!   ([`crate::intent`]) and deny only a proven conflict, or an edit the
+//!   conflict check cannot prove clean. A clean edit emits **nothing**:
+//!   `permissionDecision: "allow"` would skip the user's permission prompt,
+//!   and allowing an edit is not the hook's job — denying conflicts is.
+//! - `PostToolUse` + `Write`/`Edit`: re-check the file now on disk and append
+//!   `additionalContext` for the model. This event can never deny; its only
+//!   failure mode is a missing warning, which is fail-open by construction.
+//!
+//! `hook_common::evaluate` delegates normalized command evaluation to the
+//! harness-agnostic guard core; payload parsing and wire rendering stay local
+//! to this adapter. Adding another harness means writing another module like
+//! this one, not touching `guard`.
 //!
 //! Schema verified against the current Claude Code hooks documentation
 //! (<https://code.claude.com/docs/en/hooks>, redirected from
 //! <https://docs.anthropic.com/en/docs/claude-code/hooks>) — see the doc
 //! comments below for exactly which fields and behavior that verification
-//! covers.
+//! covers. The edit payloads and the two-event contract were verified against
+//! Claude Code 2.1.283: `Write` carries `file_path` + `content`, `Edit` carries
+//! `file_path` + `old_string` + `new_string` (+ `replace_all`), and
+//! `PostToolUse` alone supports `additionalContext`.
 //!
 //! # Fail-open, concretely
 //!
 //! Per `guard`'s fail-open principle: this adapter treats every failure
-//! mode (unparseable JSON, missing fields, an unreadable lease store, even
-//! an internal panic — see `main.rs`'s `catch_unwind` around the call into
-//! this module) the same way — print nothing to stdout and exit 0. Per the
-//! Claude Code hook contract, exit 0 with empty stdout means "no decision;
-//! continue with normal permission flow," i.e. allow. A diagnostic goes to
-//! stderr for troubleshooting, which Claude Code only writes to its debug
-//! log on exit 0 — it is never shown to the user or the model, so it can
-//! never itself interrupt or alarm anyone.
+//! mode (unparseable JSON, missing fields, an unreadable lease or intent
+//! store, even an internal panic — see `main.rs`'s `catch_unwind` around the
+//! call into this module) the same way — print nothing to stdout and exit 0.
+//! Per the Claude Code hook contract, exit 0 with empty stdout means "no
+//! decision; continue with normal permission flow," i.e. allow. A diagnostic
+//! goes to stderr for troubleshooting, which Claude Code only writes to its
+//! debug log on exit 0 — it is never shown to the user or the model, so it
+//! can never itself interrupt or alarm anyone.
+//!
+//! `PostToolUse` is exempt from the deny half of this policy: it never emits
+//! `permissionDecision` at all, so a failure there is always silence.
 //!
 //! # Fail-closed mode (opt-in)
 //!
-//! When `PORTZILLA_FAIL_CLOSED=1` is set, every portzilla-side failure
-//! (unparseable input, missing command, store read error, oversized stdin)
-//! flips from "allow + note" to "deny + reason" instead. The exact JSON
-//! shape on stdout is owned by [`fail_closed_response`] and the same
+//! When `PORTZILLA_FAIL_CLOSED=1` is set, every portzilla-side failure on a
+//! `PreToolUse` path (unparseable input, missing command, store read error,
+//! oversized stdin) flips from "allow + note" to "deny + reason" instead. The
+//! exact JSON shape on stdout is owned by [`fail_closed_response`] and the same
 //! `permissionDecisionReason` field Claude Code forwards to the model on
 //! a deny. Pass-through is strict: the only way to enter fail-closed mode
 //! is through the policy flag set by `main.rs` based on the environment
@@ -99,17 +117,48 @@ pub fn fail_closed_response(reason: &str) -> String {
     serde_json::to_string(&response).expect("HookResponse always serializes")
 }
 
-/// The subset of the Claude Code `PreToolUse` hook input JSON this adapter
-/// reads. Verified fields (input JSON, from the docs' own worked example):
+/// The hook event a payload belongs to, taken from `hook_event_name`.
+///
+/// One command serves both events, so the event decides the dispatch. Payloads
+/// from Claude Code always carry the field (verified against 2.1.283); a
+/// payload without it is treated as `PreToolUse` so the kill-guard behavior
+/// that predates event dispatch survives incomplete mocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookEvent {
+    PreToolUse,
+    PostToolUse,
+    Other,
+}
+
+impl HookEvent {
+    fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("PreToolUse") => Self::PreToolUse,
+            Some("PostToolUse") => Self::PostToolUse,
+            Some(_) => Self::Other,
+            None => Self::PreToolUse,
+        }
+    }
+}
+
+/// The subset of the Claude Code hook input JSON this adapter reads. Verified
+/// fields (input JSON, from the docs' own worked example):
 /// `session_id`, `prompt_id`, `transcript_path`, `cwd`, `permission_mode`,
-/// `hook_event_name`, `tool_name`, `tool_input` (`command`, `description`,
-/// `timeout`, `run_in_background`), `tool_use_id`. This adapter needs
-/// `tool_name`, `tool_input.command`, and `session_id` (used for ownership —
-/// see [`handle`]); every other field is ignored via `#[serde(default)]`
-/// tolerance rather than declared, so payload fields we don't use (or future
-/// additions to them) never cause a parse failure.
+/// `hook_event_name`, `tool_name`, `tool_input`, `tool_use_id`. This adapter
+/// needs `hook_event_name` (dispatch), `session_id` (ownership and file
+/// intents), `cwd` (resolving a relative `file_path`), `tool_name`, and the
+/// tool input's `command` or edit fields; every other field is ignored via
+/// `#[serde(default)]` tolerance rather than declared, so payload fields we
+/// don't use (or future additions to them) never cause a parse failure.
 #[derive(Debug, Deserialize)]
-struct PreToolUseInput {
+struct HookInput {
+    #[serde(default)]
+    hook_event_name: Option<String>,
+    // Read by the edit paths added with the file-intent support; see the note
+    // on `ToolInput`'s allow.
+    #[allow(dead_code)]
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -118,10 +167,29 @@ struct PreToolUseInput {
     tool_input: Option<ToolInput>,
 }
 
+/// The tool inputs this adapter reads. `command` belongs to `Bash`; the rest
+/// belong to `Write` and `Edit`, whose verified shapes are
+/// `{file_path, content}` and `{file_path, old_string, new_string,
+/// replace_all}`. `replace_all` is not modelled: the conflict check
+/// reconstructs the caller's version by replacing the first occurrence, the
+/// same way the OpenCode adapter does.
+//
+// The edit fields are read by the verdict paths added with the file-intent
+// support; this parsing change lands first so the payload shape is testable on
+// its own. Remove the allow when those paths exist.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ToolInput {
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
 }
 
 /// Output JSON shape, verified against the docs' worked example for a
@@ -195,7 +263,7 @@ pub fn handle_with_policy(
     checker: &dyn PidChecker,
     fail_closed: bool,
 ) -> HookOutcome {
-    let input: PreToolUseInput = match serde_json::from_str(raw_input) {
+    let input: HookInput = match serde_json::from_str(raw_input) {
         Ok(input) => input,
         Err(err) => {
             if fail_closed {
@@ -209,11 +277,13 @@ pub fn handle_with_policy(
         }
     };
 
-    if input.tool_name.as_deref() != Some("Bash") {
-        // Not a Bash call — nothing for the kill-guard to check. Silent,
-        // since this is the overwhelmingly common case (every non-Bash
-        // tool use fires this hook too, if the matcher isn't scoped) and
-        // not worth a diagnostic line.
+    if HookEvent::from_name(input.hook_event_name.as_deref()) != HookEvent::PreToolUse
+        || input.tool_name.as_deref() != Some("Bash")
+    {
+        // Not a Bash call before it runs — nothing for the kill-guard to
+        // check. Silent, since this is the overwhelmingly common case (every
+        // non-Bash tool use fires this hook too, if the matcher isn't scoped)
+        // and not worth a diagnostic line.
         return HookOutcome::allow_silent();
     }
 
@@ -326,6 +396,96 @@ mod tests {
 
     fn lease_with_session(port: u16, pid: u32, tag: &str, session: &str) -> Lease {
         Lease::new(port, pid, tag, Some(session.to_string()))
+    }
+
+    #[test]
+    fn a_write_payload_exposes_the_file_and_content() {
+        let input: HookInput = serde_json::from_str(
+            &serde_json::json!({
+                "session_id": "session-a",
+                "hook_event_name": "PreToolUse",
+                "cwd": "/repo",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "src/auth.rs", "content": "a\nb\n" },
+                "tool_use_id": "toolu_01"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            HookEvent::from_name(input.hook_event_name.as_deref()),
+            HookEvent::PreToolUse
+        );
+        assert_eq!(input.cwd.as_deref(), Some("/repo"));
+        assert_eq!(input.tool_name.as_deref(), Some("Write"));
+        let tool_input = input.tool_input.expect("tool_input must parse");
+        assert_eq!(tool_input.file_path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(tool_input.content.as_deref(), Some("a\nb\n"));
+        assert!(tool_input.command.is_none());
+    }
+
+    #[test]
+    fn an_edit_payload_exposes_old_and_new() {
+        let input: HookInput = serde_json::from_str(
+            &serde_json::json!({
+                "session_id": "session-a",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": "src/auth.rs",
+                    "old_string": "b\n",
+                    "new_string": "B\n",
+                    "replace_all": false
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(input.tool_name.as_deref(), Some("Edit"));
+        let tool_input = input.tool_input.expect("tool_input must parse");
+        assert_eq!(tool_input.file_path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(tool_input.old_string.as_deref(), Some("b\n"));
+        assert_eq!(tool_input.new_string.as_deref(), Some("B\n"));
+        assert!(tool_input.content.is_none());
+    }
+
+    #[test]
+    fn a_post_tool_use_payload_is_recognized_as_such() {
+        let input: HookInput = serde_json::from_str(
+            &serde_json::json!({
+                "session_id": "session-a",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": "src/auth.rs",
+                    "old_string": "b\n",
+                    "new_string": "B\n"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            HookEvent::from_name(input.hook_event_name.as_deref()),
+            HookEvent::PostToolUse
+        );
+    }
+
+    #[test]
+    fn the_bash_path_is_unchanged() {
+        // Parsing the extra fields must not disturb the kill guard: the same
+        // payload still denies a foreign live lease with the same shape.
+        let leases = vec![lease(3000, 1234, "dev-server")];
+        let outcome = handle(&bash_input("kill 1234"), &leases, &AlwaysAlive);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&outcome.stdout_json.expect("deny must produce stdout JSON"))
+                .unwrap();
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
     #[test]
