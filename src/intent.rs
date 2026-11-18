@@ -45,13 +45,6 @@
 //! command, a transfer, a bulk import), the reaping must move into that
 //! explicit operation and `claim` must stop doing it.
 
-// The error deliberately carries the holder's full location, so the adapter
-// can run the conflict check without a second store read. That makes the
-// error exceed clippy's 128-byte threshold; boxing it would allocate on a path
-// that already takes a file lock and does I/O, and would force every caller to
-// unbox before matching.
-#![allow(clippy::result_large_err)]
-
 use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -510,6 +503,14 @@ impl IntentStore {
     /// does not own, so it doubles as the reaper. A new key is refused once the
     /// store holds [`MAX_INTENTS`] records; refreshing an existing key still
     /// works at the cap because it replaces its own record.
+    // The error deliberately carries the holder's full location, so the adapter
+    // can run the conflict check without a second store read. That makes it
+    // exceed clippy's 128-byte threshold; boxing it would allocate on a path
+    // that already takes a file lock and does I/O, and would force every caller
+    // to unbox before matching. The allow is scoped to the functions that
+    // return an `IntentResult`, not applied to the whole module, so the lint
+    // still fires on any new one.
+    #[allow(clippy::result_large_err)]
     pub fn claim(
         &self,
         key: &str,
@@ -568,6 +569,7 @@ impl IntentStore {
     /// This reports the record exactly as persisted, expiry included: it takes
     /// no clock. Liveness is a caller concern — use [`IntentStore::list`] for
     /// the live view at a given time.
+    #[allow(clippy::result_large_err)]
     pub fn get(&self, key: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let intents = self.read_intents_unlocked()?;
@@ -581,6 +583,7 @@ impl IntentStore {
     /// monitoring call contend with real claims and widen the window for a
     /// failed rename. The next `claim` reaps the entries under the lock, so the
     /// file still stays bounded.
+    #[allow(clippy::result_large_err)]
     pub fn list(&self, now: u64) -> IntentResult<Vec<Intent>> {
         let _guard = self.lock_exclusive()?;
         let intents = self.read_intents_unlocked()?;
@@ -603,6 +606,7 @@ impl IntentStore {
     ///
     /// This path must never reap: deleting a record this session does not own
     /// would break the single-owner contract that makes `claim`'s reaping safe.
+    #[allow(clippy::result_large_err)]
     pub fn release(&self, key: &str, session: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let mut intents = self.read_intents_unlocked()?;
@@ -726,6 +730,7 @@ impl IntentStore {
 /// for the same reason the lease store bounds its tags: these values are
 /// persisted and echoed back by every listing. `expires_at` must be in the
 /// future, otherwise the "claim" would be born expired and could never bind.
+#[allow(clippy::result_large_err)]
 fn validate_claim_inputs(key: &str, session: &str, now: u64, expires_at: u64) -> IntentResult<()> {
     if key.is_empty() {
         return Err(IntentError::Invalid(
@@ -1390,6 +1395,9 @@ mod tests {
     const RACING_SESSIONS: usize = 8;
 
     #[test]
+    // The spawned closure returns `store.claim(...)`, so it inherits the
+    // intentional large `IntentError`; see `IntentStore::claim`.
+    #[allow(clippy::result_large_err)]
     fn concurrent_claims_of_one_key_have_exactly_one_winner() {
         use std::sync::{Arc, Barrier};
 
