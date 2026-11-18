@@ -26,8 +26,6 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The edit a caller is about to apply to the file.
-// The adapter constructs these next; until then nothing builds one outside tests.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum PendingEdit<'a> {
     /// A targeted replacement: `old` becomes `new`, first occurrence only.
@@ -66,8 +64,6 @@ pub enum ConflictVerdict {
 /// 6. With a base, run `git merge-file` over the three versions. Exit code 0
 ///    is clean, 1..=127 is a conflict count, and anything else (an error
 ///    return or a signal) is unprovable.
-// The adapter wires this in next; until then the binary has no caller for it.
-#[allow(dead_code)]
 pub fn check(caller_cwd: &Path, holder: &IntentLocation, edit: PendingEdit<'_>) -> ConflictVerdict {
     let Ok(holder_version) = fs::read_to_string(&holder.file) else {
         return ConflictVerdict::Unprovable;

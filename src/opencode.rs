@@ -29,9 +29,11 @@
 //! `write` and `edit` are checked by claiming the edited file's intent
 //! ([`crate::intent`]) under the tool call's session. The claim *is* the
 //! check: the holding session refreshes its own intent, an expired intent is
-//! taken over, and a different live holder produces a deny that names the
-//! file and the holder. A deny never writes, so the blocked session does not
-//! end up holding the file it was just denied.
+//! taken over, and a different live holder's record is run through the
+//! conflict proof ([`crate::conflict`]). Only a proven conflict — or an edit
+//! the check cannot prove clean — denies. A clean merge is allowed with a
+//! warn, and the holder keeps its claim. A deny never writes, so the blocked
+//! session does not end up holding the file it was just denied.
 //!
 //! An intent is taken *before* the tool runs and is never released afterwards:
 //! V2's verified `execute.before` hook has no release counterpart, so a file
@@ -50,13 +52,14 @@
 //! environment; a claim is only recognized as own when its session id matches
 //! the id OpenCode reports for the call.
 //!
-//! # No pre-execution model-visible warn channel
+//! # Warnings are non-blocking
 //!
-//! `tool.execute.before` is binary: return = allow, throw = deny. V1 deferred
-//! warn text to `tool.execute.after`; the V2 registration for that event has
-//! not been verified, and a hook that fails to register can keep the whole
-//! plugin from loading, so the shim logs a warn to OpenCode's console instead
-//! of the model. The warning still never blocks.
+//! `tool.execute.before` is binary: return = allow, throw = deny. When the
+//! conflict check proves a held file's pending edit clean, this adapter
+//! returns `{"action":"warn"}`. The shim lets every non-deny action through,
+//! so the edit proceeds and the reason is advisory; the check writes nothing,
+//! so the holder keeps its claim and the caller's next edit is checked again
+//! against the holder's evolving copy.
 //!
 //! # Fail-open, concretely
 //!
@@ -76,23 +79,16 @@
 //! existing throw-on-deny path then blocks the tool call exactly as a real
 //! deny would.
 
+use crate::conflict::{self, ConflictVerdict, PendingEdit};
 use crate::guard::{GuardAuditDraft, Verdict};
 use crate::hook_common::{EvaluationRequest, evaluate_with_evidence};
-use crate::intent::{IntentError, IntentStore, key_for_file};
+use crate::intent::{DEFAULT_TTL_SECS, IntentError, IntentLocation, IntentStore, locate_file};
 use crate::lease::{Lease, PidChecker, current_unix_timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// How long a file intent stays binding after the tool call that took it.
-///
-/// Thirty minutes covers a multi-step edit of one file in a slow agent
-/// session while still freeing a crashed session's file without manual
-/// cleanup. Overridable with `PORTZILLA_INTENT_TTL_SECS` for tests and
-/// tuning.
-const DEFAULT_INTENT_TTL_SECS: u64 = 30 * 60;
-
-/// Environment variable that overrides [`DEFAULT_INTENT_TTL_SECS`]. It exists
-/// for tests and tuning, not as a supported contract: a hook path must keep
+/// Environment variable that overrides [`DEFAULT_TTL_SECS`]. It exists for
+/// tests and tuning, not as a supported contract: a hook path must keep
 /// working when the value is garbage, so an unparseable or zero value falls
 /// back to the default instead of failing the hook.
 const INTENT_TTL_ENV: &str = "PORTZILLA_INTENT_TTL_SECS";
@@ -157,6 +153,30 @@ struct OpenCodeInput {
     file: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    /// Tool-call id from OpenCode. The adapter itself has no use for it; the
+    /// shim keys its `execute.after` warnings on it. Accepted (and ignored) so
+    /// the shim can send one payload shape everywhere.
+    #[serde(default, rename = "call_id")]
+    _call_id: Option<String>,
+    /// The edit the tool is about to apply, when the shim can supply it.
+    /// Required to prove a held file's edit clean; absent means deny.
+    #[serde(default)]
+    edit: Option<EditInput>,
+}
+
+/// The optional edit payload the shim forwards for `write` and `edit` calls.
+///
+/// `content` is a whole-file write; `old` + `new` is a replacement. The
+/// conflict check needs one of the two shapes to reconstruct the caller's
+/// post-edit version.
+#[derive(Debug, Deserialize)]
+struct EditInput {
+    #[serde(default)]
+    old: Option<String>,
+    #[serde(default)]
+    new: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 /// Output JSON shape: a flat `action` verdict plus an optional `reason`.
@@ -211,6 +231,7 @@ pub fn handle_with_policy(
             file,
             input.session_id.as_deref(),
             input.cwd.as_deref(),
+            input.edit.as_ref(),
             None,
             fail_closed,
         );
@@ -245,7 +266,8 @@ pub fn handle_with_policy(
     }
 }
 
-/// Handles the file-intent half of the protocol: `{ session_id, file, cwd }`.
+/// Handles the file-intent half of the protocol:
+/// `{ session_id, file, cwd, edit? }`.
 ///
 /// The claim IS the check. [`IntentStore::claim`] runs under the store's
 /// exclusive lock, so one atomic operation both decides and records: the
@@ -253,6 +275,19 @@ pub fn handle_with_policy(
 /// and a live intent held by a different session is refused before anything
 /// is written. Two sessions racing for one file therefore cannot both see it
 /// free.
+///
+/// A refusal is not the verdict by itself. When the stored holder record
+/// carries a [`IntentLocation`] and the shim supplied an edit payload,
+/// [`conflict::check`] proves whether the pending edit merges with the
+/// holder's version:
+///
+/// - [`ConflictVerdict::Clean`]: the edit is allowed with a warn that names
+///   the holder. Nothing is written, so the holder keeps its claim.
+/// - [`ConflictVerdict::Conflict`]: the edit is denied, and the reason says
+///   the conflict is real.
+/// - [`ConflictVerdict::Unprovable`]: the edit is denied exactly like the
+///   unconditional guard did before — a missing location (a v1 record), a
+///   missing edit payload, an unreadable file or any git failure.
 ///
 /// An edit with no session id cannot be attributed, so it follows the same
 /// fail-open / `PORTZILLA_FAIL_CLOSED` policy as every other portzilla-side
@@ -264,6 +299,7 @@ fn handle_file_intent(
     file: &str,
     session: Option<&str>,
     cwd: Option<&str>,
+    edit: Option<&EditInput>,
     intent_dir: Option<&Path>,
     fail_closed: bool,
 ) -> HookOutcome {
@@ -282,11 +318,11 @@ fn handle_file_intent(
 
     let cwd = match cwd {
         Some(cwd) => PathBuf::from(cwd),
-        // `key_for_file` anchors a relative cwd to the process directory, so
+        // `locate_file` anchors a relative cwd to the process directory, so
         // this is the OpenCode process's working directory.
         None => PathBuf::from("."),
     };
-    let key = key_for_file(&cwd, Path::new(file));
+    let (key, location) = locate_file(&cwd, Path::new(file));
 
     let store = match IntentStore::open(intent_dir.map(Path::to_path_buf)) {
         Ok(store) => store,
@@ -299,23 +335,99 @@ fn handle_file_intent(
     };
 
     let now = current_unix_timestamp();
-    // The location is wired in when the adapter uses the conflict check; until
-    // then a claim records only the key, exactly like a v1-era record.
-    match store.claim(&key, session, now, now + intent_ttl_secs(), None) {
+    // The location makes this session's own record conflict-checkable by a
+    // peer: without it, every peer has to deny.
+    match store.claim(&key, session, now, now + intent_ttl_secs(), Some(location)) {
         Ok(_) => HookOutcome {
             stdout_json: verdict_json("allow", None),
             stderr_note: None,
             audit: None,
         },
-        Err(IntentError::HeldBy { holder, .. }) => HookOutcome {
-            stdout_json: verdict_json("deny", Some(held_file_reason(file, &holder))),
-            stderr_note: None,
-            audit: None,
-        },
+        Err(IntentError::HeldBy {
+            holder,
+            location: Some(holder_location),
+            ..
+        }) => held_file_outcome(file, &holder, &holder_location, &cwd, edit),
+        Err(IntentError::HeldBy { holder, .. }) => deny_held_file(file, &holder),
         Err(err) => failure_outcome(
             fail_closed,
             &format!("could not record a file intent for {file}: {err}"),
         ),
+    }
+}
+
+/// Decides what to do with a held file whose holder's working copy is known.
+///
+/// Missing edit data and any failure inside the check collapse into
+/// [`ConflictVerdict::Unprovable`], which denies: allowing on "could not find
+/// out" would make the guard weaker than the unconditional deny it replaces.
+fn held_file_outcome(
+    file: &str,
+    holder: &str,
+    holder_location: &IntentLocation,
+    caller_cwd: &Path,
+    edit: Option<&EditInput>,
+) -> HookOutcome {
+    let verdict = edit
+        .and_then(pending_edit)
+        .map_or(ConflictVerdict::Unprovable, |pending| {
+            conflict::check(caller_cwd, holder_location, pending)
+        });
+    match verdict {
+        ConflictVerdict::Clean => HookOutcome {
+            stdout_json: verdict_json("warn", Some(clean_merge_warning(file, holder))),
+            stderr_note: None,
+            audit: None,
+        },
+        ConflictVerdict::Conflict => HookOutcome {
+            stdout_json: verdict_json("deny", Some(conflicting_file_reason(file, holder))),
+            stderr_note: None,
+            audit: None,
+        },
+        ConflictVerdict::Unprovable => deny_held_file(file, holder),
+    }
+}
+
+/// Converts the shim's optional edit payload into the conflict check's input.
+///
+/// A `content` payload wins when both shapes are present: a whole-file write
+/// is the stronger statement about the caller's post-edit version. A replace
+/// needs both halves. `None` means the payload cannot describe an edit, which
+/// the caller treats as unprovable and therefore denies.
+fn pending_edit(edit: &EditInput) -> Option<PendingEdit<'_>> {
+    match (&edit.content, &edit.old, &edit.new) {
+        (Some(content), ..) => Some(PendingEdit::Write { content }),
+        (None, Some(old), Some(new)) => Some(PendingEdit::Replace { old, new }),
+        _ => None,
+    }
+}
+
+/// The warn text for an edit that provably merges with the holder's version.
+/// It names the other session and tells the caller to coordinate before the
+/// two changes drift into the same lines; it never claims the file.
+fn clean_merge_warning(file: &str, holder: &str) -> String {
+    format!(
+        "{file} is also being edited by session {holder}, but your edit merges cleanly right now. Coordinate before changing the same lines."
+    )
+}
+
+/// The deny text for an edit that really conflicts with the holder's version,
+/// as opposed to one that could not be checked.
+fn conflicting_file_reason(file: &str, holder: &str) -> String {
+    format!(
+        "{file} is held by session {holder}, and the pending edit conflicts with the version that \
+         session is editing right now. Do not edit it. Instead: wait for that session's claim to \
+         expire, coordinate with it so one of you edits the file at a time, or ask the user before \
+         proceeding."
+    )
+}
+
+/// The deny outcome for an unprovable or v1-held file, with today's wording.
+fn deny_held_file(file: &str, holder: &str) -> HookOutcome {
+    HookOutcome {
+        stdout_json: verdict_json("deny", Some(held_file_reason(file, holder))),
+        stderr_note: None,
+        audit: None,
     }
 }
 
@@ -340,7 +452,7 @@ fn intent_ttl_secs_from(value: Option<&str>) -> u64 {
         .map(str::trim)
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_INTENT_TTL_SECS)
+        .unwrap_or(DEFAULT_TTL_SECS)
 }
 
 fn intent_ttl_secs() -> u64 {
@@ -464,8 +576,10 @@ export default {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intent::key_for_file;
     use crate::lease::Lease;
     use crate::lease::test_support::{AlwaysAlive, AlwaysDead};
+    use std::process::Command;
 
     fn lease(port: u16, pid: u32, tag: &str) -> Lease {
         Lease::new(port, pid, tag, None)
@@ -538,6 +652,7 @@ mod tests {
                 file,
                 Some(session),
                 Some(self.project.to_str().unwrap()),
+                None,
                 Some(&self.intents),
                 fail_closed,
             )
@@ -873,6 +988,7 @@ mod tests {
             "src/lib.rs",
             Some("session-mine"),
             Some(fixture.project.to_str().unwrap()),
+            None,
             Some(intents.path()),
             false,
         );
@@ -896,6 +1012,7 @@ mod tests {
             "src/lib.rs",
             Some("session-mine"),
             Some(fixture.project.to_str().unwrap()),
+            None,
             Some(intents.path()),
             true,
         );
@@ -919,6 +1036,7 @@ mod tests {
             "src/lib.rs",
             Some("session-mine"),
             Some(fixture.project.to_str().unwrap()),
+            None,
             Some(not_a_dir.path()),
             false,
         );
@@ -933,6 +1051,7 @@ mod tests {
             "src/lib.rs",
             Some("session-mine"),
             Some(fixture.project.to_str().unwrap()),
+            None,
             Some(not_a_dir.path()),
             true,
         );
@@ -955,18 +1074,242 @@ mod tests {
 
     #[test]
     fn intent_ttl_defaults_and_overrides() {
-        assert_eq!(intent_ttl_secs_from(None), DEFAULT_INTENT_TTL_SECS);
-        assert_eq!(DEFAULT_INTENT_TTL_SECS, 30 * 60);
+        assert_eq!(intent_ttl_secs_from(None), DEFAULT_TTL_SECS);
+        assert_eq!(DEFAULT_TTL_SECS, 30 * 60);
         assert_eq!(intent_ttl_secs_from(Some("120")), 120);
         assert_eq!(intent_ttl_secs_from(Some(" 120 ")), 120);
         assert_eq!(
             intent_ttl_secs_from(Some("0")),
-            DEFAULT_INTENT_TTL_SECS,
+            DEFAULT_TTL_SECS,
             "zero must fall back rather than produce an already-expired claim"
         );
-        assert_eq!(intent_ttl_secs_from(Some("-5")), DEFAULT_INTENT_TTL_SECS);
-        assert_eq!(intent_ttl_secs_from(Some("soon")), DEFAULT_INTENT_TTL_SECS);
-        assert_eq!(intent_ttl_secs_from(Some("")), DEFAULT_INTENT_TTL_SECS);
+        assert_eq!(intent_ttl_secs_from(Some("-5")), DEFAULT_TTL_SECS);
+        assert_eq!(intent_ttl_secs_from(Some("soon")), DEFAULT_TTL_SECS);
+        assert_eq!(intent_ttl_secs_from(Some("")), DEFAULT_TTL_SECS);
+    }
+
+    /// A git repository whose `src/auth.rs` is committed as `"a\nb\nc\n"`,
+    /// plus a holder copy outside the repository. The separate holder file
+    /// mirrors a linked worktree: the holder committed the same base, so its
+    /// HEAD and the caller's share a merge base, while its *working copy* can
+    /// diverge without touching the caller's checkout.
+    struct ConflictFixture {
+        _repo: tempfile::TempDir,
+        _holder: tempfile::TempDir,
+        _intents: tempfile::TempDir,
+        repo: PathBuf,
+        intents: PathBuf,
+        key: String,
+        location: IntentLocation,
+        store: IntentStore,
+    }
+
+    /// Runs a git command for the fixture, under the same fork lock the
+    /// product's git helpers take: a child that execs while another test holds
+    /// a listener duplicates that fd until the exec and makes socket tests
+    /// flaky.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let _fork_guard = crate::store::port_test_support::lock();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git must be installed to run the conflict-aware tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn conflict_fixture(holder_content: &str) -> ConflictFixture {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_path_buf();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/auth.rs"), "a\nb\nc\n").unwrap();
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["add", "."]);
+        // Explicit identity and signing flags: a developer's global git config
+        // must not be able to make the fixture commit fail.
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.email=portzilla@example.com",
+                "-c",
+                "user.name=Portzilla Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        );
+
+        let holder_dir = tempfile::tempdir().unwrap();
+        let holder_file = holder_dir.path().join("auth.rs");
+        std::fs::write(&holder_file, holder_content).unwrap();
+
+        let intents_dir = tempfile::tempdir().unwrap();
+        let store = IntentStore::open(Some(intents_dir.path().to_path_buf())).unwrap();
+        let (key, located) = locate_file(&repo, Path::new("src/auth.rs"));
+        let location = IntentLocation {
+            file: holder_file,
+            worktree: repo.clone(),
+            rel: located.rel,
+        };
+        ConflictFixture {
+            repo,
+            intents: intents_dir.path().to_path_buf(),
+            key,
+            location,
+            store,
+            _repo: repo_dir,
+            _holder: holder_dir,
+            _intents: intents_dir,
+        }
+    }
+
+    impl ConflictFixture {
+        /// Seeds the holder claim the way a peer session would have. Returns
+        /// the stored record so a test can compare it before and after.
+        fn seed_holder(&self, location: Option<IntentLocation>) -> crate::intent::Intent {
+            let now = current_unix_timestamp();
+            self.store
+                .claim(
+                    &self.key,
+                    "session-theirs",
+                    now.saturating_sub(10),
+                    now + 600,
+                    location,
+                )
+                .unwrap()
+        }
+
+        fn handle(&self, edit: Option<EditInput>) -> HookOutcome {
+            handle_file_intent(
+                "src/auth.rs",
+                Some("session-mine"),
+                Some(self.repo.to_str().unwrap()),
+                edit.as_ref(),
+                Some(&self.intents),
+                false,
+            )
+        }
+    }
+
+    fn replace(old: &str, new: &str) -> EditInput {
+        EditInput {
+            old: Some(old.to_string()),
+            new: Some(new.to_string()),
+            content: None,
+        }
+    }
+
+    fn whole_file(content: &str) -> EditInput {
+        EditInput {
+            old: None,
+            new: None,
+            content: Some(content.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_clean_edit_on_a_held_file_is_allowed_with_a_warning() {
+        // The holder changed line 1; the caller changes line 3.
+        let fixture = conflict_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+        let store_before = std::fs::read(fixture.intents.join("intents.json")).unwrap();
+
+        let outcome = fixture.handle(Some(replace("c\n", "C\n")));
+
+        assert_eq!(action_of(&outcome), "warn");
+        assert!(outcome.stderr_note.is_none());
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.contains("src/auth.rs"),
+            "the warn must name the file: {reason}"
+        );
+        assert!(
+            reason.contains("session-theirs"),
+            "the warn must name the holder: {reason}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.intents.join("intents.json")).unwrap(),
+            store_before,
+            "a warn must not touch the intent store"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_edit_on_a_held_file_is_denied() {
+        // The holder changed line 1; the caller rewrites the whole file with
+        // a different line 1.
+        let fixture = conflict_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+
+        let outcome = fixture.handle(Some(whole_file("X\nb\nc\n")));
+
+        assert_eq!(action_of(&outcome), "deny");
+        assert!(outcome.stderr_note.is_none());
+        let reason = reason_of(&outcome);
+        assert!(
+            reason.to_lowercase().contains("conflict"),
+            "the deny must say the edit really conflicts: {reason}"
+        );
+        assert!(
+            reason.contains("src/auth.rs"),
+            "the deny must name the file: {reason}"
+        );
+        assert!(
+            reason.contains("session-theirs"),
+            "the deny must name the holder: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_held_file_without_a_location_is_denied() {
+        // A v1 record: the peer cannot read the holder's version, so the
+        // check is unprovable and today's deny stays.
+        let fixture = conflict_fixture("A\nb\nc\n");
+        fixture.seed_holder(None);
+
+        let outcome = fixture.handle(Some(replace("c\n", "C\n")));
+
+        assert_eq!(action_of(&outcome), "deny");
+        assert!(
+            reason_of(&outcome).contains("Do not edit it"),
+            "the v1 deny must use today's wording"
+        );
+    }
+
+    #[test]
+    fn a_missing_edit_payload_on_a_held_file_is_denied() {
+        let fixture = conflict_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+
+        let outcome = fixture.handle(None);
+
+        assert_eq!(action_of(&outcome), "deny");
+        assert!(outcome.stderr_note.is_none());
+    }
+
+    #[test]
+    fn a_warn_never_takes_over_the_claim() {
+        let fixture = conflict_fixture("A\nb\nc\n");
+        let before = fixture.seed_holder(Some(fixture.location.clone()));
+
+        let outcome = fixture.handle(Some(replace("c\n", "C\n")));
+
+        assert_eq!(action_of(&outcome), "warn");
+        let after = fixture.store.get(&fixture.key).unwrap().unwrap();
+        assert_eq!(
+            after, before,
+            "a warn must leave the holder's record byte-for-byte identical"
+        );
     }
 
     #[test]

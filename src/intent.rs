@@ -45,6 +45,13 @@
 //! command, a transfer, a bulk import), the reaping must move into that
 //! explicit operation and `claim` must stop doing it.
 
+// The error deliberately carries the holder's full location, so the adapter
+// can run the conflict check without a second store read. That makes the
+// error exceed clippy's 128-byte threshold; boxing it would allocate on a path
+// that already takes a file lock and does I/O, and would force every caller to
+// unbox before matching.
+#![allow(clippy::result_large_err)]
+
 use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -74,6 +81,15 @@ pub const MAX_INTENT_KEY_CHARS: usize = 8192;
 /// port-space precedent: far beyond the number of files a set of agent sessions
 /// edits inside one TTL window, while keeping a single listing bounded.
 const MAX_INTENTS: usize = 65_536;
+
+/// Default lifetime of a file intent, in seconds.
+///
+/// Thirty minutes covers a multi-step edit of one file in a slow agent session
+/// while still freeing a crashed session's file without manual cleanup. The
+/// OpenCode adapter and the `portzilla intent claim` CLI both start from this
+/// value; the adapter can override it with `PORTZILLA_INTENT_TTL_SECS`, the CLI
+/// with `--ttl-secs`.
+pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
 
 /// Where a claim's working copy lives, so a peer can read the exact version
 /// the holder is editing.
@@ -118,7 +134,7 @@ impl Intent {
     /// The boundary is exclusive: an intent with `expires_at == now` is
     /// already expired. Using one rule for both `list` and `claim` keeps
     /// "visible" and "stealable" from disagreeing at the exact second.
-    fn is_live_at(&self, now: u64) -> bool {
+    pub(crate) fn is_live_at(&self, now: u64) -> bool {
         now < self.expires_at
     }
 }
@@ -155,6 +171,11 @@ impl FileOps for RealFileOps {
 /// identity. See that function for the key and path-resolution rules.
 ///
 /// Keys are opaque and must never be parsed; see the module documentation.
+// The adapter and CLI resolve a key through `locate_file`, which they need for
+// the location too; this key-only wrapper is kept for callers that only need
+// identity. It is temporarily unused between the adapter's move to
+// `locate_file` and the `intent` CLI landing in the next commit.
+#[allow(dead_code)]
 pub fn key_for_file(cwd: &Path, file: &Path) -> String {
     locate_file(cwd, file).0
 }
@@ -357,6 +378,9 @@ pub enum IntentError {
         key: String,
         holder: String,
         expires_at: u64,
+        /// Where the holder's working copy lived at claim time. `None` for a
+        /// v1 record, which the conflict check cannot prove anything about.
+        location: Option<IntentLocation>,
     },
     /// A release was attempted by a session that does not own the key.
     NotOwner {
@@ -503,6 +527,7 @@ impl IntentStore {
                     key: key.to_string(),
                     holder: holder.session,
                     expires_at: holder.expires_at,
+                    location: holder.location,
                 });
             }
             Some(holder) => Intent {
@@ -955,7 +980,38 @@ mod tests {
                 ref key,
                 ref holder,
                 expires_at,
+                location: None,
             } if key == "repo:a.rs" && holder == "session-a" && expires_at == 1_800
+        ));
+    }
+
+    #[test]
+    fn held_by_carries_the_holders_location() {
+        let store = temp_store();
+        let location = IntentLocation {
+            file: PathBuf::from("/repo/src/auth.rs"),
+            worktree: PathBuf::from("/repo"),
+            rel: PathBuf::from("src/auth.rs"),
+        };
+        store
+            .claim(
+                "repo:a.rs",
+                "session-a",
+                1_000,
+                1_800,
+                Some(location.clone()),
+            )
+            .unwrap();
+
+        let err = store
+            .claim("repo:a.rs", "session-b", 1_100, 1_900, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IntentError::HeldBy {
+                location: Some(ref carried),
+                ..
+            } if carried == &location
         ));
     }
 
