@@ -105,13 +105,67 @@ removed, so their `alive` value is `false`:
 {"event":"watch_cycle","pruned":[{"port":3000,"pid":57107,"tag":"next-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"age_secs":3,"alive":false}]}
 ```
 
+## File intents
+
+File intents record which session is editing which file, keyed by repository plus repo-relative path (`<git-common-dir>:<path>`), so two worktrees of one repository share the key. The OpenCode guard consults them automatically (see [File intents](../README.md#file-intents-opencode)); these commands let a human do the same by hand. State lives in `<data_dir>/intents.json`, written atomically under its own lock.
+
+Sessions are resolved in this order: `--session`, `$PORTZILLA_SESSION`, `$CLAUDE_CODE_SESSION_ID`. `claim` and `release` need one and exit `1` with an instruction when none is available; `who` and `ls` do not.
+
+Paths are resolved against the current directory. `claim` also records the holder's working copy (absolute path, worktree root, repo-relative path), which is what lets a peer prove whether its pending edit merges cleanly.
+
+### `portzilla intent claim <PATH> [--ttl-secs <SECONDS>] [--session <SESSION>] [--json]`
+
+Claims `<PATH>` for the caller's session, or refreshes the caller's existing claim in place (the original `created_at` is kept). A live claim held by another session is refused with exit `1` and the holder's name.
+
+- `--ttl-secs <SECONDS>` — how long the claim stays binding, `1` through `86400`, default `1800` (30 minutes). Zero or above 24 hours is rejected before the store is touched.
+- `--session <SESSION>` — overrides the environment fallbacks.
+- `--json` — print the intent view instead of a one-line confirmation.
+
+### `portzilla intent who <PATH> [--json]`
+
+Prints the live claim on `<PATH>`. Exits `2` and prints nothing to stdout when the file has no live claim (an expired record is not live).
+
+### `portzilla intent ls [--json]`
+
+Lists every live claim, sorted by key. Human output is a table (`KEY SESSION AGE EXPIRES`, with age and remaining time in seconds); an empty store prints `no live file intents`. JSON output is an array of intent views.
+
+### `portzilla intent release <PATH> [--session <SESSION>] [--json]`
+
+Removes the caller's own claim. A claim held by another session is refused with exit `1` and the holder's name. Releasing a file with no claim is success (exit `0`): release is idempotent, so a retry after a crash needs no special case.
+
+`release --json` has two shapes. A successful release prints the removed claim as a full intent view (the seven fields below). Releasing an absent claim prints only:
+
+```json
+{"released":false,"key":"<git-common-dir>:<path>","file":"/repo/src/auth.rs"}
+```
+
+Do not assume the seven-field view for every `release --json` result; check for `released` first.
+
+### Intent JSON view (`claim`, `who`, `ls`, `release`)
+
+```json
+{
+  "key": "<git-common-dir>:src/auth.rs",
+  "file": "/repo/src/auth.rs",
+  "session": "session-a",
+  "created_at": 1785959877,
+  "expires_at": 1785961677,
+  "age_secs": 12,
+  "live": true
+}
+```
+
+`key` is opaque; do not parse it (the `:` separator is ambiguous on Windows). `file` is the holder's absolute working copy, and is `null` for a claim written by a v1 binary, which stores no location. `created_at` and `expires_at` are Unix seconds; `age_secs` is `now - created_at`; `live` is `now < expires_at`. `ls` filters to live claims; `who` reports only a live record; `release` also removes a lapsed record the caller owns.
+
+Schema: `intents.json` is a versioned envelope, currently `format_version: 2`. v1 files (no `location`) are read and upgraded on the next write. Unknown future versions are rejected without modifying the file. An older binary cannot safely read a v2 file: upgrade it before pointing it at the same data directory.
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| `0`  | Success |
-| `1`  | Unexpected error (I/O failure, corrupt state file, lock failure) |
-| `2`  | Requested lease not found (`who` / `release` on a port with no lease) |
+| `0`  | Success. For `intent release`, also a claim that was already absent |
+| `1`  | Unexpected error (I/O failure, corrupt state file, lock failure); for `intent`, also a claim held by another session, a release by a non-owner, or a missing session |
+| `2`  | Requested record not found: `who` / `release` on a port with no lease, or `intent who` on a file with no live claim |
 
 ## JSON output shapes
 

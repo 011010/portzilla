@@ -57,7 +57,12 @@ use std::sync::Arc;
 /// Version of the `intents.json` envelope. Bump it when the stored shape
 /// changes incompatibly so an older binary refuses to touch a newer file
 /// instead of corrupting it.
-const INTENT_FORMAT_VERSION: u32 = 1;
+const INTENT_FORMAT_VERSION: u32 = 2;
+
+/// Oldest envelope this build still reads. v1 records have no `location`; they
+/// are read with a `None` location and upgraded the next time the file is
+/// written, so an existing data directory keeps working after the upgrade.
+const MIN_READABLE_INTENT_FORMAT_VERSION: u32 = 1;
 
 /// Upper bound on a normalized intent key, in CHARACTERS. A key normally
 /// holds a repository path plus a relative path; 8192 characters is far beyond
@@ -70,9 +75,35 @@ pub const MAX_INTENT_KEY_CHARS: usize = 8192;
 /// edits inside one TTL window, while keeping a single listing bounded.
 const MAX_INTENTS: usize = 65_536;
 
+/// Default lifetime of a file intent, in seconds.
+///
+/// Thirty minutes covers a multi-step edit of one file in a slow agent session
+/// while still freeing a crashed session's file without manual cleanup. The
+/// OpenCode adapter and the `portzilla intent claim` CLI both start from this
+/// value; the adapter can override it with `PORTZILLA_INTENT_TTL_SECS`, the CLI
+/// with `--ttl-secs`.
+pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
+
+/// Where a claim's working copy lives, so a peer can read the exact version
+/// the holder is editing.
+///
+/// Persisted inside the intent record as a single `location` object. A v1
+/// record has no such key and deserializes the field as `None`; the conflict
+/// check treats that as "cannot prove clean".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntentLocation {
+    /// Canonical absolute path of the file the holder is editing.
+    pub file: PathBuf,
+    /// Worktree root the file was resolved against.
+    pub worktree: PathBuf,
+    /// Path below `worktree`, as git printed it. Absolute when the file is not
+    /// inside any git work tree.
+    pub rel: PathBuf,
+}
+
 /// A claim that `session` is editing `key` until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Intent {
     pub key: String,
     pub session: String,
@@ -82,6 +113,10 @@ pub struct Intent {
     pub created_at: u64,
     /// Unix timestamp after which the claim is no longer binding.
     pub expires_at: u64,
+    /// Where the holder's working copy lived when the claim was recorded.
+    /// `None` for records written by a v1 binary.
+    #[serde(default)]
+    pub location: Option<IntentLocation>,
 }
 
 impl Intent {
@@ -90,7 +125,7 @@ impl Intent {
     /// The boundary is exclusive: an intent with `expires_at == now` is
     /// already expired. Using one rule for both `list` and `claim` keeps
     /// "visible" and "stealable" from disagreeing at the exact second.
-    fn is_live_at(&self, now: u64) -> bool {
+    pub(crate) fn is_live_at(&self, now: u64) -> bool {
         now < self.expires_at
     }
 }
@@ -123,6 +158,17 @@ impl FileOps for RealFileOps {
 
 /// Returns the intent key for `file` as seen from `cwd`.
 ///
+/// Thin wrapper over [`locate_file`] for callers that only need repository
+/// identity. See that function for the key and path-resolution rules.
+///
+/// Keys are opaque and must never be parsed; see the module documentation.
+pub fn key_for_file(cwd: &Path, file: &Path) -> String {
+    locate_file(cwd, file).0
+}
+
+/// Returns the intent key for `file` as seen from `cwd`, plus the parts a peer
+/// needs to read the holder's working copy.
+///
 /// Inside a git work tree the key is `<git-common-dir>:<repo-relative-path>`.
 /// Repository identity is the *common* dir, not the worktree root, so the same
 /// relative file in two linked worktrees of one repository produces one key —
@@ -138,31 +184,58 @@ impl FileOps for RealFileOps {
 /// directory — would produce different keys, and a peer's claim would be
 /// silently invisible.
 ///
+/// The location's [`rel`](IntentLocation::rel) is the path below the worktree
+/// git reported. Outside a git work tree there is no root to be relative to,
+/// so `rel` is the absolute path and [`worktree`](IntentLocation::worktree) is
+/// the file's parent directory (the nearest anchor a later git call can start
+/// from).
+///
 /// Keys are opaque and must never be parsed; see the module documentation.
-pub fn key_for_file(cwd: &Path, file: &Path) -> String {
+pub fn locate_file(cwd: &Path, file: &Path) -> (String, IntentLocation) {
     let cwd = canonicalize_or_owned(cwd);
     let absolute = canonicalize_deepest_existing(&absolute_path(&cwd, file));
-    let outside_git = || absolute.to_string_lossy().into_owned();
 
     let Some(git_paths) = git_stdout(&cwd, &["rev-parse", "--show-toplevel", "--git-common-dir"])
     else {
-        return outside_git();
+        return outside_git_location(absolute);
     };
     let mut lines = git_paths.lines();
     let (Some(toplevel), Some(common_dir)) = (lines.next(), lines.next()) else {
-        return outside_git();
+        return outside_git_location(absolute);
     };
 
     let toplevel = canonicalize_or_owned(Path::new(toplevel));
     let Some(relative) = relative_to(&absolute, &toplevel) else {
-        return outside_git();
+        return outside_git_location(absolute);
     };
     let common_dir = resolve_common_dir(&cwd, Path::new(common_dir));
-    format!(
+    let key = format!(
         "{}:{}",
         common_dir.to_string_lossy(),
         relative.to_string_lossy()
-    )
+    );
+    let location = IntentLocation {
+        file: absolute,
+        worktree: toplevel,
+        rel: relative,
+    };
+    (key, location)
+}
+
+/// Builds the key and location for a file with no git repository behind it:
+/// the key is the absolute path, and the location names that same path as both
+/// the file and the relative path, with its parent as the worktree anchor.
+fn outside_git_location(absolute: PathBuf) -> (String, IntentLocation) {
+    let worktree = absolute
+        .parent()
+        .map_or_else(|| absolute.clone(), Path::to_path_buf);
+    let key = absolute.to_string_lossy().into_owned();
+    let location = IntentLocation {
+        file: absolute.clone(),
+        worktree,
+        rel: absolute,
+    };
+    (key, location)
 }
 
 /// Runs `git -C cwd <args>` and returns the non-empty stdout with trailing
@@ -284,13 +357,15 @@ fn canonicalize_or_owned(path: &Path) -> PathBuf {
 /// wraps everything else (lock, I/O, malformed JSON) so short-circuiting with
 /// `?` stays ergonomic inside this module.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum IntentError {
     /// Another live session owns the key.
     HeldBy {
         key: String,
         holder: String,
         expires_at: u64,
+        /// Where the holder's working copy lived at claim time. `None` for a
+        /// v1 record, which the conflict check cannot prove anything about.
+        location: Option<IntentLocation>,
     },
     /// A release was attempted by a session that does not own the key.
     NotOwner {
@@ -344,6 +419,20 @@ impl std::error::Error for IntentError {
     }
 }
 
+impl IntentError {
+    /// Absolute expiry of the claim that caused the refusal, when the variant
+    /// carries one. The CLI renders it as "expires in Ns" so a human knows how
+    /// long waiting actually takes.
+    pub(crate) fn expires_at(&self) -> Option<u64> {
+        match self {
+            Self::HeldBy { expires_at, .. } | Self::NotOwner { expires_at, .. } => {
+                Some(*expires_at)
+            }
+            Self::Capacity { .. } | Self::Invalid(_) | Self::Store(_) => None,
+        }
+    }
+}
+
 impl From<anyhow::Error> for IntentError {
     fn from(error: anyhow::Error) -> Self {
         Self::Store(error)
@@ -361,13 +450,11 @@ pub type IntentResult<T> = std::result::Result<T, IntentError>;
 /// temp file plus rename. Reads take the lock too, so a reader never observes a
 /// partially written file or races a rename.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct IntentStore {
     data_dir: PathBuf,
     file_ops: Arc<dyn FileOps>,
 }
 
-#[allow(dead_code)]
 impl IntentStore {
     /// Opens the intent store, resolving the same data directory as the lease
     /// store (`PORTZILLA_DATA_DIR`, then XDG/HOME) unless `override_dir` is
@@ -406,17 +493,31 @@ impl IntentStore {
     ///   original `created_at`, so the age of the claim stays visible
     /// - a different live session: refuse with [`IntentError::HeldBy`]
     ///
+    /// `location` is where the caller's working copy lives. It is stored on
+    /// create; on a same-session refresh a supplied location replaces the old
+    /// one, while `None` keeps it, so a refresh never erases where the
+    /// holder's file is.
+    ///
     /// While the file is open for writing, expired records for other keys are
     /// dropped too. `claim` is the only operation allowed to delete records it
     /// does not own, so it doubles as the reaper. A new key is refused once the
     /// store holds [`MAX_INTENTS`] records; refreshing an existing key still
     /// works at the cap because it replaces its own record.
+    // The error deliberately carries the holder's full location, so the adapter
+    // can run the conflict check without a second store read. That makes it
+    // exceed clippy's 128-byte threshold; boxing it would allocate on a path
+    // that already takes a file lock and does I/O, and would force every caller
+    // to unbox before matching. The allow is scoped to the functions that
+    // return an `IntentResult`, not applied to the whole module, so the lint
+    // still fires on any new one.
+    #[allow(clippy::result_large_err)]
     pub fn claim(
         &self,
         key: &str,
         session: &str,
         now: u64,
         expires_at: u64,
+        location: Option<IntentLocation>,
     ) -> IntentResult<Intent> {
         validate_claim_inputs(key, session, now, expires_at)?;
         let _guard = self.lock_exclusive()?;
@@ -431,6 +532,7 @@ impl IntentStore {
                     key: key.to_string(),
                     holder: holder.session,
                     expires_at: holder.expires_at,
+                    location: holder.location,
                 });
             }
             Some(holder) => Intent {
@@ -438,12 +540,14 @@ impl IntentStore {
                 session: session.to_string(),
                 created_at: holder.created_at,
                 expires_at,
+                location: location.or(holder.location),
             },
             None => Intent {
                 key: key.to_string(),
                 session: session.to_string(),
                 created_at: now,
                 expires_at,
+                location,
             },
         };
         // Expired entries are reaped here, including an expired record for
@@ -465,6 +569,7 @@ impl IntentStore {
     /// This reports the record exactly as persisted, expiry included: it takes
     /// no clock. Liveness is a caller concern — use [`IntentStore::list`] for
     /// the live view at a given time.
+    #[allow(clippy::result_large_err)]
     pub fn get(&self, key: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let intents = self.read_intents_unlocked()?;
@@ -478,6 +583,7 @@ impl IntentStore {
     /// monitoring call contend with real claims and widen the window for a
     /// failed rename. The next `claim` reaps the entries under the lock, so the
     /// file still stays bounded.
+    #[allow(clippy::result_large_err)]
     pub fn list(&self, now: u64) -> IntentResult<Vec<Intent>> {
         let _guard = self.lock_exclusive()?;
         let intents = self.read_intents_unlocked()?;
@@ -500,6 +606,7 @@ impl IntentStore {
     ///
     /// This path must never reap: deleting a record this session does not own
     /// would break the single-owner contract that makes `claim`'s reaping safe.
+    #[allow(clippy::result_large_err)]
     pub fn release(&self, key: &str, session: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
         let mut intents = self.read_intents_unlocked()?;
@@ -571,12 +678,14 @@ impl IntentStore {
                 path.display()
             )
         })?;
-        if stored.format_version != INTENT_FORMAT_VERSION {
+        if !(MIN_READABLE_INTENT_FORMAT_VERSION..=INTENT_FORMAT_VERSION)
+            .contains(&stored.format_version)
+        {
             bail!(
-                "unsupported intents file format version {} at {}; expected {}",
-                stored.format_version,
+                "intents.json at {} uses format_version {}, which this build does not \
+                 understand; upgrade portzilla. The file was not modified",
                 path.display(),
-                INTENT_FORMAT_VERSION
+                stored.format_version
             );
         }
         validate_stored_intents(&stored.intents, &path)?;
@@ -621,6 +730,7 @@ impl IntentStore {
 /// for the same reason the lease store bounds its tags: these values are
 /// persisted and echoed back by every listing. `expires_at` must be in the
 /// future, otherwise the "claim" would be born expired and could never bind.
+#[allow(clippy::result_large_err)]
 fn validate_claim_inputs(key: &str, session: &str, now: u64, expires_at: u64) -> IntentResult<()> {
     if key.is_empty() {
         return Err(IntentError::Invalid(
@@ -748,6 +858,7 @@ mod tests {
                 session: format!("session-{index}"),
                 created_at: 1_000,
                 expires_at,
+                location: None,
             })
             .collect();
         let json = serde_json::to_vec(&StoredIntents {
@@ -762,7 +873,7 @@ mod tests {
     fn claim_then_get_returns_the_same_intent() {
         let store = temp_store();
         store
-            .claim("repo:src/auth.rs", "session-a", 1_000, 1_800)
+            .claim("repo:src/auth.rs", "session-a", 1_000, 1_800, None)
             .unwrap();
         let got = store.get("repo:src/auth.rs").unwrap().unwrap();
         assert_eq!(got.session, "session-a");
@@ -770,11 +881,104 @@ mod tests {
     }
 
     #[test]
+    fn claim_with_a_location_persists_it() {
+        let store = temp_store();
+        let location = IntentLocation {
+            file: PathBuf::from("/repo/src/auth.rs"),
+            worktree: PathBuf::from("/repo"),
+            rel: PathBuf::from("src/auth.rs"),
+        };
+        store
+            .claim(
+                "repo:src/auth.rs",
+                "session-a",
+                1_000,
+                1_800,
+                Some(location.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("repo:src/auth.rs").unwrap().unwrap().location,
+            Some(location)
+        );
+    }
+
+    #[test]
+    fn a_v1_file_without_locations_is_upgraded_on_write() {
+        let store = temp_store();
+        // A v1 record: no `location` field anywhere.
+        let original = br#"{"format_version":1,"intents":[
+            {"key":"repo:a.rs","session":"session-a","created_at":1000,"expires_at":1800}
+        ]}"#;
+        fs::write(store.state_file_path(), original).unwrap();
+        let location = IntentLocation {
+            file: PathBuf::from("/repo/src/auth.rs"),
+            worktree: PathBuf::from("/repo"),
+            rel: PathBuf::from("src/auth.rs"),
+        };
+
+        store
+            .claim(
+                "repo:a.rs",
+                "session-a",
+                1_500,
+                2_300,
+                Some(location.clone()),
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(store.state_file_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["format_version"].as_u64(), Some(2));
+        let record = &value["intents"][0];
+        assert_eq!(record["key"], "repo:a.rs");
+        assert_eq!(record["location"]["file"], "/repo/src/auth.rs");
+        assert_eq!(record["location"]["worktree"], "/repo");
+        assert_eq!(record["location"]["rel"], "src/auth.rs");
+        // The upgraded file still reads back through the typed API.
+        assert_eq!(
+            store.get("repo:a.rs").unwrap().unwrap().location,
+            Some(location)
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_the_original_location() {
+        let store = temp_store();
+        let location = IntentLocation {
+            file: PathBuf::from("/repo/src/auth.rs"),
+            worktree: PathBuf::from("/repo"),
+            rel: PathBuf::from("src/auth.rs"),
+        };
+        store
+            .claim(
+                "repo:a.rs",
+                "session-a",
+                1_000,
+                1_800,
+                Some(location.clone()),
+            )
+            .unwrap();
+
+        // A refresh without a location must not erase the one already stored.
+        store
+            .claim("repo:a.rs", "session-a", 1_500, 2_300, None)
+            .unwrap();
+
+        let got = store.get("repo:a.rs").unwrap().unwrap();
+        assert_eq!(got.location, Some(location));
+        assert_eq!(got.created_at, 1_000);
+        assert_eq!(got.expires_at, 2_300);
+    }
+
+    #[test]
     fn other_session_cannot_claim_a_live_intent() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         let err = store
-            .claim("repo:a.rs", "session-b", 1_100, 1_900)
+            .claim("repo:a.rs", "session-b", 1_100, 1_900, None)
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("repo:a.rs"));
@@ -785,15 +989,50 @@ mod tests {
                 ref key,
                 ref holder,
                 expires_at,
+                location: None,
             } if key == "repo:a.rs" && holder == "session-a" && expires_at == 1_800
+        ));
+    }
+
+    #[test]
+    fn held_by_carries_the_holders_location() {
+        let store = temp_store();
+        let location = IntentLocation {
+            file: PathBuf::from("/repo/src/auth.rs"),
+            worktree: PathBuf::from("/repo"),
+            rel: PathBuf::from("src/auth.rs"),
+        };
+        store
+            .claim(
+                "repo:a.rs",
+                "session-a",
+                1_000,
+                1_800,
+                Some(location.clone()),
+            )
+            .unwrap();
+
+        let err = store
+            .claim("repo:a.rs", "session-b", 1_100, 1_900, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IntentError::HeldBy {
+                location: Some(ref carried),
+                ..
+            } if carried == &location
         ));
     }
 
     #[test]
     fn same_session_refreshes_its_own_intent() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
-        store.claim("repo:a.rs", "session-a", 1_500, 2_300).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_500, 2_300, None)
+            .unwrap();
         let got = store.get("repo:a.rs").unwrap().unwrap();
         assert_eq!(got.expires_at, 2_300);
         assert_eq!(got.created_at, 1_000);
@@ -802,8 +1041,12 @@ mod tests {
     #[test]
     fn expired_intent_can_be_taken_by_another_session() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
-        store.claim("repo:a.rs", "session-b", 1_801, 3_601).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:a.rs", "session-b", 1_801, 3_601, None)
+            .unwrap();
         assert_eq!(
             store.get("repo:a.rs").unwrap().unwrap().session,
             "session-b"
@@ -813,7 +1056,9 @@ mod tests {
     #[test]
     fn release_only_by_owner() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         let err = store.release("repo:a.rs", "session-b").unwrap_err();
         let message = err.to_string();
         assert!(message.contains("repo:a.rs"));
@@ -840,7 +1085,9 @@ mod tests {
     #[test]
     fn release_of_an_absent_key_is_idempotent() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         let before = fs::read(store.state_file_path()).unwrap();
         assert!(matches!(
             store.release("repo:never-claimed.rs", "any-session"),
@@ -852,7 +1099,9 @@ mod tests {
     #[test]
     fn list_drops_expired_entries_on_read() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         assert!(store.list(2_000).unwrap().is_empty());
     }
 
@@ -860,10 +1109,10 @@ mod tests {
     fn list_keeps_live_entries_while_dropping_expired_ones() {
         let store = temp_store();
         store
-            .claim("repo:live.rs", "session-a", 1_000, 1_800)
+            .claim("repo:live.rs", "session-a", 1_000, 1_800, None)
             .unwrap();
         store
-            .claim("repo:stale.rs", "session-b", 500, 1_500)
+            .claim("repo:stale.rs", "session-b", 500, 1_500, None)
             .unwrap();
         let listed = store.list(1_600).unwrap();
         assert_eq!(listed.len(), 1);
@@ -874,10 +1123,10 @@ mod tests {
     fn list_does_not_persist_pruning() {
         let store = temp_store();
         store
-            .claim("repo:live.rs", "session-a", 1_000, 3_000)
+            .claim("repo:live.rs", "session-a", 1_000, 3_000, None)
             .unwrap();
         store
-            .claim("repo:stale.rs", "session-b", 1_000, 1_500)
+            .claim("repo:stale.rs", "session-b", 1_000, 1_500, None)
             .unwrap();
         let before = fs::read(store.state_file_path()).unwrap();
         assert_eq!(store.list(2_000).unwrap().len(), 1);
@@ -888,13 +1137,13 @@ mod tests {
     fn claiming_one_key_reaps_expired_records_but_keeps_live_ones() {
         let store = temp_store();
         store
-            .claim("repo:expired.rs", "session-b", 1_000, 1_500)
+            .claim("repo:expired.rs", "session-b", 1_000, 1_500, None)
             .unwrap();
         store
-            .claim("repo:live.rs", "session-c", 1_000, 3_000)
+            .claim("repo:live.rs", "session-c", 1_000, 3_000, None)
             .unwrap();
         store
-            .claim("repo:claimed.rs", "session-a", 1_600, 2_000)
+            .claim("repo:claimed.rs", "session-a", 1_600, 2_000, None)
             .unwrap();
 
         // The first record is gone from disk, not just from a listing.
@@ -909,7 +1158,9 @@ mod tests {
     #[test]
     fn intents_file_uses_the_versioned_envelope() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         let path = store.state_file_path();
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "intents.json");
 
@@ -923,8 +1174,10 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["format_version", "intents"]);
-        assert_eq!(value["format_version"].as_u64(), Some(1));
+        assert_eq!(value["format_version"].as_u64(), Some(2));
         assert_eq!(value["intents"].as_array().unwrap().len(), 1);
+        // A record without a location still serializes the field, as null.
+        assert_eq!(value["intents"][0]["location"], serde_json::Value::Null);
     }
 
     struct RenameFailFileOps;
@@ -943,7 +1196,9 @@ mod tests {
     fn rename_failure_preserves_previous_state_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
         let before = fs::read(store.state_file_path()).unwrap();
 
         let failing = IntentStore {
@@ -951,7 +1206,7 @@ mod tests {
             file_ops: Arc::new(RenameFailFileOps),
         };
         let err = failing
-            .claim("repo:b.rs", "session-b", 1_000, 1_800)
+            .claim("repo:b.rs", "session-b", 1_000, 1_800, None)
             .unwrap_err();
         assert!(format!("{err:#}").contains("injected rename failure"));
         assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
@@ -964,7 +1219,7 @@ mod tests {
         let before = fs::read(store.state_file_path()).unwrap();
 
         let err = store
-            .claim("repo:new.rs", "session-new", 1_000, 2_000)
+            .claim("repo:new.rs", "session-new", 1_000, 2_000, None)
             .unwrap_err();
         assert!(matches!(err, IntentError::Capacity { max: MAX_INTENTS }));
         assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
@@ -972,7 +1227,7 @@ mod tests {
         // An existing key still refreshes: it replaces its own record, so the
         // record count does not grow.
         store
-            .claim("repo:file0.rs", "session-0", 1_000, 20_000)
+            .claim("repo:file0.rs", "session-0", 1_000, 20_000, None)
             .unwrap();
         assert_eq!(
             store.get("repo:file0.rs").unwrap().unwrap().expires_at,
@@ -1000,7 +1255,9 @@ mod tests {
         let max_key = "k".repeat(MAX_INTENT_KEY_CHARS);
         let max_session = "s".repeat(MAX_SESSION_CHARS);
 
-        store.claim(&max_key, &max_session, 1_000, 1_800).unwrap();
+        store
+            .claim(&max_key, &max_session, 1_000, 1_800, None)
+            .unwrap();
         assert_eq!(store.get(&max_key).unwrap().unwrap().session, max_session);
     }
 
@@ -1011,12 +1268,12 @@ mod tests {
         let long_session = "s".repeat(MAX_SESSION_CHARS + 1);
 
         let err = store
-            .claim(&long_key, "session-a", 1_000, 1_800)
+            .claim(&long_key, "session-a", 1_000, 1_800, None)
             .unwrap_err();
         assert!(matches!(err, IntentError::Invalid(message) if message.contains("at most")));
 
         let err = store
-            .claim("repo:a.rs", &long_session, 1_000, 1_800)
+            .claim("repo:a.rs", &long_session, 1_000, 1_800, None)
             .unwrap_err();
         assert!(matches!(err, IntentError::Invalid(message) if message.contains("at most")));
     }
@@ -1025,16 +1282,16 @@ mod tests {
     fn empty_inputs_and_a_non_future_expiry_are_rejected() {
         let store = temp_store();
         assert!(matches!(
-            store.claim("", "session-a", 1_000, 1_800).unwrap_err(),
+            store.claim("", "session-a", 1_000, 1_800, None).unwrap_err(),
             IntentError::Invalid(message) if message.contains("key must not be empty")
         ));
         assert!(matches!(
-            store.claim("repo:a.rs", "", 1_000, 1_800).unwrap_err(),
+            store.claim("repo:a.rs", "", 1_000, 1_800, None).unwrap_err(),
             IntentError::Invalid(message) if message.contains("session must not be empty")
         ));
         for expires_at in [1_000, 999] {
             let err = store
-                .claim("repo:a.rs", "session-a", 1_000, expires_at)
+                .claim("repo:a.rs", "session-a", 1_000, expires_at, None)
                 .unwrap_err();
             assert!(
                 matches!(err, IntentError::Invalid(message) if message.contains("must be after"))
@@ -1067,9 +1324,18 @@ mod tests {
         fs::write(store.state_file_path(), &original).unwrap();
 
         let err = store.get("repo:a.rs").unwrap_err();
+        let message = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("unsupported intents file format version 99"),
-            "unexpected error: {err:#}"
+            message.contains("format_version 99"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&store.state_file_path().display().to_string()),
+            "the error must name the file: {message}"
+        );
+        assert!(
+            message.contains("was not modified"),
+            "the error must say the file is untouched: {message}"
         );
         assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
     }
@@ -1086,7 +1352,7 @@ mod tests {
 
         // Use the write path to prove a rejected read never clobbers the file.
         let err = store
-            .claim("repo:new.rs", "session-c", 1_000, 2_000)
+            .claim("repo:new.rs", "session-c", 1_000, 2_000, None)
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("duplicate intent key"),
@@ -1098,12 +1364,16 @@ mod tests {
     #[test]
     fn expiry_boundary_is_exclusive_for_list_and_claim() {
         let store = temp_store();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
 
         // At exactly `expires_at` the record is no longer visible...
         assert!(store.list(1_800).unwrap().is_empty());
         // ...and a different session may take it at that instant.
-        store.claim("repo:a.rs", "session-b", 1_800, 2_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-b", 1_800, 2_800, None)
+            .unwrap();
         assert_eq!(
             store.get("repo:a.rs").unwrap().unwrap().session,
             "session-b"
@@ -1114,7 +1384,9 @@ mod tests {
     fn a_second_store_handle_sees_claims_from_the_first() {
         let store = temp_store();
         let peer = IntentStore::open(Some(store.dir_path())).unwrap();
-        store.claim("repo:a.rs", "session-a", 1_000, 1_800).unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
 
         let got = peer.get("repo:a.rs").unwrap().unwrap();
         assert_eq!(got.session, "session-a");
@@ -1123,6 +1395,9 @@ mod tests {
     const RACING_SESSIONS: usize = 8;
 
     #[test]
+    // The spawned closure returns `store.claim(...)`, so it inherits the
+    // intentional large `IntentError`; see `IntentStore::claim`.
+    #[allow(clippy::result_large_err)]
     fn concurrent_claims_of_one_key_have_exactly_one_winner() {
         use std::sync::{Arc, Barrier};
 
@@ -1137,7 +1412,7 @@ mod tests {
                     barrier.wait();
                     let session = format!("session-{index}");
                     store
-                        .claim("repo:a.rs", &session, 1_000, 1_800)
+                        .claim("repo:a.rs", &session, 1_000, 1_800, None)
                         .map(|_| session)
                 })
             })

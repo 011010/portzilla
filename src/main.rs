@@ -1,6 +1,7 @@
 mod audit;
 mod claude_code;
 mod codex;
+mod conflict;
 mod cursor;
 mod gemini;
 mod guard;
@@ -22,8 +23,11 @@ use audit::{
     LeaseSnapshot, ProcessExitOutcome,
 };
 use clap::{Parser, Subcommand};
+use intent::{Intent, IntentStore, key_for_file, locate_file};
 use lease::{Lease, PidChecker, SystemPidChecker};
+use serde::Serialize;
 use std::io::Read;
+use std::path::PathBuf;
 use store::{ClaimOutcome, Store};
 use view::{LeaseView, to_claim_view, to_view};
 
@@ -217,6 +221,58 @@ enum Commands {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Inspect and manage file intents: which session is editing which file.
+    Intent {
+        #[command(subcommand)]
+        command: IntentCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntentCommands {
+    /// Claim a file for this session so another session's edits are checked
+    /// against it.
+    Claim {
+        /// The file to claim, absolute or relative to the current directory.
+        path: PathBuf,
+        /// How long the claim stays binding, in seconds (default: 1800,
+        /// maximum: 86400).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// Session id to claim under. Falls back to PORTZILLA_SESSION, then
+        /// CLAUDE_CODE_SESSION_ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which session holds a file.
+    Who {
+        /// The file to look up.
+        path: PathBuf,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List live file claims.
+    Ls {
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release this session's claim before it expires.
+    Release {
+        /// The file whose claim should be released.
+        path: PathBuf,
+        /// Session id releasing the claim. Falls back to PORTZILLA_SESSION,
+        /// then CLAUDE_CODE_SESSION_ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -312,8 +368,15 @@ enum InitHarness {
 /// Exit code for "the requested lease does not exist" — distinct from the
 /// generic exit code 1 used for unexpected/internal errors (I/O failures,
 /// corrupt state, lock failures, etc.). A missing lease is an expected,
-/// well-defined outcome, not a tool failure.
+/// well-defined outcome, not a tool failure. The `intent` commands reuse it
+/// for a file with no live claim.
 const EXIT_NOT_FOUND: i32 = 2;
+
+/// Bounds for `portzilla intent claim --ttl-secs`. Zero would create a claim
+/// that is expired the moment it is written, and 24 hours is the longest a
+/// crashed session should be able to hold a file before a peer can take it.
+const MIN_INTENT_TTL_SECS: u64 = 1;
+const MAX_INTENT_TTL_SECS: u64 = 86_400;
 
 fn main() {
     match run() {
@@ -321,6 +384,14 @@ fn main() {
         Err(RunError::NotFound(port)) => {
             eprintln!("no lease found for port {port}");
             std::process::exit(EXIT_NOT_FOUND);
+        }
+        Err(RunError::IntentNotFound(file)) => {
+            eprintln!("no live file intent found for {file}");
+            std::process::exit(EXIT_NOT_FOUND);
+        }
+        Err(RunError::Message(message)) => {
+            eprintln!("{message}");
+            std::process::exit(1);
         }
         Err(RunError::Other(err)) => {
             eprintln!("error: {err:#}");
@@ -334,12 +405,32 @@ fn main() {
 /// an actual failure.
 enum RunError {
     NotFound(u16),
+    /// A file has no live intent. Carries the path as the user spelled it so
+    /// the message names what they asked about, not an opaque store key.
+    IntentNotFound(String),
+    /// A usage error whose text is already the complete message (a missing
+    /// session, a nonsensical TTL). Printed without the `error:` prefix so it
+    /// reads as the instruction it is.
+    Message(String),
     Other(anyhow::Error),
 }
 
 impl From<anyhow::Error> for RunError {
     fn from(err: anyhow::Error) -> Self {
         RunError::Other(err)
+    }
+}
+
+impl From<intent::IntentError> for RunError {
+    fn from(err: intent::IntentError) -> Self {
+        // A held-by-another or not-the-owner refusal carries the holder's
+        // expiry. Say how long the block lasts instead of making the user
+        // subtract timestamps.
+        let Some(expires_at) = err.expires_at() else {
+            return RunError::Other(err.into());
+        };
+        let remaining = expires_at.saturating_sub(lease::current_unix_timestamp());
+        RunError::Other(anyhow::anyhow!("{err} (expires in {remaining}s)"))
     }
 }
 
@@ -504,8 +595,228 @@ fn run() -> Result<(), RunError> {
                 print_history(&page, json);
             }
         }
+        Commands::Intent { command } => run_intent_command(command)?,
     }
     Ok(())
+}
+
+/// Runs one `portzilla intent` subcommand.
+///
+/// `claim` and `release` need an attributable session; `who` and `ls` do not.
+/// A path is resolved once into the store's opaque key, and `claim` also
+/// records the located working copy so peers can run the conflict check
+/// against the claim the CLI created.
+fn run_intent_command(command: IntentCommands) -> Result<(), RunError> {
+    let store = IntentStore::open(None)?;
+    let now = lease::current_unix_timestamp();
+    let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
+
+    match command {
+        IntentCommands::Claim {
+            path,
+            ttl_secs,
+            session,
+            json,
+        } => {
+            let session = intent_session("claim", session.as_deref())?;
+            let ttl = intent_ttl_secs(ttl_secs)?;
+            let (key, location) = locate_file(&cwd, &path);
+            let intent = store.claim(&key, &session, now, now + ttl, Some(location))?;
+            print_intent_claim(&intent, ttl, json);
+        }
+        IntentCommands::Who { path, json } => match store.get(&key_for_file(&cwd, &path))? {
+            Some(intent) if intent.is_live_at(now) => print_intent_who(&intent, now, json),
+            _ => {
+                return Err(RunError::IntentNotFound(sanitize_for_display(
+                    &path.display().to_string(),
+                )));
+            }
+        },
+        IntentCommands::Ls { json } => {
+            let mut intents = store.list(now)?;
+            // Stable, script-friendly order independent of the store's
+            // insertion order.
+            intents.sort_by(|left, right| left.key.cmp(&right.key));
+            print_intents(&intents, now, json);
+        }
+        IntentCommands::Release {
+            path,
+            session,
+            json,
+        } => {
+            let session = intent_session("release", session.as_deref())?;
+            let (key, location) = locate_file(&cwd, &path);
+            match store.release(&key, &session)? {
+                Some(intent) => print_intent_release(&intent, now, json),
+                None => print_intent_absent_release(&location.file, &key, json),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the session a command must attribute its write to, or fails with
+/// the exact instruction the user needs. `--session` wins; the environment
+/// fallbacks are the same ones the lease commands use.
+fn intent_session(command: &str, explicit: Option<&str>) -> Result<String, RunError> {
+    resolve_cli_actor_session(explicit).ok_or_else(|| {
+        RunError::Message(format!(
+            "intent {command} needs a session: pass --session or set PORTZILLA_SESSION"
+        ))
+    })
+}
+
+/// Validates `--ttl-secs`, defaulting to the adapter's 30 minutes. Zero and
+/// anything above 24 hours are refused before the store is touched.
+fn intent_ttl_secs(requested: Option<u64>) -> Result<u64, RunError> {
+    let ttl = requested.unwrap_or(intent::DEFAULT_TTL_SECS);
+    if !(MIN_INTENT_TTL_SECS..=MAX_INTENT_TTL_SECS).contains(&ttl) {
+        return Err(RunError::Message(format!(
+            "--ttl-secs must be between {MIN_INTENT_TTL_SECS} and {MAX_INTENT_TTL_SECS} seconds, \
+             got {ttl}"
+        )));
+    }
+    Ok(ttl)
+}
+
+/// The JSON shape of one intent, for `ls` (an array) and for `who`, `claim`
+/// and `release` (a single object). `file` is the holder's absolute working
+/// copy from a v2 record; a v1 record has no location, so the field is null
+/// and the opaque key remains the only identifier.
+#[derive(Serialize)]
+struct IntentView {
+    key: String,
+    file: Option<String>,
+    session: String,
+    created_at: u64,
+    expires_at: u64,
+    age_secs: u64,
+    live: bool,
+}
+
+fn intent_view(intent: &Intent, now: u64) -> IntentView {
+    IntentView {
+        key: intent.key.clone(),
+        file: intent
+            .location
+            .as_ref()
+            .map(|location| location.file.to_string_lossy().into_owned()),
+        session: intent.session.clone(),
+        created_at: intent.created_at,
+        expires_at: intent.expires_at,
+        age_secs: now.saturating_sub(intent.created_at),
+        live: intent.is_live_at(now),
+    }
+}
+
+/// The best human label for an intent: the holder's working copy when the
+/// record has one, otherwise the opaque key (which is all a v1 record stores).
+fn intent_file_label(intent: &Intent) -> String {
+    intent
+        .location
+        .as_ref()
+        .map(|location| location.file.to_string_lossy().into_owned())
+        .unwrap_or_else(|| intent.key.clone())
+}
+
+fn print_intents(intents: &[Intent], now: u64, json: bool) {
+    if json {
+        let views: Vec<IntentView> = intents
+            .iter()
+            .map(|intent| intent_view(intent, now))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string(&views).expect("IntentView always serializes")
+        );
+        return;
+    }
+    if intents.is_empty() {
+        println!("no live file intents");
+        return;
+    }
+    println!("KEY SESSION AGE EXPIRES");
+    for intent in intents {
+        let expires_in = intent.expires_at.saturating_sub(now);
+        println!(
+            "{} {} {}s {}s",
+            sanitize_for_display(&intent.key),
+            sanitize_for_display(&intent.session),
+            now.saturating_sub(intent.created_at),
+            expires_in
+        );
+    }
+}
+
+fn print_intent_who(intent: &Intent, now: u64, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+        );
+        return;
+    }
+    println!(
+        "{} is held by session {} (age {}s, expires in {}s)",
+        sanitize_for_display(&intent_file_label(intent)),
+        sanitize_for_display(&intent.session),
+        now.saturating_sub(intent.created_at),
+        intent.expires_at.saturating_sub(now)
+    );
+}
+
+fn print_intent_claim(intent: &Intent, ttl: u64, json: bool) {
+    if json {
+        // The caller just wrote the claim, so `now` is before its expiry; use
+        // the record itself to keep the view honest if the clock ticked.
+        let now = lease::current_unix_timestamp();
+        println!(
+            "{}",
+            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+        );
+        return;
+    }
+    println!(
+        "claimed {} for session {} (expires in {ttl}s)",
+        sanitize_for_display(&intent_file_label(intent)),
+        sanitize_for_display(&intent.session)
+    );
+}
+
+fn print_intent_release(intent: &Intent, now: u64, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+        );
+        return;
+    }
+    println!(
+        "released {} for session {}",
+        sanitize_for_display(&intent_file_label(intent)),
+        sanitize_for_display(&intent.session)
+    );
+}
+
+/// Release is idempotent: a claim that is already absent is success. The JSON
+/// form says so explicitly instead of inventing timestamps for a record that
+/// never existed.
+fn print_intent_absent_release(file: &std::path::Path, key: &str, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "released": false,
+                "key": key,
+                "file": file.to_string_lossy(),
+            })
+        );
+        return;
+    }
+    println!(
+        "no file intent for {} to release (already absent)",
+        sanitize_for_display(&file.display().to_string())
+    );
 }
 
 /// Runs the Claude Code `PreToolUse` hook: reads the hook payload from
@@ -1392,16 +1703,23 @@ fn print_init_opencode() {
     eprintln!("    opencode` for a verdict, and throws on deny before anything runs — the reason");
     eprintln!("    reaches the model as a tool error.");
     eprintln!(
-        "  - write/edit: the edited file is claimed as a file intent, so a second session that"
+        "  - write/edit: the edited file is claimed as a file intent. When another live session"
     );
-    eprintln!("    tries to edit the same file is denied instead of silently clobbering it.");
+    eprintln!(
+        "    holds it, the pending edit is checked: a real conflict is denied, while an edit that"
+    );
+    eprintln!("    merges cleanly is allowed with a warning naming the holder.");
     eprintln!(
         "  - shell: a command that would kill a process leased to another session is denied."
     );
     eprintln!(
-        "  - warn verdicts (a kill by process name, which cannot be resolved to a lease) are"
+        "  - warn verdicts from a file edit reach the model: the reason is appended to the tool"
     );
-    eprintln!("    written to OpenCode's log; they never block the call.");
+    eprintln!(
+        "    result by a second hook, tool.execute.after. A shell warn (a kill by process name,"
+    );
+    eprintln!("    which cannot be resolved to a lease) goes to OpenCode's log instead.");
+    eprintln!("    Neither warning blocks the call.");
     eprintln!();
     eprintln!(
         "Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,"
