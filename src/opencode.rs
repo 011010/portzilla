@@ -13,16 +13,18 @@
 //! 1. **The shim** — a small JS plugin (`portzilla init opencode` prints
 //!    its full source) in OpenCode's V2 plugin shape (`id` + `setup`). It
 //!    registers `tool.execute.before`, translates `write`/`edit` into a
-//!    file-intent check and `shell` into a kill-guard check, shells out to
-//!    `portzilla hook opencode`, and turns a deny into
+//!    file-intent check (with the pending edit) and `shell` into a kill-guard
+//!    check, shells out to `portzilla hook opencode`, and turns a deny into
 //!    `throw new Error(reason)` (which OpenCode surfaces to the model as a
-//!    tool error; the tool does not run). See [`PLUGIN_SNIPPET`].
+//!    tool error; the tool does not run). A warn is stashed per tool call and
+//!    appended to the tool result by `tool.execute.after`. See
+//!    [`PLUGIN_SNIPPET`].
 //! 2. **This module** — the binary-side verdict protocol the shim calls:
-//!    stdin JSON `{ "session_id": ..., "command": ... }` for a shell command
-//!    or `{ "session_id": ..., "file": ..., "cwd": ... }` for an edit,
-//!    stdout JSON `{ "action": "allow" | "deny" | "warn", "reason": ... }`,
-//!    always exit 0 (exit codes mean nothing to the shim; the verdict is the
-//!    JSON).
+//!    stdin JSON `{ "session_id": ..., "command": ... }` for a shell command,
+//!    `{ "session_id": ..., "file": ..., "cwd": ..., "edit": { ... } }` for
+//!    an edit, stdout JSON `{ "action": "allow" | "deny" | "warn",
+//!    "reason": ... }`, always exit 0 (exit codes mean nothing to the shim;
+//!    the verdict is the JSON).
 //!
 //! # File intents
 //!
@@ -57,9 +59,11 @@
 //! `tool.execute.before` is binary: return = allow, throw = deny. When the
 //! conflict check proves a held file's pending edit clean, this adapter
 //! returns `{"action":"warn"}`. The shim lets every non-deny action through,
-//! so the edit proceeds and the reason is advisory; the check writes nothing,
-//! so the holder keeps its claim and the caller's next edit is checked again
-//! against the holder's evolving copy.
+//! so the edit proceeds; it stashes the reason under the tool call id and its
+//! `tool.execute.after` hook appends it as text to the tool result, which is
+//! how the model reads it. The check writes nothing, so the holder keeps its
+//! claim and the caller's next edit is checked again against the holder's
+//! evolving copy.
 //!
 //! # Fail-open, concretely
 //!
@@ -152,11 +156,6 @@ struct OpenCodeInput {
     file: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
-    /// Tool-call id from OpenCode. The adapter itself has no use for it; the
-    /// shim keys its `execute.after` warnings on it. Accepted (and ignored) so
-    /// the shim can send one payload shape everywhere.
-    #[serde(default, rename = "call_id")]
-    _call_id: Option<String>,
     /// The edit the tool is about to apply, when the shim can supply it.
     /// Required to prove a held file's edit clean; absent means deny.
     #[serde(default)]
@@ -462,9 +461,10 @@ fn intent_ttl_secs() -> u64 {
 /// opencode`. Save it as `.opencode/plugin/portzilla.js` (project) or
 /// `~/.config/opencode/plugin/portzilla.js` (user) — OpenCode
 /// auto-discovers `*.js`/`*.ts` files in those directories. The plugin uses
-/// the V2 shape (a default export with `id` + `setup`), registers one
-/// `tool.execute.before` hook, and enforces its own 5000 ms timeout around
-/// the subprocess, since OpenCode applies no timeout to plugin hooks.
+/// the V2 shape (a default export with `id` + `setup`), registers
+/// `tool.execute.before` and `tool.execute.after`, and enforces its own
+/// 5000 ms timeout around the subprocess, since OpenCode applies no timeout
+/// to plugin hooks.
 pub const PLUGIN_SNIPPET: &str = r#"// portzilla guard for OpenCode 2.x.
 //
 // Save as .opencode/plugin/portzilla.js (project) or
@@ -477,10 +477,18 @@ pub const PLUGIN_SNIPPET: &str = r#"// portzilla guard for OpenCode 2.x.
 // hooks object — is rejected by OpenCode 2.3.0 with "Plugin must export a
 // default definition with an id and an effect or setup function".
 //
-// One hook, `tool.execute.before`, with three branches:
+// Two hooks, and two ways a verdict reaches the model:
+//   - deny: `execute.before` throws, so OpenCode reports the reason to the
+//     model as a tool error and the tool does not run.
+//   - warn: `execute.before` stashes the reason under the tool call id, and
+//     `execute.after` appends it to that call's result content. The model
+//     reads it as part of the tool result; nothing is blocked.
+//
+// `execute.before` has three branches:
 //   - write / edit: ask portzilla for a file intent on the path being
-//     edited. If another live session holds that file, the tool call throws
-//     and the file is not modified.
+//     edited, sending the pending edit so a live holder's claim can be
+//     checked for a real conflict. A conflicting or unprovable edit throws;
+//     a clean merge warns and the edit proceeds.
 //   - shell: ask portzilla's kill-guard about the command. A command that
 //     would kill another session's leased process throws before it runs.
 //   - anything else: not ours, return.
@@ -502,6 +510,11 @@ export default {
   id: "portzilla",
   async setup(ctx) {
     const CHECK_TIMEOUT_MS = 5000;
+
+    // Warns from `execute.before`, keyed by the tool call id (`event.id`).
+    // `execute.before` cannot return a non-blocking message, so this map is
+    // the hand-off to `execute.after`, which is where the model is told.
+    const pendingWarnings = new Map();
 
     // Sends one payload to `portzilla hook opencode` and parses the verdict.
     // Returns null for anything that is not a usable verdict; callers treat
@@ -550,8 +563,15 @@ export default {
           session_id: event.sessionID ?? null,
           file: file,
           cwd: ctx.directory ?? null,
+          // The pending edit lets portzilla tell a real conflict apart from
+          // a change that merges cleanly with the holder's version.
+          edit:
+            event.tool === "write"
+              ? { content: event.input?.content }
+              : { old: event.input?.oldString, new: event.input?.newString },
         });
         if (verdict?.action === "deny") throw new Error(verdict.reason);
+        if (verdict?.action === "warn") pendingWarnings.set(event.id, verdict.reason);
         return;
       }
 
@@ -564,10 +584,25 @@ export default {
           command: command,
         });
         if (verdict?.action === "deny") throw new Error(verdict.reason);
-        // No verified non-blocking hook in V2 appends to the tool result, so
-        // a warn goes to OpenCode's console instead of the model.
+        // Shell warns have no file result to attach to here, so they stay
+        // log-only; file-edit warns travel through `pendingWarnings`.
         if (verdict?.action === "warn") console.warn(`portzilla: ${verdict.reason}`);
       }
+    });
+
+    await ctx.tool.hook("execute.after", async (event) => {
+      const reason = pendingWarnings.get(event.id);
+      if (reason === undefined) return;
+      pendingWarnings.delete(event.id);
+
+      // Verified in OpenCode 2.3.0: `result.content` is an array whose text
+      // parts the model reads, while `result.output` is not a string and
+      // mutating it is invisible. Appending here is the warn channel.
+      if (Array.isArray(event.result?.content)) {
+        event.result.content.push({ type: "text", text: `portzilla: ${reason}` });
+        return;
+      }
+      console.warn(`portzilla: ${reason}`);
     });
   },
 };"#;
@@ -1316,18 +1351,20 @@ mod tests {
         // The shim is the load-bearing half of this adapter: these are the
         // exact strings OpenCode's V2 plugin loader and the guard protocol
         // depend on. It must export an id + setup definition, register
-        // `execute.before`, route write/edit to the file-intent payload and
-        // shell to the command payload, shell out to the binary, and throw
-        // on deny.
+        // `execute.before` and `execute.after`, route write/edit to the
+        // file-intent payload (with the pending edit) and shell to the
+        // command payload, shell out to the binary, throw on deny, and put a
+        // warn in front of the model through the tool result.
         assert!(PLUGIN_SNIPPET.contains(r#"id: "portzilla""#));
         assert!(PLUGIN_SNIPPET.contains("async setup(ctx)"));
         assert!(PLUGIN_SNIPPET.contains("export default {"));
         assert_eq!(
             PLUGIN_SNIPPET.matches("ctx.tool.hook(").count(),
-            1,
-            "only execute.before is registered"
+            2,
+            "execute.before and execute.after are registered"
         );
         assert!(PLUGIN_SNIPPET.contains(r#"ctx.tool.hook("execute.before""#));
+        assert!(PLUGIN_SNIPPET.contains(r#"ctx.tool.hook("execute.after""#));
         assert!(PLUGIN_SNIPPET.contains(r#"event.tool === "write" || event.tool === "edit""#));
         assert!(PLUGIN_SNIPPET.contains(r#"event.tool === "shell""#));
         assert!(PLUGIN_SNIPPET.contains("event.input?.path"));
@@ -1337,6 +1374,25 @@ mod tests {
         assert!(PLUGIN_SNIPPET.contains("Bun.spawn"));
         assert!(PLUGIN_SNIPPET.contains("CHECK_TIMEOUT_MS"));
         assert!(PLUGIN_SNIPPET.contains("throw new Error"));
+
+        // The pending edit is what makes the verdict conflict-aware: a whole
+        // file for `write`, the replacement halves for `edit`.
+        assert!(PLUGIN_SNIPPET.contains("content: event.input?.content"));
+        assert!(PLUGIN_SNIPPET.contains("old: event.input?.oldString"));
+        assert!(PLUGIN_SNIPPET.contains("new: event.input?.newString"));
+
+        // A warn must reach the model through `execute.after`: stashed under
+        // the call id in `execute.before`, pushed into `result.content` after.
+        assert!(PLUGIN_SNIPPET.contains("pendingWarnings"));
+        assert!(PLUGIN_SNIPPET.contains("pendingWarnings.set(event.id, verdict.reason)"));
+        assert!(PLUGIN_SNIPPET.contains("pendingWarnings.delete(event.id)"));
+        assert!(PLUGIN_SNIPPET.contains("Array.isArray(event.result?.content)"));
+        assert!(PLUGIN_SNIPPET.contains("event.result.content.push"));
+        assert!(PLUGIN_SNIPPET.contains(r#"{ type: "text", text: `portzilla: ${reason}` }"#));
+        // The spike proved `result.output` is not a string and mutating it is
+        // invisible, so the shim must not pretend to write there.
+        assert!(!PLUGIN_SNIPPET.contains("result.output ="));
+        assert!(!PLUGIN_SNIPPET.contains("output +="));
 
         // The V1 shapes must not come back: this plugin does not load on
         // OpenCode 2.x, and the removed env injection would be dead code.

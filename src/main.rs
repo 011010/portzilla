@@ -1703,16 +1703,23 @@ fn print_init_opencode() {
     eprintln!("    opencode` for a verdict, and throws on deny before anything runs — the reason");
     eprintln!("    reaches the model as a tool error.");
     eprintln!(
-        "  - write/edit: the edited file is claimed as a file intent, so a second session that"
+        "  - write/edit: the edited file is claimed as a file intent. When another live session"
     );
-    eprintln!("    tries to edit the same file is denied instead of silently clobbering it.");
+    eprintln!(
+        "    holds it, the pending edit is checked: a real conflict is denied, while an edit that"
+    );
+    eprintln!("    merges cleanly is allowed with a warning naming the holder.");
     eprintln!(
         "  - shell: a command that would kill a process leased to another session is denied."
     );
     eprintln!(
-        "  - warn verdicts (a kill by process name, which cannot be resolved to a lease) are"
+        "  - warn verdicts from a file edit reach the model: the reason is appended to the tool"
     );
-    eprintln!("    written to OpenCode's log; they never block the call.");
+    eprintln!(
+        "    result by a second hook, tool.execute.after. A shell warn (a kill by process name,"
+    );
+    eprintln!("    which cannot be resolved to a lease) goes to OpenCode's log instead.");
+    eprintln!("    Neither warning blocks the call.");
     eprintln!();
     eprintln!(
         "Fail-open: if the plugin can't load, can't spawn portzilla, or hits the 5s timeout,"
