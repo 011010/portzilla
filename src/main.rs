@@ -1,6 +1,7 @@
 mod audit;
 mod claude_code;
 mod codex;
+mod conflict;
 mod cursor;
 mod gemini;
 mod guard;
