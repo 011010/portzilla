@@ -299,7 +299,9 @@ fn handle_file_intent(
     };
 
     let now = current_unix_timestamp();
-    match store.claim(&key, session, now, now + intent_ttl_secs()) {
+    // The location is wired in when the adapter uses the conflict check; until
+    // then a claim records only the key, exactly like a v1-era record.
+    match store.claim(&key, session, now, now + intent_ttl_secs(), None) {
         Ok(_) => HookOutcome {
             stdout_json: verdict_json("allow", None),
             stderr_note: None,
@@ -714,6 +716,7 @@ mod tests {
                 "session-theirs",
                 now,
                 now + 600,
+                None,
             )
             .unwrap();
 
@@ -743,7 +746,7 @@ mod tests {
         let now = current_unix_timestamp();
         fixture
             .store
-            .claim(&key, "session-theirs", now, now + 600)
+            .claim(&key, "session-theirs", now, now + 600, None)
             .unwrap();
         let before = fixture.store.get(&key).unwrap().unwrap();
 
@@ -766,7 +769,13 @@ mod tests {
         let before_call = current_unix_timestamp();
         fixture
             .store
-            .claim(&key, "session-mine", before_call - 1_000, before_call + 60)
+            .claim(
+                &key,
+                "session-mine",
+                before_call - 1_000,
+                before_call + 60,
+                None,
+            )
             .unwrap();
         let created_at = fixture.store.get(&key).unwrap().unwrap().created_at;
 
@@ -802,6 +811,7 @@ mod tests {
                 "session-theirs",
                 before_call - 2_000,
                 before_call - 1_000,
+                None,
             )
             .unwrap();
 
