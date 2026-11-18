@@ -64,8 +64,8 @@ pub enum ConflictVerdict {
 /// 5. Without a base blob (a file new on both sides, or unrelated histories),
 ///    identical versions are clean and anything else is a conflict.
 /// 6. With a base, run `git merge-file` over the three versions. Exit code 0
-///    is clean, a positive exit code is a conflict, and a negative code or a
-///    spawn failure is unprovable.
+///    is clean, 1..=127 is a conflict count, and anything else (an error
+///    return or a signal) is unprovable.
 // The adapter wires this in next; until then the binary has no caller for it.
 #[allow(dead_code)]
 pub fn check(caller_cwd: &Path, holder: &IntentLocation, edit: PendingEdit<'_>) -> ConflictVerdict {
@@ -119,10 +119,6 @@ fn base_version(caller_cwd: &Path, holder: &IntentLocation) -> Option<String> {
 }
 
 /// Runs the three-way merge and maps git's exit code to a verdict.
-///
-/// `git merge-file` documents 0 for a clean merge and a positive count of
-/// conflicts otherwise; a negative return (reported by the shell as 255) or a
-/// spawn failure means the check itself did not run.
 fn merge_verdict(caller_cwd: &Path, holder: &str, base: &str, caller: &str) -> ConflictVerdict {
     let Some(files) = MergeFiles::new([holder, base, caller]) else {
         return ConflictVerdict::Unprovable;
@@ -138,10 +134,23 @@ fn merge_verdict(caller_cwd: &Path, holder: &str, base: &str, caller: &str) -> C
     let Some(output) = git_output(caller_cwd, &args) else {
         return ConflictVerdict::Unprovable;
     };
-    match output.status.code() {
+    verdict_from_exit_code(output.status.code())
+}
+
+/// Maps a `git merge-file` exit status to a verdict.
+///
+/// Git documents 0 for a clean merge and a positive count of conflicts
+/// otherwise, truncated to 127 — the value git's own `exit(127)` ceiling
+/// leaves room for. Codes above that ceiling are error returns, not conflict
+/// counts: 129 means the arguments were wrong and 255 usually means an input
+/// file could not be read. Those say nothing about whether the edits merge, so
+/// they are [`ConflictVerdict::Unprovable`], exactly like a spawn failure or a
+/// process killed by a signal (where there is no code at all).
+fn verdict_from_exit_code(code: Option<i32>) -> ConflictVerdict {
+    match code {
         Some(0) => ConflictVerdict::Clean,
-        Some(code) if code > 0 => ConflictVerdict::Conflict,
-        _ => ConflictVerdict::Unprovable,
+        Some(1..=127) => ConflictVerdict::Conflict,
+        Some(_) | None => ConflictVerdict::Unprovable,
     }
 }
 
@@ -319,6 +328,21 @@ mod tests {
             worktree: repo.linked.clone(),
             rel: PathBuf::from(rel),
         }
+    }
+
+    #[test]
+    fn merge_file_exit_codes_map_to_verdicts() {
+        // 0 is a clean merge; 1..=127 is a conflict count (git truncates it
+        // there). 128 and above are error returns, and `None` means the child
+        // died on a signal: none of them prove anything about the merge.
+        assert_eq!(verdict_from_exit_code(Some(0)), ConflictVerdict::Clean);
+        assert_eq!(verdict_from_exit_code(Some(1)), ConflictVerdict::Conflict);
+        assert_eq!(verdict_from_exit_code(Some(127)), ConflictVerdict::Conflict);
+        assert_eq!(
+            verdict_from_exit_code(Some(128)),
+            ConflictVerdict::Unprovable
+        );
+        assert_eq!(verdict_from_exit_code(None), ConflictVerdict::Unprovable);
     }
 
     #[test]
