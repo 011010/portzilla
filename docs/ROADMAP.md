@@ -160,6 +160,22 @@ An OpenCode adapter over the same unchanged `src/guard.rs` core, built on a wire
 
 **Rationale**: a pre-claim from an agent's ephemeral shell can become dead while the server keeps running, and claiming after the server binds causes valid OS-occupancy reassignment. `run` owns the claim, spawn, and verified transfer as one operation, while the skill teaches agents to make their framework consume the assigned port.
 
+## v0.4 — File-intent CLI and conflict-aware guard — Implemented
+
+The first file-intent slice (shipped with the OpenCode V2 shim) only denied every edit of a file another live session held. This slice gives humans manual control over claims and makes the guard deny only when the pending edit would actually conflict.
+
+| Item | Status |
+|------|--------|
+| `portzilla intent claim <PATH> [--ttl-secs N] [--session S] [--json]` — claim or refresh a file for a session | Implemented |
+| `portzilla intent who <PATH>` / `intent ls` — inspect live claims (exit `2` from `who` when there is none) | Implemented |
+| `portzilla intent release <PATH> [--session S]` — release early; idempotent when the claim is already absent | Implemented |
+| `intents.json` schema v2: each claim records the holder's working copy (file, worktree, repo-relative path); v1 files are read and upgraded on the next write, unknown versions are refused without rewriting | Implemented |
+| Conflict proof: `git merge-file` over the holder's version, the merge base, and the caller's post-edit version, returning `Clean` / `Conflict` / `Unprovable` | Implemented |
+| OpenCode shim sends the pending `write` content or `edit` replacement and appends a clean-merge warning to the tool result, so the model sees it; real conflicts are denied with a conflict-specific reason | Implemented |
+| `Unprovable` still denies exactly as before (v1 record, git failure, incomplete payload), so the guard can never become weaker than the deny-only behaviour it replaces | Implemented |
+
+**Rationale**: a claim with no release path forces every human to wait out the 30-minute TTL, and an unconditional deny blocks edits that had no conflict to begin with. Recording where the holder's copy lives turns "someone holds this file" into "these two edits do or do not collide", which is the question the caller actually needs answered. The fail-safe verdict is deliberate: the guard only relaxes when cleanliness is proven, never when it is merely unknown.
+
 ## Later — Planned, not yet scheduled
 
 - **Optional daemon with active lease expiry and stale-lease cleanup.** A background process that watches leased PIDs directly (rather than checking on demand) may attempt prompt lease expiry while it is running. It does not kill orphaned server processes, and it cannot guarantee cleanup if it is stopped or crashes. Kept optional so the core tool remains daemon-less by default — this only activates for users who want stronger supervision.

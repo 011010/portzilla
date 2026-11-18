@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Made file intents conflict-aware: a live foreign claim no longer denies every edit. A clean merge against the holder's working copy is allowed, the holder keeps its claim, and the model reads a warning appended to the tool result; a proven conflict is denied with a reason that says so; anything unprovable (a v1 record, a git failure, an incomplete payload) is denied as before. `intents.json` is now schema v2 and records the holder's location; v1 files are read and upgraded on the next write.
+- Added `portzilla intent claim|who|ls|release` to inspect and manage file claims from the shell, with `--json` output, `--ttl-secs` bounds, and an idempotent release.
 - Fixed `portzilla init <harness>` output streams: the snippet or file body now goes to stdout alone and the instructions go to stderr, so redirects like `portzilla init opencode > .opencode/plugin/portzilla.js` save a file that actually loads.
 - Added file-intent leases: the OpenCode shim denies a `write`/`edit` on a file another live session is editing, keyed by repository plus relative path so two worktrees of one repository collide while unrelated repositories do not.
 - Rewrote the OpenCode plugin shim for the V2 plugin API. OpenCode 2.3.0 rejects the V1 shape, so the previous shim did not load.

@@ -228,16 +228,36 @@ Full harness setup, `sh -c` unwrapping rules, and fail-open/closed semantics →
 
 Agents in parallel worktrees also collide on *files*: two sessions editing `src/auth.rs` produce a merge conflict that only surfaces at review time. File intents are the same lease idea applied to a path.
 
-The OpenCode shim asks for an intent on every `write`/`edit` before the tool runs:
+The OpenCode shim asks for an intent on every `write`/`edit` before the tool runs, and sends the pending edit with the request:
 
 - The first session to edit a file claims it for 30 minutes (`PORTZILLA_INTENT_TTL_SECS` overrides the window).
 - A session that edits it again refreshes its own claim.
-- A *different* live session is denied, with a reason naming the file and the holding session. The edit never runs.
+- A *different* live session triggers a conflict check against the holder's working copy. A real conflict is denied, and the reason says the edit conflicts. An edit that merges cleanly is allowed, the holder keeps its claim, and the model reads a warning on the tool result that names the holder.
+- Anything the check cannot prove — a v1 record with no recorded location, a git failure, an incomplete edit payload — is denied exactly as before. The check is fail-safe: the softer verdict applies only when cleanliness has been proven.
 - A denied attempt claims nothing, so a blocked session cannot take the file by retrying.
 
 The key is `<git-common-dir>:<repo-relative-path>`. The same relative file in two worktrees of one repository is one key; the same absolute path in a different repository is not. Outside a repository the key is the canonical absolute path.
 
-Limits, stated plainly: this is **deny-only** — an edit that would have merged cleanly is still blocked while another session holds the file. Only OpenCode is covered today; the other harnesses still get the kill guard alone.
+Humans can inspect and clear claims without waiting for the TTL:
+
+```console
+$ portzilla intent claim src/auth.rs --session "$CLAUDE_CODE_SESSION_ID"
+claimed /repo/src/auth.rs for session ... (expires in 1800s)
+
+$ portzilla intent who src/auth.rs
+/repo/src/auth.rs is held by session ... (age 12s, expires in 1788s)
+
+$ portzilla intent ls
+KEY SESSION AGE EXPIRES
+...
+
+$ portzilla intent release src/auth.rs --session "$CLAUDE_CODE_SESSION_ID"
+released /repo/src/auth.rs for session ...
+```
+
+`claim` records where the caller's working copy lives, so a claim made by hand is conflict-checkable by the OpenCode guard too. The intent file is at schema v2: v1 files are read and upgraded on the next write, but an older portzilla binary cannot read a v2 file and must be upgraded before sharing a data directory. Invalid TTLs (outside 1–86400 seconds) are refused. Full flags, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md#file-intents)**.
+
+Limits, stated plainly: only OpenCode is covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
 
 ## Data file & config
 
