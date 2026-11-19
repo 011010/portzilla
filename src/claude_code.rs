@@ -646,15 +646,32 @@ fn held_file_reason(file: &str, holder: &str) -> String {
 }
 
 /// The `.claude/settings.json` snippet printed by `portzilla init
-/// claude-code`, registering this hook on `PreToolUse` for the `Bash` tool.
-/// Format verified against the docs' own worked example for a `PreToolUse`
-/// hook on `Bash` (`matcher: "Bash"`, `hooks: [{ type: "command", command:
-/// ... }]`).
+/// claude-code`. It registers the one hook command on both events: the
+/// `PreToolUse` entry covers the kill guard (`Bash`) and the file-intent check
+/// (`Write`/`Edit`), and the `PostToolUse` entry appends the clean-merge or
+/// conflict-created context to the tool result the model reads.
+///
+/// Format verified against the docs' own worked example (`matcher`, `hooks:
+/// [{ type: "command", command: ... }]`) and against Claude Code 2.1.283 for
+/// the combined matcher `"Write|Edit"`; a `PreToolUse` matcher accepts
+/// alternatives, so one entry covers all three tools without a second process
+/// registration.
 pub const SETTINGS_SNIPPET: &str = r#"{
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "portzilla hook claude-code"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
         "hooks": [
           {
             "type": "command",
@@ -983,16 +1000,19 @@ mod tests {
     }
 
     #[test]
-    fn settings_snippet_registers_pretooluse_on_the_bash_matcher() {
+    fn settings_snippet_registers_both_hook_events() {
         let value: serde_json::Value = serde_json::from_str(SETTINGS_SNIPPET)
             .expect("SETTINGS_SNIPPET must itself be valid JSON");
-        let hook_entry = &value["hooks"]["PreToolUse"][0];
-        assert_eq!(hook_entry["matcher"], "Bash");
-        assert_eq!(hook_entry["hooks"][0]["type"], "command");
-        assert_eq!(
-            hook_entry["hooks"][0]["command"],
-            "portzilla hook claude-code"
-        );
+
+        let pre = &value["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "Bash|Write|Edit");
+        assert_eq!(pre["hooks"][0]["type"], "command");
+        assert_eq!(pre["hooks"][0]["command"], "portzilla hook claude-code");
+
+        let post = &value["hooks"]["PostToolUse"][0];
+        assert_eq!(post["matcher"], "Write|Edit");
+        assert_eq!(post["hooks"][0]["type"], "command");
+        assert_eq!(post["hooks"][0]["command"], "portzilla hook claude-code");
     }
 
     /// A git repository whose `src/auth.rs` is committed as `"a\nb\nc\n"`,

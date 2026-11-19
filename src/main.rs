@@ -1860,15 +1860,31 @@ fn print_init_claude_code() {
     eprintln!(
         "Add the following to your Claude Code settings (.claude/settings.json for a project,"
     );
-    eprintln!("or ~/.claude/settings.json for your user) to register portzilla's kill-guard as a");
-    eprintln!("PreToolUse hook on the Bash tool:");
+    eprintln!("or ~/.claude/settings.json for your user) to register portzilla's kill-guard on");
+    eprintln!("Bash and its file-intent guard on Write and Edit:");
     eprintln!();
     println!("{}", claude_code::SETTINGS_SNIPPET);
     eprintln!();
+    eprintln!("If you already have a \"hooks\" key in settings.json, merge the \"PreToolUse\" and");
+    eprintln!("\"PostToolUse\" entries above into your existing hooks instead of overwriting the");
+    eprintln!("file.");
+    eprintln!();
     eprintln!(
-        "If you already have a \"hooks\" key in settings.json, merge the \"PreToolUse\" entry"
+        "If you registered an earlier portzilla release, its \"PreToolUse\" matcher is Bash only."
     );
-    eprintln!("above into your existing hooks instead of overwriting the file.");
+    eprintln!(
+        "Replace that entry with the \"Bash|Write|Edit\" entry above and add the \"PostToolUse\""
+    );
+    eprintln!("entry. Without the update you keep the kill-guard but get no file-intent");
+    eprintln!("protection.");
+    eprintln!();
+    eprintln!(
+        "A clean edit is allowed without skipping the permission prompt: portzilla emits nothing,"
+    );
+    eprintln!(
+        "so Claude Code's normal permission flow still runs. Only a proven conflict, or an edit"
+    );
+    eprintln!("portzilla cannot prove clean, is denied.");
     eprintln!();
     eprintln!("portzilla must be on PATH as `portzilla` for the hook command above to run.");
     eprintln!("Verify with: portzilla --version");

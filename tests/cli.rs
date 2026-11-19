@@ -1252,13 +1252,36 @@ fn hook_claude_code_warns_on_process_name_kill() {
 fn init_claude_code_prints_the_settings_snippet() {
     let dir = tempfile::tempdir().unwrap();
 
-    cmd(dir.path())
+    let output = cmd(dir.path())
         .args(["init", "claude-code"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"PreToolUse\""))
-        .stdout(predicate::str::contains("\"matcher\": \"Bash\""))
-        .stdout(predicate::str::contains("portzilla hook claude-code"));
+        .output()
+        .expect("init claude-code must run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    let snippet: Value =
+        serde_json::from_str(&stdout).expect("init must print one JSON settings document");
+
+    let pre = &snippet["hooks"]["PreToolUse"][0];
+    assert_eq!(pre["matcher"], "Bash|Write|Edit");
+    assert_eq!(pre["hooks"][0]["type"], "command");
+    assert_eq!(pre["hooks"][0]["command"], "portzilla hook claude-code");
+
+    let post = &snippet["hooks"]["PostToolUse"][0];
+    assert_eq!(post["matcher"], "Write|Edit");
+    assert_eq!(post["hooks"][0]["type"], "command");
+    assert_eq!(post["hooks"][0]["command"], "portzilla hook claude-code");
+
+    // The prose must cover the migration and the silent-clean rule.
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(
+        stderr.contains("Bash only"),
+        "the prose must say an old Bash-only registration needs updating: {stderr}"
+    );
+    assert!(
+        stderr.contains("permission prompt"),
+        "the prose must say a clean edit does not skip the permission prompt: {stderr}"
+    );
 }
 
 // ---- hook cursor / gemini, init cursor / gemini ----
