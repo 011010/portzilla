@@ -176,6 +176,24 @@ The first file-intent slice (shipped with the OpenCode V2 shim) only denied ever
 
 **Rationale**: a claim with no release path forces every human to wait out the 30-minute TTL, and an unconditional deny blocks edits that had no conflict to begin with. Recording where the holder's copy lives turns "someone holds this file" into "these two edits do or do not collide", which is the question the caller actually needs answered. The fail-safe verdict is deliberate: the guard only relaxes when cleanliness is proven, never when it is merely unknown.
 
+## v0.6 — Environment slots — Implemented
+
+The third coordination layer. Port leases coordinate a port and file intents coordinate an edit; a slot coordinates a whole worktree environment so two agent sessions stop sharing the resources worktrees do not isolate: the database they point at, and the `target/` directory Cargo serialises behind its lock.
+
+| Item | Status |
+|------|--------|
+| `portzilla slot up|env|run|ls|show|down|prune` | Implemented |
+| `portzilla.toml`: port names with preferred bases, cache env vars, static env, database templates and argv provision/deprovision commands | Implemented |
+| `slots.json` store, versioned and locked like the other two | Implemented |
+| Durable leases: a slot's ports stay live until released instead of looking dead the moment `up` exits, and the kill guard treats them like any other lease | Implemented |
+| Transactional `up`: a failure releases ports, removes only the directories that run created, deprovisions what it provisioned, restores `.env.portzilla`, and persists nothing | Implemented |
+| Retryable `down`: a failed deprovision keeps the record, ports and directories; `--force` cleans up anyway | Implemented |
+| Cross-process operation lock so two agents cannot create the same slot or race over a cache directory | Implemented |
+
+**Rationale**: the original research for this layer found the same complaint repeatedly — worktrees isolate the repository, not the runtime. Ports were already covered, and files are covered by intents; the remaining collision surface that hurts daily is the database and the build cache. Configurable argv commands were chosen over built-in Postgres support so Portzilla never holds credentials, needs no database driver, and covers SQLite, Postgres and MySQL with one mechanism. Containers stay out of scope: that is where `agentslots` and Emdash already compete, and it would add the supervision surface this tool deliberately avoids.
+
+**Known limits, stated rather than hidden**: one `.env.portzilla` per worktree (a second slot in the same worktree overwrites it, with a warning); slot tags are not worktree-qualified; a `SIGKILL` between side effects and the final write can leave durable leases and directories with no record, recoverable with `portzilla release <port>`.
+
 ## Later — Planned, not yet scheduled
 
 - **Optional daemon with active lease expiry and stale-lease cleanup.** A background process that watches leased PIDs directly (rather than checking on demand) may attempt prompt lease expiry while it is running. It does not kill orphaned server processes, and it cannot guarantee cleanup if it is stopped or crashes. Kept optional so the core tool remains daemon-less by default — this only activates for users who want stronger supervision.
