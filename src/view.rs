@@ -190,3 +190,36 @@ mod tests {
         );
     }
 }
+
+/// Flat view of a file intent: the shape used by the CLI's `intent` commands
+/// and by the MCP intent tools, so both surfaces emit identical JSON.
+///
+/// `file` is the holder's absolute working copy from a v2 record; a v1 record
+/// has no location, so the field is null and the opaque key remains the only
+/// identifier.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IntentView {
+    pub key: String,
+    pub file: Option<String>,
+    pub session: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub age_secs: u64,
+    pub live: bool,
+}
+
+/// Builds an [`IntentView`], computing `age_secs` and `live` at `now`.
+pub fn to_intent_view(intent: &crate::intent::Intent, now: u64) -> IntentView {
+    IntentView {
+        key: intent.key.clone(),
+        file: intent
+            .location
+            .as_ref()
+            .map(|location| location.file.to_string_lossy().into_owned()),
+        session: intent.session.clone(),
+        created_at: intent.created_at,
+        expires_at: intent.expires_at,
+        age_secs: now.saturating_sub(intent.created_at),
+        live: intent.is_live_at(now),
+    }
+}

@@ -189,7 +189,9 @@ For agents with MCP access (Claude Code, etc.) — typed JSON in/out instead of 
 $ claude mcp add portzilla -- portzilla serve --mcp
 ```
 
-Exposes `claim`, `who`, `ls`, `release`, `prune`, and read-only `history` as MCP tools with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
+Exposes `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, and the four file-intent tools `intent_claim`, `intent_who`, `intent_ls`, `intent_release` with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
+
+The intent tools are the only file protection available on harnesses without an edit hook (Cursor, Gemini CLI, Codex, Windsurf): the agent calls `intent_claim` before editing and `intent_release` when it is done. They are cooperative, so they complement rather than replace the OpenCode and Claude Code hooks. **Pass a session string identical to the one your harness gives the hooks**, otherwise your own claims look foreign to the guard.
 
 ## Audit history
 

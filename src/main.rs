@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use store::{ClaimOutcome, Store};
-use view::{LeaseView, to_claim_view, to_view};
+use view::{IntentView, LeaseView, to_claim_view, to_intent_view, to_view};
 
 /// Maximum number of bytes the hook runners will read from stdin before
 /// giving up. Hook payloads are JSON with a single command string; anything
@@ -803,36 +803,6 @@ fn intent_ttl_secs(requested: Option<u64>) -> Result<u64, RunError> {
     Ok(ttl)
 }
 
-/// The JSON shape of one intent, for `ls` (an array) and for `who`, `claim`
-/// and `release` (a single object). `file` is the holder's absolute working
-/// copy from a v2 record; a v1 record has no location, so the field is null
-/// and the opaque key remains the only identifier.
-#[derive(Serialize)]
-struct IntentView {
-    key: String,
-    file: Option<String>,
-    session: String,
-    created_at: u64,
-    expires_at: u64,
-    age_secs: u64,
-    live: bool,
-}
-
-fn intent_view(intent: &Intent, now: u64) -> IntentView {
-    IntentView {
-        key: intent.key.clone(),
-        file: intent
-            .location
-            .as_ref()
-            .map(|location| location.file.to_string_lossy().into_owned()),
-        session: intent.session.clone(),
-        created_at: intent.created_at,
-        expires_at: intent.expires_at,
-        age_secs: now.saturating_sub(intent.created_at),
-        live: intent.is_live_at(now),
-    }
-}
-
 /// The best human label for an intent: the holder's working copy when the
 /// record has one, otherwise the opaque key (which is all a v1 record stores).
 fn intent_file_label(intent: &Intent) -> String {
@@ -847,7 +817,7 @@ fn print_intents(intents: &[Intent], now: u64, json: bool) {
     if json {
         let views: Vec<IntentView> = intents
             .iter()
-            .map(|intent| intent_view(intent, now))
+            .map(|intent| to_intent_view(intent, now))
             .collect();
         println!(
             "{}",
@@ -876,7 +846,8 @@ fn print_intent_who(intent: &Intent, now: u64, json: bool) {
     if json {
         println!(
             "{}",
-            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+            serde_json::to_string(&to_intent_view(intent, now))
+                .expect("IntentView always serializes")
         );
         return;
     }
@@ -896,7 +867,8 @@ fn print_intent_claim(intent: &Intent, ttl: u64, json: bool) {
         let now = lease::current_unix_timestamp();
         println!(
             "{}",
-            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+            serde_json::to_string(&to_intent_view(intent, now))
+                .expect("IntentView always serializes")
         );
         return;
     }
@@ -911,7 +883,8 @@ fn print_intent_release(intent: &Intent, now: u64, json: bool) {
     if json {
         println!(
             "{}",
-            serde_json::to_string(&intent_view(intent, now)).expect("IntentView always serializes")
+            serde_json::to_string(&to_intent_view(intent, now))
+                .expect("IntentView always serializes")
         );
         return;
     }
