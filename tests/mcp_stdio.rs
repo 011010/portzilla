@@ -215,6 +215,7 @@ fn initialize_tools_list_and_tools_call_over_real_stdio() {
             "intent_claim",
             "intent_who",
             "intent_ls",
+            "intent_history",
             "intent_release",
         ]
         .into_iter()

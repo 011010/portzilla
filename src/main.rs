@@ -26,7 +26,10 @@ use audit::{
     LeaseSnapshot, ProcessExitOutcome,
 };
 use clap::{Parser, Subcommand};
-use intent::{Intent, IntentStore, key_for_file, locate_file};
+use intent::{
+    Intent, IntentEventKind, IntentHistoryPage, IntentHistoryQuery, IntentStore, key_for_file,
+    locate_file,
+};
 use lease::{Lease, PidChecker, SystemPidChecker};
 use serde::Serialize;
 use slot::SlotRecord;
@@ -285,6 +288,29 @@ enum IntentCommands {
         session: Option<String>,
         /// Print machine-readable JSON instead of human-readable text.
         #[arg(long)]
+        json: bool,
+    },
+    /// Query or clear the bounded file-intent journal.
+    History {
+        /// Clear all retained events instead of querying them.
+        #[arg(value_enum)]
+        action: Option<HistoryAction>,
+        /// Only events where this session claimed, refreshed, released, or
+        /// lost the key to a takeover.
+        #[arg(long, conflicts_with = "action")]
+        session: Option<String>,
+        /// Only events of this kind: claim_created, claim_refreshed,
+        /// claim_taken_over, or released.
+        #[arg(long, value_name = "EVENT", conflicts_with = "action")]
+        event: Option<String>,
+        /// Only events with a sequence below this cursor (exclusive).
+        #[arg(long, conflicts_with = "action")]
+        before: Option<u64>,
+        /// Maximum number of events to return (1-1000, default 100).
+        #[arg(long, conflicts_with = "action")]
+        limit: Option<usize>,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long, conflicts_with = "action")]
         json: bool,
     },
 }
@@ -775,8 +801,43 @@ fn run_intent_command(command: IntentCommands) -> Result<(), RunError> {
                 None => print_intent_absent_release(&location.file, &key, json),
             }
         }
+        IntentCommands::History {
+            action,
+            session,
+            event,
+            before,
+            limit,
+            json,
+        } => {
+            if matches!(action, Some(HistoryAction::Clear)) {
+                let removed = store.clear_history()?;
+                println!("cleared {removed} intent history events");
+            } else {
+                let event = event.as_deref().map(parse_intent_event).transpose()?;
+                let query = IntentHistoryQuery::try_new(
+                    session,
+                    event,
+                    before,
+                    limit.unwrap_or(audit::DEFAULT_HISTORY_LIMIT),
+                )?;
+                let page = store.history(&query)?;
+                print_intent_history(&page, json);
+            }
+        }
     }
     Ok(())
+}
+
+/// Parses `intent history --event`. The CLI rejects an unknown name itself so
+/// the failure is exit code 1 (a validation error, per the documented exit
+/// table) and names every accepted value, instead of a clap usage error.
+fn parse_intent_event(name: &str) -> std::result::Result<IntentEventKind, RunError> {
+    IntentEventKind::parse(name).ok_or_else(|| {
+        RunError::Message(format!(
+            "--event must be one of claim_created, claim_refreshed, claim_taken_over, \
+             released; got {name:?}"
+        ))
+    })
 }
 
 /// Resolves the session a command must attribute its write to, or fails with
@@ -2437,6 +2498,31 @@ fn history_port(kind: &AuditEventKind, snapshot: Option<&LeaseSnapshot>) -> Opti
             _ => None,
         },
         _ => snapshot.map(|lease| lease.port),
+    }
+}
+
+fn print_intent_history(page: &IntentHistoryPage, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(page).expect("IntentHistoryPage always serializes")
+        );
+        return;
+    }
+    if page.events.is_empty() {
+        println!("no intent history events");
+        return;
+    }
+    println!("SEQ AT EVENT SESSION KEY");
+    for event in &page.events {
+        println!(
+            "{} {} {} {} {}",
+            event.seq,
+            event.at,
+            event.event.as_str(),
+            sanitize_for_display(&event.session),
+            sanitize_for_display(&event.key)
+        );
     }
 }
 

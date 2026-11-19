@@ -3059,6 +3059,216 @@ fn intent_ls_json_lists_only_live_claims() {
 }
 
 #[test]
+fn intent_history_json_on_empty_store_returns_stable_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["intent", "history", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r#"\{"events":\[\],"next_before":null\}"#).unwrap());
+}
+
+#[test]
+fn intent_history_records_claims_refreshes_and_releases_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+
+    for _ in 0..2 {
+        cmd(dir.path())
+            .args(["intent", "claim", path, "--session", "session-a"])
+            .assert()
+            .success();
+    }
+    cmd(dir.path())
+        .args(["intent", "release", path, "--session", "session-a"])
+        .assert()
+        .success();
+
+    let output = cmd(dir.path())
+        .args(["intent", "history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3, "created + refreshed + released: {json}");
+    assert_eq!(events[0]["event"], "released");
+    assert_eq!(events[0]["seq"], 3);
+    assert_eq!(events[1]["event"], "claim_refreshed");
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[2]["event"], "claim_created");
+    assert_eq!(events[2]["seq"], 1);
+    assert_eq!(events[2]["session"], "session-a");
+    assert!(
+        events[2]["key"].as_str().unwrap().contains("auth.rs"),
+        "the event must name the key: {json}"
+    );
+    assert!(events[2]["at"].is_u64());
+    assert_eq!(events[2]["previous_session"], Value::Null);
+    assert_eq!(json["next_before"], Value::Null);
+}
+
+#[test]
+fn intent_history_human_output_is_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["intent", "history"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SEQ AT EVENT SESSION KEY"))
+        .stdout(predicate::str::contains("claim_created"))
+        .stdout(predicate::str::contains("session-a"))
+        .stdout(predicate::str::contains("auth.rs"));
+}
+
+#[test]
+fn intent_history_filters_by_session_event_limit_and_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let (project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+    let other = project.path().join("other.rs");
+    let other = other.to_str().unwrap();
+
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+    cmd(dir.path())
+        .args(["intent", "claim", other, "--session", "session-b"])
+        .assert()
+        .success();
+    cmd(dir.path())
+        .args(["intent", "release", other, "--session", "session-b"])
+        .assert()
+        .success();
+
+    let history = |args: &[&str]| -> Value {
+        let output = cmd(dir.path())
+            .args(["intent", "history"])
+            .args(args)
+            .args(["--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
+
+    let by_session = history(&["--session", "session-a"]);
+    assert_eq!(by_session["events"].as_array().unwrap().len(), 1);
+    assert_eq!(by_session["events"][0]["event"], "claim_created");
+    assert_eq!(by_session["events"][0]["session"], "session-a");
+
+    let by_event = history(&["--event", "released"]);
+    assert_eq!(by_event["events"].as_array().unwrap().len(), 1);
+    assert_eq!(by_event["events"][0]["event"], "released");
+
+    let first_page = history(&["--limit", "1"]);
+    assert_eq!(first_page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(first_page["events"][0]["seq"], 3);
+    assert_eq!(first_page["next_before"], 3);
+
+    let second_page = history(&["--limit", "10", "--before", "3"]);
+    let seqs: Vec<u64> = second_page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, [2, 1], "`before` is an exclusive cursor");
+    assert_eq!(second_page["next_before"], Value::Null);
+}
+
+#[test]
+fn intent_history_rejects_an_unknown_event_name_with_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["intent", "history", "--event", "bogus"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("claim_created"))
+        .stderr(predicate::str::contains("claim_refreshed"))
+        .stderr(predicate::str::contains("claim_taken_over"))
+        .stderr(predicate::str::contains("released"))
+        .stderr(predicate::str::contains("bogus"));
+}
+
+#[test]
+fn intent_history_rejects_an_out_of_range_limit_with_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["intent", "history", "--limit", "0"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("between 1 and 1000"));
+}
+
+#[test]
+fn intent_history_clear_removes_events_and_keeps_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_project, file) = intent_paths();
+    let path = file.to_str().unwrap();
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+
+    cmd(dir.path())
+        .args(["intent", "history", "clear"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared 1 intent history events"));
+
+    // The claim survives the clear.
+    cmd(dir.path())
+        .args(["intent", "who", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session-a"));
+
+    // And the sequence is not reset: the next refresh is event 2.
+    cmd(dir.path())
+        .args(["intent", "claim", path, "--session", "session-a"])
+        .assert()
+        .success();
+    let output = cmd(dir.path())
+        .args(["intent", "history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["events"][0]["seq"], 2);
+    assert_eq!(json["events"][0]["event"], "claim_refreshed");
+}
+
+#[test]
+fn intent_history_clear_rejects_query_options() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd(dir.path())
+        .args(["intent", "history", "clear", "--limit", "2"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("cannot be used").or(predicate::str::contains("conflicts")),
+        );
+}
+
+#[test]
 fn intent_claim_honours_ttl_secs() {
     let dir = tempfile::tempdir().unwrap();
     let (_project, file) = intent_paths();

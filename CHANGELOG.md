@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added `portzilla intent history` and the read-only MCP `intent_history` tool: a bounded, filterable journal of `claim_created`, `claim_refreshed`, `claim_taken_over` and `released` events stored atomically with the claims in `intents.json`. It is schema v3; v1 and v2 files upgrade on the next write. `intent history clear` is CLI-only and never reuses a sequence number.
+
 - Added a dependency policy enforced by `cargo deny check` in CI: RustSec advisories (including unmaintained crates, with one documented ignore), an explicit permissive-license allowlist, duplicate-version warnings, and source restrictions. It replaces the standalone audit step with a single tool.
 
 - Added MCP tools for file intents: `intent_claim`, `intent_who`, `intent_ls` and `intent_release`, with the same JSON shapes as the CLI. They are the only file protection on harnesses without an edit hook, and they record the holder's working copy so conflict checks work across peers.
