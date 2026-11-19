@@ -198,11 +198,12 @@ struct ToolInput {
 ///   }
 /// }
 /// ```
-/// and the documented `additionalContext` (non-blocking, appended to the tool
-/// result the model reads) and top-level `systemMessage` (shown to the user,
-/// not Claude) fields. `additionalContext` is used for the Bash kill guard's
-/// `Verdict::Warn` and for the `PostToolUse` file-intent warning;
-/// `permissionDecision` is only ever `deny`.
+/// and the documented top-level `systemMessage` (shown to the user, not Claude)
+/// field. `permissionDecision` is only ever `deny`; `additionalContext` exists
+/// only on `PostToolUse`, where it carries the file-intent warning. A Bash
+/// `Verdict::Warn` on `PreToolUse` therefore reaches the user through
+/// `systemMessage` and never reaches the model: this event has no
+/// model-visible, non-blocking channel.
 #[derive(Debug, Serialize, PartialEq)]
 struct HookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,13 +363,18 @@ fn handle_bash(
             }
         }
         Verdict::Warn { explanation } => {
+            // `PreToolUse` has no `additionalContext` in the verified contract:
+            // emitting it there was inert, so the model never saw the warning
+            // this adapter claimed to deliver. `systemMessage` is documented as
+            // reaching the user, which is the only channel this event offers
+            // for a non-blocking warning.
             let response = HookResponse {
-                system_message: Some(explanation.clone()),
+                system_message: Some(explanation),
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
                     permission_decision: None,
                     permission_decision_reason: None,
-                    additional_context: Some(explanation),
+                    additional_context: None,
                 },
             };
             HookOutcome {
@@ -933,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn warn_on_unresolvable_process_name_emits_additional_context_and_system_message() {
+    fn warn_on_unresolvable_process_name_emits_system_message_only() {
         let leases: Vec<Lease> = vec![];
         let outcome = handle(&bash_input("pkill node"), &leases, &AlwaysAlive);
 
@@ -947,10 +953,14 @@ mod tests {
                 .get("permissionDecision")
                 .is_none()
         );
-        let additional_context = json["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("additionalContext must be a string");
-        assert!(additional_context.contains("node"));
+        // PreToolUse has no additionalContext in the verified contract: emitting
+        // one was inert. The warning reaches the user through systemMessage.
+        assert!(
+            json["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none(),
+            "PreToolUse must not carry additionalContext: {json}"
+        );
         let system_message = json["systemMessage"]
             .as_str()
             .expect("systemMessage must be a string");
