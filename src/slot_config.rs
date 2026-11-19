@@ -595,8 +595,10 @@ provision = ["createdb", "{nope}"]
         let path = config.cache_path(&temp.worktree, "auth", ".slot/{name}/target");
         assert_eq!(path, temp.worktree.join(".slot/auth/target"));
 
+        // Build the expectation with `Path`, not a Unix string literal: on
+        // Windows "/tmp/elsewhere" is a rooted path on the current drive.
         let absolute = config.cache_path(&temp.worktree, "auth", "/tmp/elsewhere/{name}");
-        assert_eq!(absolute, PathBuf::from("/tmp/elsewhere/auth"));
+        assert_eq!(absolute, Path::new("/tmp/elsewhere").join("auth"));
 
         let entries = cache_entries(&config, &temp.worktree, "auth");
         assert_eq!(entries.len(), 2);

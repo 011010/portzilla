@@ -948,7 +948,10 @@ GREETING = "hello world"
         assert!(env_file.contains("PORTZILLA_WORKTREE="));
         assert!(env_file.contains("PORTZILLA_PORT_WEB=3000\n"));
         assert!(env_file.contains("PORTZILLA_PORT=3000\n"));
-        assert!(env_file.contains(&format!("CARGO_TARGET_DIR={}\n", target.to_string_lossy())));
+        assert!(env_file.contains(&format!(
+            "CARGO_TARGET_DIR={}\n",
+            shell_value(&target.to_string_lossy())
+        )));
         assert!(env_file.contains("XDG_CACHE_HOME="));
         assert!(env_file.contains("RUST_LOG=debug\n"));
         assert!(env_file.contains("GREETING=\"hello world\"\n"));
@@ -1119,19 +1122,15 @@ deprovision = ["sh", "-c", "exit 9"]
     #[test]
     fn a_cache_path_outside_the_worktree_is_refused_before_allocating() {
         let fixture = fixture();
-        let outside = fixture._data.path().join("outside");
         let context = ctx(
             &fixture,
-            &format!(
-                r#"
+            r#"
 [slot.ports]
 web = 3000
 
 [slot.cache]
-CARGO_TARGET_DIR = "{}"
+CARGO_TARGET_DIR = "../outside/{name}"
 "#,
-                outside.display()
-            ),
         );
         let runtime = rt(&fixture, &AlwaysAlive);
 
@@ -1141,7 +1140,9 @@ CARGO_TARGET_DIR = "{}"
             "unexpected error: {error:#}"
         );
         assert!(fixture.leases.get(3000).unwrap().is_none());
-        assert!(!outside.exists());
+        // "../outside" must not have been created beside the worktree.
+        let escaped = fixture.worktree.path().parent().unwrap().join("outside");
+        assert!(!escaped.exists(), "refused path must not be created");
     }
 
     #[test]
