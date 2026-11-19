@@ -113,7 +113,7 @@ $ cargo install --path .
 ```console
 $ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | sh
 # specific version / directory:
-$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | PORTZILLA_VERSION=0.5.0 PORTZILLA_INSTALL_DIR=/usr/local/bin sh
+$ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | PORTZILLA_VERSION=0.6.0 PORTZILLA_INSTALL_DIR=/usr/local/bin sh
 ```
 
 **npm** (same native binary):
