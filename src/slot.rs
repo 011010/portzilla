@@ -140,7 +140,10 @@ impl fmt::Display for SlotError {
                 write!(formatter, "slot {name} is not up in {}", worktree.display())
             }
             Self::Capacity { max } => {
-                write!(formatter, "slot store already holds the maximum of {max} slots")
+                write!(
+                    formatter,
+                    "slot store already holds the maximum of {max} slots"
+                )
             }
             Self::Store(error) => write!(formatter, "{error:#}"),
         }
@@ -523,8 +526,20 @@ mod tests {
         assert_eq!(got.ports.get("web"), Some(&3000));
         assert_eq!(got.ports.get("api"), Some(&3100));
         assert_eq!(got.db.as_ref().unwrap().name, "app_auth");
-        assert_eq!(got.db.as_ref().unwrap().schema.as_deref(), Some("slot_auth"));
-        assert_eq!(got.db.as_ref().unwrap().deprovision.as_deref().unwrap().len(), 2);
+        assert_eq!(
+            got.db.as_ref().unwrap().schema.as_deref(),
+            Some("slot_auth")
+        );
+        assert_eq!(
+            got.db
+                .as_ref()
+                .unwrap()
+                .deprovision
+                .as_deref()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(
             got.cache_dirs,
             vec![canonicalize_or_owned(tree.path()).join(".slot/auth/target")]
@@ -537,7 +552,10 @@ mod tests {
         assert!(got.env_file.ends_with(".env.portzilla"));
         assert_eq!(got.created_at, 1_795_000_000);
         assert!(got.purge_cache_on_down);
-        assert_eq!(got.env.get("PORTZILLA_SLOT").map(String::as_str), Some("auth"));
+        assert_eq!(
+            got.env.get("PORTZILLA_SLOT").map(String::as_str),
+            Some("auth")
+        );
     }
 
     #[test]
@@ -548,7 +566,10 @@ mod tests {
 
         let err = store.insert(record(tree.path(), "auth")).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("already up"), "unexpected error: {message}");
+        assert!(
+            message.contains("already up"),
+            "unexpected error: {message}"
+        );
         assert!(message.contains("--replace"));
         assert!(matches!(err, SlotError::AlreadyExists { .. }));
         assert_eq!(store.list().unwrap().len(), 1);

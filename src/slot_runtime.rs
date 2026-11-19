@@ -107,9 +107,6 @@ impl<'a> SlotRuntime<'a> {
     /// `down` first; if that fails, nothing new is created.
     pub fn up(&self, context: &SlotContext, name: &str, replace: bool) -> Result<UpOutcome> {
         crate::slot_config::validate_slot_name(name)?;
-        if context.config.db.is_some() {
-            bail!("database provisioning is not implemented in this build yet");
-        }
 
         let mut warnings = Vec::new();
         let mut replaced = false;
@@ -203,9 +200,7 @@ impl<'a> SlotRuntime<'a> {
             create_dir_tracked(dir, &mut transaction.created_dirs)?;
         }
 
-        // Database provisioning is wired in the next change; the guard is
-        // already in place so a config using it cannot silently do nothing.
-        let db: Option<DbRuntime> = None;
+        let db = build_db_runtime(&context.config, name, &context.worktree);
         let env = render_environment(
             &context.worktree,
             name,
@@ -216,6 +211,27 @@ impl<'a> SlotRuntime<'a> {
         )?;
         transaction.env = env.clone();
         transaction.deprovision = db.as_ref().and_then(|db| db.deprovision.clone());
+
+        // Provision after the environment is complete so the command sees the
+        // same PORTZILLA_* values the slot exports, including PORTZILLA_DB and
+        // PORTZILLA_DB_SCHEMA. From here on, rollback also runs deprovision:
+        // a half-created database is exactly the kind of partial state the
+        // rollback contract exists to remove.
+        if let Some(db) = &db
+            && let Some(config_db) = &context.config.db
+            && !config_db.provision.is_empty()
+        {
+            let argv = render_db_argv(
+                &config_db.provision,
+                name,
+                &db.name,
+                db.schema.as_deref(),
+                &context.worktree,
+            );
+            transaction.provision_attempted = true;
+            run_argv(&argv, &env, "provision")
+                .with_context(|| format!("failed to provision the database for slot {name}"))?;
+        }
 
         let previous = fs::read(&transaction.env_file).ok();
         transaction.previous_env = previous;
@@ -724,18 +740,17 @@ impl UpTransaction<'_, '_> {
 /// Renders the database identity and deprovision argv from the config.
 ///
 /// Kept here rather than in the store: the store records what `up` decided,
-/// while this is the config-to-runtime translation.
-pub fn build_db_runtime(config: &SlotConfig, name: &str) -> Option<DbRuntime> {
+/// while this is the config-to-runtime translation. The deprovision argv is
+/// rendered now, with the worktree, so `slot down` can run it after the config
+/// has changed or disappeared.
+pub fn build_db_runtime(config: &SlotConfig, name: &str, worktree: &Path) -> Option<DbRuntime> {
     let db: &DbConfig = config.db.as_ref()?;
-    let rendered_name = crate::slot_config::substitute(&db.name_template, &[("slot", name)]);
-    let schema = db
-        .schema_template
-        .as_ref()
-        .map(|template| crate::slot_config::substitute(template, &[("slot", name)]));
+    let rendered_name = config.db_name(name)?;
+    let schema = config.db_schema(name);
     let deprovision = db
         .deprovision
         .as_ref()
-        .map(|argv| render_db_argv(argv, name, &rendered_name, schema.as_deref()));
+        .map(|argv| render_db_argv(argv, name, &rendered_name, schema.as_deref(), worktree));
     Some(DbRuntime {
         name: rendered_name,
         schema,
@@ -743,26 +758,10 @@ pub fn build_db_runtime(config: &SlotConfig, name: &str) -> Option<DbRuntime> {
     })
 }
 
-/// Substitutes `{slot}`, `{db}`, `{schema}`, and `{worktree}` in one argv
-/// element. `worktree` is filled by [`render_provision_argv`], which has the
-/// path; this keeps the pure substitution in one place.
-fn render_db_argv(argv: &[String], name: &str, db_name: &str, schema: Option<&str>) -> Vec<String> {
-    argv.iter()
-        .map(|argument| {
-            crate::slot_config::substitute(
-                argument,
-                &[
-                    ("slot", name),
-                    ("db", db_name),
-                    ("schema", schema.unwrap_or("")),
-                ],
-            )
-        })
-        .collect()
-}
-
-/// Renders a provision argv, including `{worktree}`.
-pub fn render_provision_argv(
+/// Substitutes `{slot}`, `{db}`, `{schema}`, and `{worktree}` in every argv
+/// element. Used for provision (at `up`) and for deprovision, whose rendered
+/// form is persisted in the record.
+fn render_db_argv(
     argv: &[String],
     name: &str,
     db_name: &str,
@@ -1251,5 +1250,257 @@ CARGO_TARGET_DIR = ".slot/{name}/target"
         assert!(fixture.slots.list().unwrap().is_empty());
         assert!(fixture.leases.get(3000).unwrap().is_none());
         assert!(!worktree.exists());
+    }
+    #[test]
+    fn db_names_are_rendered_and_deprovision_argv_is_persisted() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot.ports]
+web = 3200
+
+[slot.db]
+name_template = "app_{slot}"
+schema_template = "slot_{slot}"
+provision = []
+deprovision = ["dropdb", "--if-exists", "{db}", "--worktree", "{worktree}"]
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+        let outcome = runtime.up(&context, "auth", false).unwrap();
+
+        let db = outcome.record.db.as_ref().expect("db recorded");
+        assert_eq!(db.name, "app_auth");
+        assert_eq!(db.schema.as_deref(), Some("slot_auth"));
+        let deprovision = db.deprovision.as_ref().expect("deprovision recorded");
+        assert_eq!(
+            deprovision,
+            &vec![
+                "dropdb".to_string(),
+                "--if-exists".to_string(),
+                "app_auth".to_string(),
+                "--worktree".to_string(),
+                context.worktree.to_string_lossy().into_owned(),
+            ]
+        );
+        // The environment carries both names for provision/deprovision.
+        assert_eq!(db.name, outcome.record.env["PORTZILLA_DB"]);
+        assert_eq!("slot_auth", outcome.record.env["PORTZILLA_DB_SCHEMA"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_receives_the_substituted_argv_and_inherits_the_environment() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot.ports]
+web = 3201
+
+[slot.db]
+name_template = "app_{slot}"
+schema_template = "slot_{slot}"
+provision = ["sh", "-c", 'printf "%s|%s|%s" "$PORTZILLA_DB" "$PORTZILLA_DB_SCHEMA" "$PORTZILLA_SLOT" > {worktree}/provision.txt']
+deprovision = ["sh", "-c", 'printf done > {worktree}/deprovisioned.txt']
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+
+        runtime.up(&context, "auth", false).unwrap();
+
+        let written = fs::read_to_string(context.worktree.join("provision.txt")).unwrap();
+        assert_eq!(written, "app_auth|slot_auth|auth");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_provision_command_rolls_the_slot_back() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot.ports]
+web = 3202
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{name}/target"
+
+[slot.db]
+name_template = "app_{slot}"
+provision = ["sh", "-c", 'echo provision-broke >&2; printf partial > {worktree}/provision-attempted; exit 3']
+deprovision = ["sh", "-c", 'printf cleaned > {worktree}/deprovision-ran']
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+
+        let error = runtime.up(&context, "auth", false).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("provision-broke"),
+            "stderr surfaced: {message}"
+        );
+        assert!(
+            message.contains("failed to provision"),
+            "unexpected error: {message}"
+        );
+        assert!(fixture.leases.get(3202).unwrap().is_none(), "port released");
+        assert!(
+            fixture
+                .slots
+                .get(fixture.worktree.path(), "auth")
+                .unwrap()
+                .is_none(),
+            "nothing persisted"
+        );
+        assert!(!context.worktree.join(".slot/auth/target").exists());
+        assert!(!context.worktree.join(ENV_FILE_NAME).exists());
+        // The failed provision is evidence the command ran; rollback then ran
+        // deprovision so a half-created database does not survive.
+        assert!(context.worktree.join("provision-attempted").exists());
+        assert!(context.worktree.join("deprovision-ran").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn down_runs_deprovision_then_releases_ports_and_purges_dirs() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = 3203
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{name}/target"
+
+[slot.db]
+name_template = "app_{slot}"
+provision = ["sh", "-c", 'printf db > {worktree}/db-created']
+deprovision = ["sh", "-c", 'printf order > {worktree}/.slot/auth/target/order.txt; rm -f {worktree}/db-created']
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+        runtime.up(&context, "auth", false).unwrap();
+        let target = context.worktree.join(".slot/auth/target");
+        assert!(context.worktree.join("db-created").exists());
+
+        // Deprovision writes into the cache directory: it can only succeed if
+        // purge has not run yet, so a successful `down` proves the order.
+        let outcome = runtime.down(&context.worktree, "auth", false).unwrap();
+
+        assert_eq!(outcome.released_ports, vec![3203]);
+        assert_eq!(outcome.purged_dirs, vec![target.clone()]);
+        assert!(!target.exists());
+        assert!(!context.worktree.join("db-created").exists());
+        assert!(fixture.leases.get(3203).unwrap().is_none());
+        assert!(fixture.slots.list().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn down_keeps_everything_when_deprovision_fails() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = 3204
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{name}/target"
+
+[slot.db]
+name_template = "app_{slot}"
+provision = ["sh", "-c", 'printf db > {worktree}/db-created']
+deprovision = ["sh", "-c", 'echo deprovision-broke >&2; exit 4']
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+        runtime.up(&context, "auth", false).unwrap();
+
+        let error = runtime.down(&context.worktree, "auth", false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("deprovision-broke"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("--force"),
+            "the retry hint must be visible: {message}"
+        );
+
+        // Nothing was torn down: the user can fix the command and retry.
+        assert!(
+            fixture
+                .slots
+                .get(fixture.worktree.path(), "auth")
+                .unwrap()
+                .is_some()
+        );
+        assert!(fixture.leases.get(3204).unwrap().is_some());
+        assert!(context.worktree.join(".slot/auth/target").is_dir());
+        assert!(context.worktree.join("db-created").exists());
+
+        // The forced retry discards the broken step and cleans up.
+        let forced = runtime.down(&context.worktree, "auth", true).unwrap();
+        assert!(forced.forced);
+        assert!(
+            forced
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("deprovision failed"))
+        );
+        assert!(fixture.slots.list().unwrap().is_empty());
+        assert!(fixture.leases.get(3204).unwrap().is_none());
+        assert!(!context.worktree.join(".slot/auth/target").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn down_force_cleans_up_even_when_deprovision_fails() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = 3205
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{name}/lost+found"
+
+[slot.db]
+name_template = "app_{slot}"
+provision = ["sh", "-c", "true"]
+deprovision = ["sh", "-c", "exit 7"]
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+        runtime.up(&context, "auth", false).unwrap();
+        assert!(context.worktree.join(".slot/auth/lost+found").is_dir());
+
+        let outcome = runtime.down(&context.worktree, "auth", true).unwrap();
+
+        assert!(outcome.forced);
+        assert!(
+            fixture
+                .slots
+                .get(fixture.worktree.path(), "auth")
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.leases.get(3205).unwrap().is_none());
+        assert!(!context.worktree.join(".slot/auth/lost+found").exists());
     }
 }
