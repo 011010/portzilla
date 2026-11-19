@@ -1237,11 +1237,13 @@ fn hook_claude_code_warns_on_process_name_kill() {
         .clone();
 
     let json: Value = serde_json::from_slice(&output).expect("stdout must be valid JSON");
+    // PreToolUse has no additionalContext in the verified contract; the user is
+    // warned through systemMessage, and the model is not warned at all.
     assert!(
-        json["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("node")
+        json["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "PreToolUse must not carry additionalContext: {json}"
     );
     assert!(json["systemMessage"].as_str().unwrap().contains("node"));
 }
@@ -3200,7 +3202,13 @@ GREETING = "hello world"
         worktree.path(),
         &["slot", "show", "auth", "--json"],
     );
-    assert_eq!(shown, listed[0]);
+    // `age_secs` is rendered from the wall clock, so it can tick between the
+    // two invocations; every other field must match exactly.
+    let without_age = |mut value: Value| {
+        value.as_object_mut().unwrap().remove("age_secs");
+        value
+    };
+    assert_eq!(without_age(shown), without_age(listed[0].clone()));
 
     // `env` is line-oriented KEY=value and survives `eval`.
     let env_output = cmd(data.path())
