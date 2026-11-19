@@ -1377,11 +1377,15 @@ mod tests {
         assert_eq!(value["session"], "sess-a");
         assert_eq!(value["live"], true);
         assert_eq!(value["ttl_secs"], 120);
+        // Build the tail with join() so it matches the platform separator the
+        // record actually holds (Windows: "src\\auth.rs").
+        let tail = std::path::Path::new("src").join("auth.rs");
+        let tail = tail.to_string_lossy();
         assert!(
-            value["file"].as_str().unwrap().ends_with("src/auth.rs"),
+            value["file"].as_str().unwrap().ends_with(tail.as_ref()),
             "the claim must record the holder's working copy: {value}"
         );
-        assert!(value["key"].as_str().unwrap().contains("src/auth.rs"));
+        assert!(value["key"].as_str().unwrap().contains(tail.as_ref()));
     }
 
     #[tokio::test]
