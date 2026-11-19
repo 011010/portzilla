@@ -1836,12 +1836,7 @@ mod tests {
         .unwrap();
 
         let outcome = store
-            .claim_durable(
-                24_655,
-                "slot:auth:web".to_string(),
-                None,
-                &AlwaysDead,
-            )
+            .claim_durable(24_655, "slot:auth:web".to_string(), None, &AlwaysDead)
             .unwrap();
         assert_eq!(outcome.lease.port, 24_656);
         assert_eq!(
@@ -1868,7 +1863,9 @@ mod tests {
         let refused = store
             .release_if_tagged(24_657, "slot:other:web", actor(), &AlwaysDead)
             .unwrap();
-        assert!(matches!(refused, TaggedRelease::NotOurs(ref lease) if lease.tag == "slot:auth:web"));
+        assert!(
+            matches!(refused, TaggedRelease::NotOurs(ref lease) if lease.tag == "slot:auth:web")
+        );
         assert!(store.get(24_657).unwrap().is_some());
 
         let released = store
