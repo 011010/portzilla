@@ -198,9 +198,11 @@ struct ToolInput {
 ///   }
 /// }
 /// ```
-/// and the documented `additionalContext` (non-blocking, shown to Claude on
-/// its next turn) and top-level `systemMessage` (shown to the user, not
-/// Claude) fields, used together for [`Verdict::Warn`].
+/// and the documented `additionalContext` (non-blocking, appended to the tool
+/// result the model reads) and top-level `systemMessage` (shown to the user,
+/// not Claude) fields. `additionalContext` is used for the Bash kill guard's
+/// `Verdict::Warn` and for the `PostToolUse` file-intent warning;
+/// `permissionDecision` is only ever `deny`.
 #[derive(Debug, Serialize, PartialEq)]
 struct HookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,9 +284,7 @@ pub fn handle_with_policy(
 
     match HookEvent::from_name(input.hook_event_name.as_deref()) {
         HookEvent::PreToolUse => handle_pre_tool_use(&input, leases, checker, intents, fail_closed),
-        // Nothing to check yet: the PostToolUse warning is recomputed from the
-        // file on disk after the edit.
-        HookEvent::PostToolUse => HookOutcome::allow_silent(),
+        HookEvent::PostToolUse => handle_post_tool_use(&input, intents),
         HookEvent::Other => HookOutcome::allow_silent(),
     }
 }
@@ -467,6 +467,120 @@ fn handle_edit(input: &HookInput, intents: Option<&IntentStore>, fail_closed: bo
             &format!("could not record a file intent for {file}: {err}"),
         ),
     }
+}
+
+/// Handles a `PostToolUse` for `Write` or `Edit`: the edit already happened, so
+/// this event may never deny. When another session still holds a live intent
+/// for the file, the caller's file as written is compared with the holder's
+/// version and the result is appended to the tool result as
+/// `additionalContext`.
+///
+/// The warning is recomputed rather than stashed: the two hook invocations are
+/// separate processes and the payload carries no reliable call id, so a
+/// pending-warning map could not be shared safely. Recomputing is also stricter
+/// than the OpenCode version — it compares the file *as written* and can report
+/// a conflict the edit just created, which `PreToolUse` could not know.
+///
+/// No store, no session, no file, no record, an own claim, an expired claim, a
+/// v1 record without a location, an unreadable file or any store error produce
+/// no output: the only failure mode here is a missing warning.
+fn handle_post_tool_use(input: &HookInput, intents: Option<&IntentStore>) -> HookOutcome {
+    let Some(store) = intents else {
+        return HookOutcome::allow_silent();
+    };
+    let Some(session) = input
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return HookOutcome::allow_silent();
+    };
+    let Some(file) = input
+        .tool_input
+        .as_ref()
+        .and_then(|tool| tool.file_path.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return HookOutcome::allow_silent();
+    };
+
+    let cwd = input
+        .cwd
+        .as_deref()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let (key, location) = locate_file(&cwd, Path::new(file));
+    let record = match store.get(&key) {
+        Ok(Some(record)) => record,
+        Ok(None) | Err(_) => return HookOutcome::allow_silent(),
+    };
+    if record.session == session || !record.is_live_at(current_unix_timestamp()) {
+        return HookOutcome::allow_silent();
+    }
+    let Some(holder_location) = record.location else {
+        return HookOutcome::allow_silent();
+    };
+
+    // The caller's file is the post-edit version: the tool already ran. Read it
+    // from the caller's own worktree so a tracked edit in a linked worktree is
+    // compared against this checkout, not the holder's.
+    let Ok(post_edit) = std::fs::read_to_string(location.worktree.join(&holder_location.rel))
+    else {
+        return HookOutcome::allow_silent();
+    };
+    let verdict = conflict::check(
+        &location.worktree,
+        &holder_location,
+        PendingEdit::Write {
+            content: &post_edit,
+        },
+    );
+    match verdict {
+        ConflictVerdict::Clean => context_response(clean_post_edit_context(file, &record.session)),
+        ConflictVerdict::Conflict => {
+            context_response(conflicting_post_edit_context(file, &record.session))
+        }
+        // The check could not prove anything, and this event may not deny. A
+        // missing warning is the only cost, so stay silent.
+        ConflictVerdict::Unprovable => HookOutcome::allow_silent(),
+    }
+}
+
+/// Builds the `PostToolUse` `additionalContext` response. There is
+/// deliberately no `permissionDecision` field: a post-edit hook may only add
+/// information to the tool result the model reads.
+fn context_response(context: String) -> HookOutcome {
+    let response = HookResponse {
+        system_message: None,
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PostToolUse",
+            permission_decision: None,
+            permission_decision_reason: None,
+            additional_context: Some(context),
+        },
+    };
+    HookOutcome {
+        stdout_json: Some(
+            serde_json::to_string(&response).expect("HookResponse always serializes"),
+        ),
+        stderr_note: None,
+        audit: None,
+    }
+}
+
+/// The context for an edit that provably merges with the holder's version. It
+/// says the merge was clean *after* the fact and asks for coordination before
+/// the two changes drift into the same lines.
+fn clean_post_edit_context(file: &str, holder: &str) -> String {
+    format!("{file} is also being edited by session {holder}; the versions merged cleanly.")
+}
+
+/// The context for an edit the check finds conflicting. The edit already
+/// happened, so this informs rather than blocks: the next edit is the one that
+/// will be denied if the versions still conflict.
+fn conflicting_post_edit_context(file: &str, holder: &str) -> String {
+    format!(
+        "{file} now conflicts with session {holder}'s version; coordinate before the next edit."
+    )
 }
 
 /// Converts the tool payload into the conflict check's input.
@@ -992,6 +1106,24 @@ mod tests {
             .to_string();
             handle_with_policy(&payload, &[], &AlwaysAlive, Some(&self.store), false)
         }
+
+        fn post_tool_use(&self, tool: &str, tool_input: serde_json::Value) -> HookOutcome {
+            let payload = serde_json::json!({
+                "session_id": "session-mine",
+                "hook_event_name": "PostToolUse",
+                "cwd": self.repo.to_str().unwrap(),
+                "tool_name": tool,
+                "tool_input": tool_input,
+                "tool_response": { "success": true },
+                "tool_use_id": "toolu_01"
+            })
+            .to_string();
+            handle_with_policy(&payload, &[], &AlwaysAlive, Some(&self.store), false)
+        }
+
+        fn set_caller_file(&self, content: &str) {
+            std::fs::write(self.repo.join("src/auth.rs"), content).unwrap();
+        }
     }
 
     fn edit_input(old: &str, new: &str) -> serde_json::Value {
@@ -1161,5 +1293,99 @@ mod tests {
 
         let reason = deny_reason(&outcome);
         assert!(reason.contains("Do not edit it"));
+    }
+
+    fn additional_context_of(outcome: &HookOutcome) -> String {
+        let json: serde_json::Value = serde_json::from_str(
+            outcome
+                .stdout_json
+                .as_deref()
+                .expect("a warning must produce stdout JSON"),
+        )
+        .expect("the warning must be valid JSON");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(json.get("systemMessage").is_none());
+        json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext must be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn a_clean_edit_on_a_held_file_emits_additional_context() {
+        let fixture = edit_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+        // The edit already happened: the caller's file is the post-edit
+        // version, and only line 3 changed relative to the base.
+        fixture.set_caller_file("a\nb\nC\n");
+
+        let outcome = fixture.post_tool_use("Edit", edit_input("c\n", "C\n"));
+
+        assert!(outcome.stderr_note.is_none());
+        let context = additional_context_of(&outcome);
+        assert!(context.contains("src/auth.rs"), "{context}");
+        assert!(context.contains("session-theirs"), "{context}");
+        assert!(context.contains("merged cleanly"), "{context}");
+    }
+
+    #[test]
+    fn an_edit_that_created_a_conflict_emits_a_conflict_context() {
+        let fixture = edit_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+        // The caller rewrote the holder's line 1.
+        fixture.set_caller_file("X\nb\nc\n");
+
+        let outcome = fixture.post_tool_use("Edit", edit_input("a\n", "X\n"));
+
+        assert!(outcome.stderr_note.is_none());
+        let context = additional_context_of(&outcome);
+        assert!(context.contains("src/auth.rs"), "{context}");
+        assert!(context.contains("session-theirs"), "{context}");
+        assert!(context.contains("now conflicts"), "{context}");
+        assert!(
+            !context.contains("merged cleanly"),
+            "the conflict wording must differ from the clean one: {context}"
+        );
+    }
+
+    #[test]
+    fn a_post_tool_use_without_a_foreign_claim_is_silent() {
+        // No record at all.
+        let fixture = edit_fixture("A\nb\nc\n");
+        fixture.set_caller_file("X\nb\nc\n");
+        let outcome = fixture.post_tool_use("Edit", edit_input("a\n", "X\n"));
+        assert!(outcome.stdout_json.is_none(), "{:?}", outcome.stdout_json);
+        assert!(outcome.stderr_note.is_none());
+
+        // The caller's own claim: nothing to warn about.
+        let now = current_unix_timestamp();
+        fixture
+            .store
+            .claim(&fixture.key, "session-mine", now, now + 600, None)
+            .unwrap();
+        let own = fixture.post_tool_use("Edit", edit_input("a\n", "X\n"));
+        assert!(own.stdout_json.is_none(), "{:?}", own.stdout_json);
+        assert!(own.stderr_note.is_none());
+    }
+
+    #[test]
+    fn post_tool_use_never_emits_a_permission_decision() {
+        let fixture = edit_fixture("A\nb\nc\n");
+        fixture.seed_holder(Some(fixture.location.clone()));
+        fixture.set_caller_file("a\nb\nC\n");
+
+        let outcome = fixture.post_tool_use("Edit", edit_input("c\n", "C\n"));
+        let raw = outcome.stdout_json.expect("the clean case must warn");
+        assert!(
+            !raw.contains("permissionDecision"),
+            "PostToolUse may only add context, never a decision: {raw}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            json["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+        assert!(json.get("permissionDecision").is_none());
     }
 }
