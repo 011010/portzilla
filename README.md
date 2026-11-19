@@ -5,7 +5,7 @@
 <h1 align="center">portzilla</h1>
 
 <p align="center">
-  <strong>Lease registry for localhost ports — stop killing your sibling's dev server.</strong>
+  <strong>Coordination layer for parallel AI agent sessions — ports, files, and worktree environments.</strong>
 </p>
 
 <p align="center">
@@ -16,11 +16,16 @@
   [![M8ven Score](https://m8ven.ai/badge/mcp/011010-portzilla-qdocjc?v=2e641775b25eeb046db492cd7a4d7c5e)](https://m8ven.ai/mcp/011010-portzilla-qdocjc?s=readme)
 </p>
 
-> AI coding agents (Claude Code, Cursor, etc.) run parallel sessions in git worktrees — each starting its own dev server. Today they coordinate by killing whatever is on a port. `portzilla` is the layer that **prevents the conflict**.
+> AI coding agents (Claude Code, Cursor, etc.) run parallel sessions in git worktrees — each starting its own dev server, editing the same files, and pointing at the same database. Today they coordinate by killing whatever is on a port. `portzilla` is the layer that **prevents the conflict**.
 
-- **Claim, don't kill** — `portzilla claim 3000 --tag next-dev` gives you a port with owner PID + purpose tag. Conflicts and already-bound ports get the next available port instead of stealing.
-- **Ask before you kill** — `portzilla who 3000` tells you who owns a port. JSON everywhere so agents can consume it directly.
-- **Guard by default** — intercepts `kill`, `lsof | xargs kill`, `fuser -k`, `kill-port` and blocks kills against another session's live lease.
+| What collides | What portzilla gives you | Start here |
+|---|---|---|
+| A port both sessions want | A lease with owner PID and purpose tag. Conflicts get the next free port instead of a kill | `portzilla claim 3000 --tag next-dev` |
+| A port another agent wants to kill | A guard that intercepts `kill`, `lsof \| xargs kill`, `fuser -k`, `kill-port` and blocks kills against another session's live lease | `portzilla init <harness>` |
+| A file both sessions edit | A file intent. A proven conflict is denied; a clean merge is allowed with a warning; hooks do it automatically on OpenCode and Claude Code | `portzilla intent claim src/auth.ts` |
+| A database and a `target/` directory both sessions share | An environment slot: its own ports, cache directories, `.env.portzilla`, and a database provisioned by your own commands | `portzilla slot up auth` |
+
+Every layer speaks JSON and is exposed over MCP, so an agent calls it as a tool instead of parsing text. Everything is a single daemon-less binary.
 
 Port allocators and proxies such as [Portless](https://portless.sh) solve addressability and automatic port selection. `portzilla` focuses on a different boundary: declaring which agent session owns a process and preventing another agent from killing it. It stays daemon-less by default, requires no local proxy or CA, and works with any server command that consumes the assigned port.
 
@@ -35,7 +40,10 @@ Port allocators and proxies such as [Portless](https://portless.sh) solve addres
 - [Agent skill](#agent-skill)
 - [Watch mode](#watch-mode)
 - [MCP server](#mcp-server)
+- [Audit history](#audit-history)
 - [Kill guard](#kill-guard)
+- [File intents](#file-intents)
+- [Environment slots](#environment-slots)
 - [Data file & config](#data-file--config)
 - [Limitations](#limitations)
 
@@ -126,8 +134,14 @@ Binaries for Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows x86_64/ARM64
 | `portzilla prune` | Remove all leases whose PID is dead |
 | `portzilla run <PORT> --tag <TAG> [--session <S>] -- <cmd...>` | Claim a port and run a server with it; the lease follows the child PID |
 | `portzilla watch [--interval <SECONDS>]` | Repeatedly prune leases whose recorded PID is dead |
+| `portzilla guard -- <cmd...>` | Run a command with the kill guard applied, for harnesses without hooks |
+| `portzilla init <harness>` | Print the hook/plugin snippet to install; prose on stderr, snippet on stdout |
+| `portzilla serve --mcp` | Run the MCP server on stdio |
+| `portzilla intent claim\|who\|ls\|release\|history` | File intents: claim a path, inspect the holder, release early, read the journal |
+| `portzilla slot up\|env\|run\|ls\|show\|down\|prune` | Environment slots: ports, cache dirs, `.env.portzilla`, database |
+| `portzilla history [--json]` | Bounded lease and guard event journal |
 
-Data-producing commands are file-locked and support `--json`. Full flags, conflict semantics, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md)**.
+Data-producing commands are file-locked and support `--json`. Full flags, conflict semantics, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md)**. Slots have their own reference: **[docs/SLOTS.md](docs/SLOTS.md)**.
 
 ## Agent skill
 
@@ -228,11 +242,19 @@ Setup: `portzilla init <harness>` prints the snippet to add — never writes fil
 
 Full harness setup, `sh -c` unwrapping rules, and fail-open/closed semantics → **[docs/GUARD.md](docs/GUARD.md)**.
 
-### File intents (OpenCode)
+### File intents
 
 Agents in parallel worktrees also collide on *files*: two sessions editing `src/auth.rs` produce a merge conflict that only surfaces at review time. File intents are the same lease idea applied to a path.
 
-The OpenCode shim asks for an intent on every `write`/`edit` before the tool runs, and sends the pending edit with the request:
+Three delivery paths, same store and same verdicts:
+
+| Harness | How the check happens |
+|---|---|
+| OpenCode | Plugin shim asks on every `write`/`edit` and sends the pending edit |
+| Claude Code | `PreToolUse` on `Write`/`Edit`; `PostToolUse` delivers the clean-merge warning |
+| Everything with MCP | `intent_claim` / `intent_who` / `intent_ls` / `intent_release` — cooperative, the agent decides to call them |
+
+What the guard does with the pending edit:
 
 - The first session to edit a file claims it for 30 minutes (`PORTZILLA_INTENT_TTL_SECS` overrides the window).
 - A session that edits it again refreshes its own claim.
@@ -265,7 +287,7 @@ SEQ AT EVENT SESSION KEY
 
 `claim` records where the caller's working copy lives, so a claim made by hand is conflict-checkable by the OpenCode guard too. The intent file is at schema v3: it also holds a bounded journal of claim and release events. v1 and v2 files are read and upgraded on the next write (their journal starts at sequence 1), but an older portzilla binary cannot read a v3 file and must be upgraded before sharing a data directory. Invalid TTLs (outside 1–86400 seconds) are refused. Full flags, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md#file-intents)**.
 
-Limits, stated plainly: OpenCode and Claude Code are covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
+Limits, stated plainly: OpenCode and Claude Code enforce automatically; every other harness depends on the agent calling the MCP tools. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
 
 One consequence worth knowing: ownership is per *session*, and every `opencode run` invocation is a new session. In the TUI a conversation keeps its session for its whole life, but scripted runs block each other on the same file until the TTL lapses. `portzilla intent ls` shows the holder and `portzilla intent release <path> --session <id>` frees it immediately.
 
@@ -287,7 +309,7 @@ Full reference, including SQLite and Postgres recipes → **[docs/SLOTS.md](docs
 
 ## Data file & config
 
-Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. State at `leases.json` (atomic write + `leases.json.lock`). New writes use the v3 envelope, which stores leases and bounded audit history together.
+Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. Three independent stores, each written atomically behind its own lock: `leases.json` (leases plus the port/guard journal), `intents.json` (file claims plus their journal), and `slots.json` (environment slots). No store is shared with another, so a corrupt or locked file never takes the others down with it.
 
 `PORTZILLA_DATA_DIR` isolates tests/CI. `tag` max 1024 chars, `session` max 512, hook stdin capped at 1 MiB. New leases persist `process_start_time` when available; reassignment JSON includes `reassignment_reason` (`lease_conflict` or `os_occupied`). Claims for an explicit PID that does not exist yet are retained as unverified/dead records, not as ownership promises. The normal CLI default attributes a claim to its live parent process. See **[docs/CLI.md](docs/CLI.md)**.
 
