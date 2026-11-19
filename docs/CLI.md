@@ -208,6 +208,40 @@ Used as a single object by `who` and `release`, and as an array of these objects
 
 The persisted `leases.json` records an internal `process_identity_verified` boolean for new claims: `true` when `process_start_time` was resolved and `false` when it was unavailable. The field is omitted for legacy lease records and is not exposed in CLI or MCP JSON views.
 
+## Slot commands
+
+`portzilla slot <command>` manages per-worktree environment slots. The full configuration reference, failure semantics and recipes live in **[SLOTS.md](SLOTS.md)**.
+
+| Command | Arguments | Exit codes |
+|---|---|---|
+| `slot up <name>` | `--config <path>`, `--replace`, `--json` | 0 created or replaced; 1 invalid config, name invalid, already up without `--replace`, provision or rollback failure |
+| `slot env <name>` | `--config <path>` | 0 printed; 1 store or config error; 2 not found |
+| `slot run <name> -- <cmd...>` | `--config <path>` | 0 child exited 0; 1 spawn or store error; 2 not found; otherwise the child's code (a signalled child is 1) |
+| `slot ls` | `--json` | 0 listed; 1 store error |
+| `slot show <name>` | `--json` | 0 shown; 1 store error; 2 not found |
+| `slot down <name>` | `--force`, `--json` | 0 torn down; 1 deprovision or release failure; 2 not found |
+| `slot prune` | `--json` | 0 pruned or nothing to prune (failures are warnings); 1 store error |
+
+`slot env` prints one sorted `KEY=value` line per variable, safe for `eval "$(portzilla slot env auth)"` and direnv. `slot run` prints only the child's output.
+
+### Slot object (`up`, `ls`, `show`, `down`, `prune --json`)
+
+```json
+{"name":"auth","worktree":"/repo/.worktrees/auth","repo_key":"/repo/.git",
+ "ports":{"api":3101,"web":3003},
+ "db":{"name":"app_auth","schema":"slot_auth"},
+ "cache_dirs":["/repo/.worktrees/auth/.slot/auth/target"],
+ "env_file":"/repo/.worktrees/auth/.env.portzilla",
+ "created_at":1795000000,"age_secs":12}
+```
+
+- `db` is `null` when `[slot.db]` is absent; `schema` is omitted when not configured.
+- `up` adds `"replaced": bool`.
+- `down` adds `"released_ports": [...]`, `"purged_dirs": [...]`, `"warnings": [...]`, `"forced": bool`.
+- `ls` and `prune` print arrays, `[]` when empty.
+
+Slots live in their own store, `<data_dir>/slots.json`, versioned and locked the same way as `leases.json`. Ports a slot owns are durable leases: they stay live until released, have no owning process, and appear in `portzilla ls` with pid `0`. The kill guard treats them like any other lease.
+
 ## MCP server
 
 `portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, and read-only `history` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.

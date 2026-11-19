@@ -261,6 +261,22 @@ Limits, stated plainly: OpenCode and Claude Code are covered today; the other ha
 
 One consequence worth knowing: ownership is per *session*, and every `opencode run` invocation is a new session. In the TUI a conversation keeps its session for its whole life, but scripted runs block each other on the same file until the TTL lapses. `portzilla intent ls` shows the holder and `portzilla intent release <path> --session <id>` frees it immediately.
 
+## Environment slots
+
+Ports and files are not the only shared resources: two worktrees of one project also collide on the database they both point at and on the `target/` directory Cargo serialises behind its lock.
+
+A **slot** gives one worktree its own ports, cache directories, `.env.portzilla`, and — through commands you configure — its own database:
+
+```console
+$ portzilla slot up auth
+$ portzilla slot run auth -- npm test
+$ portzilla slot down auth
+```
+
+Configured in `portzilla.toml` at the worktree root; `up` is transactional and rolls back completely on failure; `down` is retryable and refuses to destroy a database it could not deprovision. No daemon, no containers, and your credentials never pass through Portzilla.
+
+Full reference, including SQLite and Postgres recipes → **[docs/SLOTS.md](docs/SLOTS.md)**.
+
 ## Data file & config
 
 Resolution order: `PORTZILLA_DATA_DIR` → `$XDG_DATA_HOME/portzilla` → `~/.local/share/portzilla`. State at `leases.json` (atomic write + `leases.json.lock`). New writes use the v3 envelope, which stores leases and bounded audit history together.

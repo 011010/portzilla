@@ -2507,7 +2507,7 @@ fn run_empty_session_is_treated_as_no_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert!(
         lease["session"].is_null(),
@@ -2543,14 +2543,19 @@ fn run_empty_session_is_treated_as_no_session() {
         .code(1);
 }
 
-/// Polls `who` until the lease on `port` names the transferred child rather
+/// Polls `ls` until the lease tagged `tag` names the transferred child rather
 /// than the still-setting-up wrapper: between the wrapper's claim and its
 /// transfer the lease legitimately names the wrapper PID, so returning the
 /// first sighting would race with the transfer.
+///
+/// Looked up by tag, not by the requested port: `run` is allowed to reassign
+/// the port when another process or lease takes it between the OS probe and
+/// the claim, and polling the requested port would then wait out the whole
+/// timeout for a lease that was correctly created somewhere else.
 #[cfg(unix)]
 fn poll_run_child_lease(
     data_dir: &std::path::Path,
-    port: u16,
+    tag: &str,
     wrapper_pid: u32,
     timeout: Duration,
 ) -> Option<Value> {
@@ -2559,14 +2564,16 @@ fn poll_run_child_lease(
     loop {
         let output = std::process::Command::new(&binary)
             .env("PORTZILLA_DATA_DIR", data_dir)
-            .args(["who", &port.to_string(), "--json"])
+            .args(["ls", "--json"])
             .output()
             .ok()?;
         if output.status.success()
-            && let Ok(json) = serde_json::from_slice::<Value>(&output.stdout)
-            && json["pid"].as_u64() != Some(u64::from(wrapper_pid))
+            && let Ok(Value::Array(leases)) = serde_json::from_slice::<Value>(&output.stdout)
+            && let Some(lease) = leases.iter().find(|lease| {
+                lease["tag"] == tag && lease["pid"].as_u64() != Some(u64::from(wrapper_pid))
+            })
         {
-            return Some(json);
+            return Some(lease.clone());
         }
         if Instant::now() >= deadline {
             return None;
@@ -2602,7 +2609,7 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
@@ -2706,7 +2713,7 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
@@ -3100,4 +3107,559 @@ fn intent_claim_rejects_out_of_range_ttl_secs() {
             .code(1)
             .stderr(predicate::str::contains("--ttl-secs must be between"));
     }
+}
+
+// ---- environment slots ----
+
+fn write_slot_config(worktree: &std::path::Path, contents: &str) -> std::path::PathBuf {
+    let path = worktree.join("portzilla.toml");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+fn slot_json_output(
+    data_dir: &std::path::Path,
+    worktree: &std::path::Path,
+    args: &[&str],
+) -> Value {
+    let output = cmd(data_dir)
+        .current_dir(worktree)
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_round_trip_covers_up_ls_show_env_run_and_down() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    let config = format!(
+        r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = {port}
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{{name}}/target"
+
+[slot.env]
+GREETING = "hello world"
+"#
+    );
+    write_slot_config(worktree.path(), &config);
+    let target = worktree.path().join(".slot/auth/target");
+    let env_file = worktree.path().join(".env.portzilla");
+
+    let up = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["slot", "up", "auth", "--json"],
+    );
+    assert_eq!(up["name"], "auth");
+    assert_eq!(up["ports"]["web"], port);
+    assert_eq!(up["db"], Value::Null);
+    assert_eq!(up["replaced"], false);
+    assert!(target.is_dir());
+    assert!(env_file.is_file());
+    let up_keys: std::collections::HashSet<&str> =
+        up.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        up_keys,
+        [
+            "name",
+            "worktree",
+            "repo_key",
+            "ports",
+            "db",
+            "cache_dirs",
+            "env_file",
+            "created_at",
+            "age_secs",
+            "replaced",
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["name"], "auth");
+    assert_eq!(listed[0]["ports"]["web"], port);
+
+    let shown = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["slot", "show", "auth", "--json"],
+    );
+    assert_eq!(shown, listed[0]);
+
+    // `env` is line-oriented KEY=value and survives `eval`.
+    let env_output = cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "env", "auth"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let env_text = String::from_utf8(env_output).unwrap();
+    assert!(env_text.contains(&format!("PORTZILLA_PORT_WEB={port}\n")));
+    assert!(env_text.contains("GREETING=\"hello world\"\n"));
+    let evaluated = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{env_text}\nprintf '%s' \"$PORTZILLA_PORT_WEB|$GREETING\""
+        ))
+        .output()
+        .unwrap();
+    assert!(evaluated.status.success());
+    assert_eq!(
+        String::from_utf8(evaluated.stdout).unwrap(),
+        format!("{port}|hello world")
+    );
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args([
+            "slot",
+            "run",
+            "auth",
+            "--",
+            "printenv",
+            "PORTZILLA_PORT_WEB",
+        ])
+        .assert()
+        .success()
+        .stdout(format!("{port}\n"));
+
+    // `run` is transparent about the child's exit code.
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "run", "auth", "--", "sh", "-c", "exit 7"])
+        .assert()
+        .code(7);
+
+    let down = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["slot", "down", "auth", "--json"],
+    );
+    assert_eq!(down["released_ports"], serde_json::json!([port]));
+    assert_eq!(down["forced"], false);
+    assert!(down["purged_dirs"].as_array().unwrap().len() == 1);
+    assert!(!target.exists());
+    assert!(!env_file.exists());
+
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed, serde_json::json!([]));
+    // The durable lease went with the record.
+    cmd(data.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn slot_up_twice_fails_and_replace_replaces() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(
+        worktree.path(),
+        &format!("[slot]\npurge_cache_on_down = true\n\n[slot.ports]\nweb = {port}\n"),
+    );
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("already up"))
+        .stderr(predicate::str::contains("--replace"));
+
+    let replaced = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["slot", "up", "auth", "--replace", "--json"],
+    );
+    assert_eq!(replaced["replaced"], true);
+    assert_eq!(replaced["ports"]["web"], port);
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "down", "auth"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn slot_missing_commands_exit_2() {
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    write_slot_config(worktree.path(), "[slot.ports]\nweb = 3600\n");
+
+    for args in [
+        vec!["slot", "show", "ghost"],
+        vec!["slot", "down", "ghost"],
+        vec!["slot", "env", "ghost"],
+        vec!["slot", "run", "ghost", "--", "true"],
+    ] {
+        cmd(data.path())
+            .current_dir(worktree.path())
+            .args(&args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("no slot named ghost"));
+    }
+}
+
+#[test]
+fn slot_prune_removes_vanished_worktrees_and_releases_their_ports() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(
+        worktree.path(),
+        &format!("[slot]\npurge_cache_on_down = true\n\n[slot.ports]\nweb = {port}\n"),
+    );
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    drop(worktree);
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let pruned = slot_json_output(data.path(), elsewhere.path(), &["slot", "prune", "--json"]);
+    assert_eq!(pruned.as_array().unwrap().len(), 1);
+    assert_eq!(pruned[0]["name"], "auth");
+    assert_eq!(pruned[0]["ports"]["web"], port);
+
+    let listed = slot_json_output(data.path(), elsewhere.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed, serde_json::json!([]));
+    cmd(data.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .code(2);
+    cmd(data.path())
+        .current_dir(elsewhere.path())
+        .args(["slot", "prune"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no slots to prune"));
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_down_keeps_the_record_when_deprovision_fails_unless_forced() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(
+        worktree.path(),
+        &format!(
+            r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = {port}
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{{name}}/target"
+
+[slot.db]
+name_template = "app_{{slot}}"
+provision = ["sh", "-c", "true"]
+deprovision = ["sh", "-c", "echo deprovision-broke >&2; exit 5"]
+"#
+        ),
+    );
+    let target = worktree.path().join(".slot/auth/target");
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "down", "auth"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("deprovision-broke"))
+        .stderr(predicate::str::contains("--force"));
+
+    // Retryable: everything is still in place.
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert!(target.is_dir());
+    cmd(data.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .success();
+
+    let forced = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["slot", "down", "auth", "--force", "--json"],
+    );
+    assert_eq!(forced["forced"], true);
+    assert!(
+        !forced["warnings"].as_array().unwrap().is_empty(),
+        "the forced skip must be reported"
+    );
+    assert!(!target.exists());
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed, serde_json::json!([]));
+    cmd(data.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .code(2);
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_up_rolls_back_when_provision_fails() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(
+        worktree.path(),
+        &format!(
+            r#"
+[slot]
+purge_cache_on_down = true
+
+[slot.ports]
+web = {port}
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{{name}}/target"
+
+[slot.db]
+name_template = "app_{{slot}}"
+provision = ["sh", "-c", "echo provision-broke >&2; exit 3"]
+deprovision = ["sh", "-c", "true"]
+"#
+        ),
+    );
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("provision-broke"));
+
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed, serde_json::json!([]));
+    assert!(!worktree.path().join(".slot/auth/target").exists());
+    assert!(!worktree.path().join(".env.portzilla").exists());
+    cmd(data.path())
+        .args(["who", &port.to_string(), "--json"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn slot_keeps_its_ports_reserved_from_a_plain_claim() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(worktree.path(), &format!("[slot.ports]\nweb = {port}\n"));
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    let own_pid = std::process::id().to_string();
+    let claimed = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &[
+            "claim",
+            &port.to_string(),
+            "--tag",
+            "intruder",
+            "--pid",
+            &own_pid,
+            "--json",
+        ],
+    );
+    assert_eq!(claimed["reassigned"], true);
+    assert_ne!(claimed["port"], port);
+
+    // The reservation is untouched and still names the slot.
+    let who = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["who", &port.to_string(), "--json"],
+    );
+    assert_eq!(who["tag"], "slot:auth:web");
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "down", "auth"])
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_down_never_releases_a_port_another_owner_took() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(worktree.path(), &format!("[slot.ports]\nweb = {port}\n"));
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    // Drop the slot's lease, then take the port for a different tag.
+    cmd(data.path())
+        .args(["release", &port.to_string()])
+        .assert()
+        .success();
+    let own_pid = std::process::id().to_string();
+    cmd(data.path())
+        .args([
+            "claim",
+            &port.to_string(),
+            "--tag",
+            "foreign-owner",
+            "--pid",
+            &own_pid,
+        ])
+        .assert()
+        .success();
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "down", "auth"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not by slot auth"));
+
+    let who = slot_json_output(
+        data.path(),
+        worktree.path(),
+        &["who", &port.to_string(), "--json"],
+    );
+    assert_eq!(who["tag"], "foreign-owner");
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_env_config_reloads_only_slot_env_values() {
+    let _ports = lock_test_ports();
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let port = free_test_port();
+    write_slot_config(
+        worktree.path(),
+        &format!("[slot.ports]\nweb = {port}\n\n[slot.env]\nGREETING = \"first\"\n"),
+    );
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .success();
+
+    let override_config = worktree.path().join("override.toml");
+    std::fs::write(
+        &override_config,
+        format!(
+            "[slot.ports]\nweb = {port}\n\n[slot.env]\nGREETING = \"second\"\nEXTRA = \"yes\"\n"
+        ),
+    )
+    .unwrap();
+
+    let reloaded = cmd(data.path())
+        .current_dir(worktree.path())
+        .args([
+            "slot",
+            "env",
+            "auth",
+            "--config",
+            override_config.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let reloaded = String::from_utf8(reloaded).unwrap();
+    assert!(reloaded.contains("GREETING=second\n"));
+    assert!(reloaded.contains("EXTRA=yes\n"));
+    assert!(reloaded.contains(&format!("PORTZILLA_PORT_WEB={port}\n")));
+
+    // Without --config the stored environment is unchanged.
+    let stored = cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "env", "auth"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(stored)
+            .unwrap()
+            .contains("GREETING=first\n")
+    );
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "down", "auth"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn slot_up_names_the_missing_config_and_creates_nothing() {
+    let data = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+
+    cmd(data.path())
+        .current_dir(worktree.path())
+        .args(["slot", "up", "auth"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("portzilla.toml"));
+
+    let listed = slot_json_output(data.path(), worktree.path(), &["slot", "ls", "--json"]);
+    assert_eq!(listed, serde_json::json!([]));
+    assert!(!worktree.path().join(".env.portzilla").exists());
 }

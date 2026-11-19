@@ -195,20 +195,12 @@ pub fn locate_file(cwd: &Path, file: &Path) -> (String, IntentLocation) {
     let cwd = canonicalize_or_owned(cwd);
     let absolute = canonicalize_deepest_existing(&absolute_path(&cwd, file));
 
-    let Some(git_paths) = git_stdout(&cwd, &["rev-parse", "--show-toplevel", "--git-common-dir"])
-    else {
+    let Some((toplevel, common_dir)) = git_repository_paths(&cwd) else {
         return outside_git_location(absolute);
     };
-    let mut lines = git_paths.lines();
-    let (Some(toplevel), Some(common_dir)) = (lines.next(), lines.next()) else {
-        return outside_git_location(absolute);
-    };
-
-    let toplevel = canonicalize_or_owned(Path::new(toplevel));
     let Some(relative) = relative_to(&absolute, &toplevel) else {
         return outside_git_location(absolute);
     };
-    let common_dir = resolve_common_dir(&cwd, Path::new(common_dir));
     let key = format!(
         "{}:{}",
         common_dir.to_string_lossy(),
@@ -220,6 +212,36 @@ pub fn locate_file(cwd: &Path, file: &Path) -> (String, IntentLocation) {
         rel: relative,
     };
     (key, location)
+}
+
+/// Returns the canonical worktree root and repository identity for `cwd`.
+///
+/// Repository identity is the git *common* dir, exactly as in
+/// [`locate_file`]: two linked worktrees of one repository return the same
+/// repository identity and distinct worktree roots. Outside a git repository
+/// both values are the canonical path of `cwd`, which is the only identity
+/// available and keeps non-git projects usable.
+///
+/// This is the slot store's `repo_key` source; it is exposed as a helper so
+/// slots never reimplement (and slowly drift from) the intent store's rule.
+pub fn repository_identity(cwd: &Path) -> (PathBuf, PathBuf) {
+    let cwd = canonicalize_or_owned(cwd);
+    match git_repository_paths(&cwd) {
+        Some((toplevel, common_dir)) => (toplevel, common_dir),
+        None => (cwd.clone(), cwd),
+    }
+}
+
+/// Runs the two `rev-parse` queries [`locate_file`] and
+/// [`repository_identity`] both need, returning canonical paths. `None`
+/// outside a work tree or when git is unavailable.
+fn git_repository_paths(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let git_paths = git_stdout(cwd, &["rev-parse", "--show-toplevel", "--git-common-dir"])?;
+    let mut lines = git_paths.lines();
+    let (toplevel, common_dir) = (lines.next()?, lines.next()?);
+    let toplevel = canonicalize_or_owned(Path::new(toplevel));
+    let common_dir = resolve_common_dir(cwd, Path::new(common_dir));
+    Some((toplevel, common_dir))
 }
 
 /// Builds the key and location for a file with no git repository behind it:
@@ -304,7 +326,7 @@ fn absolute_path(cwd: &Path, file: &Path) -> PathBuf {
 /// Lexically removes `.` and `..` components. `..` that crosses a symlink can
 /// name a different directory than the OS would follow; the caller resolves the
 /// existing prefix afterwards, which corrects that wherever the target exists.
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -345,7 +367,7 @@ fn relative_to(file: &Path, toplevel: &Path) -> Option<PathBuf> {
 
 /// Canonicalizes `path`, falling back to its lexical normalization when it
 /// cannot be resolved (for example because it does not exist yet).
-fn canonicalize_or_owned(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_or_owned(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
@@ -1494,6 +1516,32 @@ mod tests {
             ],
         );
         GitRepo { root, main, linked }
+    }
+
+    #[test]
+    fn repository_identity_is_the_common_dir_with_a_distinct_worktree_per_checkout() {
+        let repo = git_repo_with_worktree();
+        let (main_worktree, main_identity) = repository_identity(&repo.main);
+        let (linked_worktree, linked_identity) = repository_identity(&repo.linked);
+
+        assert_eq!(
+            main_identity,
+            fs::canonicalize(repo.main.join(".git")).unwrap()
+        );
+        assert_eq!(main_identity, linked_identity);
+        assert_ne!(main_worktree, linked_worktree);
+        assert_eq!(main_worktree, fs::canonicalize(&repo.main).unwrap());
+        assert_eq!(linked_worktree, fs::canonicalize(&repo.linked).unwrap());
+    }
+
+    #[test]
+    fn repository_identity_outside_git_is_the_canonical_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            repository_identity(dir.path()),
+            (canonical.clone(), canonical)
+        );
     }
 
     #[test]
