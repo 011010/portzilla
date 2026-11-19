@@ -2507,7 +2507,7 @@ fn run_empty_session_is_treated_as_no_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert!(
         lease["session"].is_null(),
@@ -2543,14 +2543,19 @@ fn run_empty_session_is_treated_as_no_session() {
         .code(1);
 }
 
-/// Polls `who` until the lease on `port` names the transferred child rather
+/// Polls `ls` until the lease tagged `tag` names the transferred child rather
 /// than the still-setting-up wrapper: between the wrapper's claim and its
 /// transfer the lease legitimately names the wrapper PID, so returning the
 /// first sighting would race with the transfer.
+///
+/// Looked up by tag, not by the requested port: `run` is allowed to reassign
+/// the port when another process or lease takes it between the OS probe and
+/// the claim, and polling the requested port would then wait out the whole
+/// timeout for a lease that was correctly created somewhere else.
 #[cfg(unix)]
 fn poll_run_child_lease(
     data_dir: &std::path::Path,
-    port: u16,
+    tag: &str,
     wrapper_pid: u32,
     timeout: Duration,
 ) -> Option<Value> {
@@ -2559,14 +2564,16 @@ fn poll_run_child_lease(
     loop {
         let output = std::process::Command::new(&binary)
             .env("PORTZILLA_DATA_DIR", data_dir)
-            .args(["who", &port.to_string(), "--json"])
+            .args(["ls", "--json"])
             .output()
             .ok()?;
         if output.status.success()
-            && let Ok(json) = serde_json::from_slice::<Value>(&output.stdout)
-            && json["pid"].as_u64() != Some(u64::from(wrapper_pid))
+            && let Ok(Value::Array(leases)) = serde_json::from_slice::<Value>(&output.stdout)
+            && let Some(lease) = leases.iter().find(|lease| {
+                lease["tag"] == tag && lease["pid"].as_u64() != Some(u64::from(wrapper_pid))
+            })
         {
-            return Some(json);
+            return Some(lease.clone());
         }
         if Instant::now() >= deadline {
             return None;
@@ -2602,7 +2609,7 @@ fn run_guard_denies_kill_of_run_child_from_foreign_session() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
@@ -2706,7 +2713,7 @@ fn run_child_lease_is_live_then_dead_then_pruned() {
         .unwrap();
     let wrapper_pid = wrapper.id();
 
-    let lease = poll_run_child_lease(dir.path(), port, wrapper_pid, Duration::from_secs(30))
+    let lease = poll_run_child_lease(dir.path(), "run-svc", wrapper_pid, Duration::from_secs(30))
         .expect("the run lease must be visible while the child runs");
     assert_eq!(lease["tag"], "run-svc");
     assert_eq!(lease["session"], "run-sess");
