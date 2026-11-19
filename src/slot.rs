@@ -200,6 +200,29 @@ impl SlotStore {
         Ok(store)
     }
 
+    /// Serializes a whole slot operation (`up`, `down`, `prune`) across
+    /// processes, not just a single store read-modify-write.
+    ///
+    /// `slots.json`'s own lock protects the file; this lock protects the
+    /// *machine*: two concurrent `up` runs must not both conclude that a
+    /// cache directory is free, and `up --replace` must not race another
+    /// teardown of the same name. The returned handle releases the lock when
+    /// it drops. It is a separate file so the store's short-lived operations
+    /// can still take `slots.json.lock` while an operation lock is held.
+    pub fn lock_operations(&self) -> Result<fs::File> {
+        self.ensure_data_dir()?;
+        let lock_path = self.data_dir.join("slots.ops.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open lock file at {}", lock_path.display()))?;
+        harden_file_permissions(&lock_path)?;
+        fs4::FileExt::lock(&lock_file).context("failed to acquire the slot operation lock")?;
+        Ok(lock_file)
+    }
+
     /// Path to the JSON slots file inside the data directory.
     pub fn state_file_path(&self) -> PathBuf {
         self.data_dir.join("slots.json")

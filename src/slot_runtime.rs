@@ -107,6 +107,10 @@ impl<'a> SlotRuntime<'a> {
     /// `down` first; if that fails, nothing new is created.
     pub fn up(&self, context: &SlotContext, name: &str, replace: bool) -> Result<UpOutcome> {
         crate::slot_config::validate_slot_name(name)?;
+        // One slot operation at a time per data directory: the file lock in
+        // the store only covers single writes, while `up` makes decisions
+        // (is this directory free? is this slot already up?) across many.
+        let _operations = self.slots.lock_operations()?;
 
         let mut warnings = Vec::new();
         let mut replaced = false;
@@ -118,7 +122,9 @@ impl<'a> SlotRuntime<'a> {
                 }
                 .into());
             }
-            self.down(&context.worktree, name, false)
+            // Already under the operation lock: call the body directly, or
+            // the recursive lock acquisition would deadlock.
+            self.down_locked(&context.worktree, name, false)
                 .with_context(|| format!("failed to tear down the existing slot {name}"))?;
             replaced = true;
         }
@@ -258,6 +264,11 @@ impl<'a> SlotRuntime<'a> {
     /// A lease whose tag no longer matches is never released: another owner
     /// may have taken that port after the slot lost it.
     pub fn down(&self, worktree: &Path, name: &str, force: bool) -> Result<DownOutcome> {
+        let _operations = self.slots.lock_operations()?;
+        self.down_locked(worktree, name, force)
+    }
+
+    fn down_locked(&self, worktree: &Path, name: &str, force: bool) -> Result<DownOutcome> {
         let worktree = canonicalize_or_owned(worktree);
         let record = self
             .slots
@@ -328,6 +339,7 @@ impl<'a> SlotRuntime<'a> {
     /// and attempting deprovision. Directory purging is skipped: the
     /// directories went away with the worktree.
     pub fn prune(&self) -> Result<PruneOutcome> {
+        let _operations = self.slots.lock_operations()?;
         let mut warnings = Vec::new();
         let pruned = self.slots.prune()?;
         for record in &pruned {
@@ -354,7 +366,8 @@ impl<'a> SlotRuntime<'a> {
                         lease.tag, record.name
                     )),
                     Err(error) => warnings.push(format!(
-                        "failed to release port {port} of pruned slot {}: {error:#}",
+                        "failed to release port {port} of pruned slot {}: {error:#}; \
+                         the record is gone, so release it manually",
                         record.name
                     )),
                 }
@@ -420,7 +433,10 @@ pub fn lease_tag(slot: &str, port_name: &str) -> String {
 ///
 /// Precedence, lowest to highest:
 /// 1. computed values: `PORTZILLA_SLOT`, `PORTZILLA_WORKTREE`,
-///    `PORTZILLA_PORT[_<NAME>]`, `PORTZILLA_DB`, `PORTZILLA_DB_SCHEMA`
+///    `PORTZILLA_PORT[_<NAME>]`, `PORTZILLA_DB`, `PORTZILLA_DB_SCHEMA`.
+///    `PORTZILLA_PORT` is the first port in name order (alphabetical, from
+///    the same `BTreeMap` used to render every file), a convenience for the
+///    common single-port slot.
 /// 2. `[slot.env]`
 /// 3. `[slot.cache]` (the resolved absolute path wins on a key conflict)
 pub fn render_environment(
@@ -748,6 +764,7 @@ pub fn build_db_runtime(config: &SlotConfig, name: &str, worktree: &Path) -> Opt
     let deprovision = db
         .deprovision
         .as_ref()
+        .filter(|argv| !argv.is_empty())
         .map(|argv| render_db_argv(argv, name, &rendered_name, schema.as_deref(), worktree));
     Some(DbRuntime {
         name: rendered_name,
