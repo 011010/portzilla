@@ -9,7 +9,7 @@
 //! against the CLI's JSON output recognizes MCP tool results too.
 
 use crate::audit::{AuditActor, AuditEventType, AuditSource, HistoryQuery};
-use crate::intent::{self, IntentStore};
+use crate::intent::{self, IntentEventKind, IntentHistoryQuery, IntentStore};
 use crate::lease::SystemPidChecker;
 use crate::store::Store;
 use crate::view::{to_claim_view, to_intent_view, to_view};
@@ -121,6 +121,24 @@ struct HistoryParams {
     event: Option<AuditEventType>,
     #[serde(default)]
     before: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct IntentHistoryParams {
+    /// Only events where this session claimed, refreshed, released, or lost
+    /// the key to a takeover.
+    #[serde(default)]
+    session: Option<String>,
+    /// Only events of this kind: claim_created, claim_refreshed,
+    /// claim_taken_over, or released.
+    #[serde(default)]
+    event: Option<IntentEventKind>,
+    /// Only events with a sequence below this cursor (exclusive).
+    #[serde(default)]
+    before: Option<u64>,
+    /// Maximum number of events to return (1-1000, default 100).
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -519,6 +537,41 @@ impl PortzillaMcpServer {
     }
 
     #[tool(
+        description = "Read the bounded file-intent journal, newest first. Records claim_created, \
+        claim_refreshed, claim_taken_over and released events; reads, refused claims, absent \
+        releases and capacity refusals record nothing. Filters are combined with AND; use before \
+        as an exclusive sequence cursor. This tool is read-only and cannot clear history.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn intent_history(
+        &self,
+        Parameters(params): Parameters<IntentHistoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = IntentHistoryQuery::try_new(
+            params.session,
+            params.event,
+            params.before,
+            params.limit.unwrap_or(crate::audit::DEFAULT_HISTORY_LIMIT),
+        )
+        .map_err(|err| McpError::invalid_params(format!("{err:#}"), None))?;
+        let intents = self.intents.clone();
+        let value = tokio::task::spawn_blocking(move || {
+            intents.history(&query).map(|page| {
+                serde_json::to_value(page).expect("IntentHistoryPage always serializes")
+            })
+        })
+        .await
+        .map_err(blocking_task_failed)?
+        .map_err(store_error)?;
+        Ok(CallToolResult::structured(value))
+    }
+
+    #[tool(
         description = "Release this session's file claim before it expires. Only the owning \
         session can release it; a different session gets a tool-level error naming the holder. \
         Releasing a file nobody claims is a no-op success, so retrying after a crash is safe.",
@@ -696,6 +749,7 @@ mod tests {
     use crate::store::PortProbe;
     use crate::store::probe_test_support::{AllPortsFree, OccupiedPorts};
     use rmcp::model::ErrorCode;
+    use serde_json::Value;
     use std::sync::Arc;
 
     fn server_with_probe_tempdir(
@@ -758,6 +812,7 @@ mod tests {
                 "intent_claim",
                 "intent_who",
                 "intent_ls",
+                "intent_history",
                 "intent_release",
             ]
             .into_iter()
@@ -778,7 +833,8 @@ mod tests {
     /// OpenAI's MCP directory rejects tools where any hint is missing, and
     /// hosts use them to warn users before invoking. The values are pinned
     /// per tool and must match the handler's actual behaviour:
-    /// - read-only: `who`, `ls`, `history` never mutate the store.
+    /// - read-only: `who`, `ls`, `history`, `intent_history` never mutate the
+    ///   store.
     /// - destructive: `release` deletes a lease even while its owner is
     ///   alive (no confirmation), `prune` deletes leases whose owner died,
     ///   and `claim` is purely additive — it never displaces a live lease,
@@ -792,7 +848,7 @@ mod tests {
     fn every_tool_declares_all_four_behaviour_hints() {
         let (server, _dir) = server_with_tempdir();
         let tools = server.tool_router.list_all();
-        let expected: [(&str, bool, bool, bool, bool); 6] = [
+        let expected: [(&str, bool, bool, bool, bool); 7] = [
             // name       read-only  destructive  idempotent  open-world
             ("claim", false, false, true, false),
             ("who", true, false, true, false),
@@ -800,6 +856,7 @@ mod tests {
             ("release", false, true, true, false),
             ("prune", false, true, true, false),
             ("history", true, false, true, false),
+            ("intent_history", true, false, true, false),
         ];
         for (name, read_only, destructive, idempotent, open_world) in expected {
             let tool = tools
@@ -1545,5 +1602,122 @@ mod tests {
             .unwrap();
         assert_eq!(again.is_error, Some(false));
         assert_eq!(structured(&again)["released"], false);
+    }
+
+    #[tokio::test]
+    async fn intent_history_on_empty_store_returns_stable_envelope() {
+        let (server, _dir) = server_with_tempdir();
+        let result = server
+            .intent_history(Parameters(IntentHistoryParams::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            structured(&result),
+            &json!({"events": [], "next_before": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_history_passes_filters_through_and_returns_the_page_shape() {
+        let (server, dir) = server_with_tempdir();
+        let first = intent_path(&dir);
+        let second = dir.path().join("other.rs").to_string_lossy().into_owned();
+
+        for (path, session) in [(&first, "sess-a"), (&second, "sess-b")] {
+            server
+                .intent_claim(Parameters(IntentClaimParams {
+                    path: path.clone(),
+                    session: session.to_string(),
+                    ttl_secs: None,
+                }))
+                .await
+                .unwrap();
+        }
+        server
+            .intent_release(Parameters(IntentReleaseParams {
+                path: second,
+                session: "sess-b".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let all = server
+            .intent_history(Parameters(IntentHistoryParams::default()))
+            .await
+            .unwrap();
+        let value = structured(&all);
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3, "created + created + released: {value}");
+        assert_eq!(events[0]["event"], "released");
+        assert_eq!(events[0]["seq"], 3);
+        assert!(events[0]["at"].is_u64());
+        assert!(events[2]["key"].as_str().unwrap().contains("auth.rs"));
+        assert_eq!(value["next_before"], Value::Null);
+
+        let by_session = server
+            .intent_history(Parameters(IntentHistoryParams {
+                session: Some("sess-a".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let by_session = structured(&by_session);
+        assert_eq!(by_session["events"].as_array().unwrap().len(), 1);
+        assert_eq!(by_session["events"][0]["event"], "claim_created");
+        assert_eq!(by_session["events"][0]["session"], "sess-a");
+
+        let by_event = server
+            .intent_history(Parameters(IntentHistoryParams {
+                event: Some(IntentEventKind::Released),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let by_event = structured(&by_event);
+        assert_eq!(by_event["events"].as_array().unwrap().len(), 1);
+        assert_eq!(by_event["events"][0]["event"], "released");
+
+        let first_page = server
+            .intent_history(Parameters(IntentHistoryParams {
+                limit: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let first_page = structured(&first_page);
+        assert_eq!(first_page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["events"][0]["seq"], 3);
+        assert_eq!(first_page["next_before"], 3);
+
+        let older = server
+            .intent_history(Parameters(IntentHistoryParams {
+                before: Some(3),
+                limit: Some(10),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let older = structured(&older);
+        let seqs: Vec<u64> = older["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [2, 1]);
+        assert_eq!(older["next_before"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn intent_history_rejects_an_out_of_range_limit_as_invalid_params() {
+        let (server, _dir) = server_with_tempdir();
+        let err = server
+            .intent_history(Parameters(IntentHistoryParams {
+                limit: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("limit 0 must be invalid params");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 }
