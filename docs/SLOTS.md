@@ -147,6 +147,7 @@ Provision and deprovision run with the caller's environment, so use `.pgpass`, `
 
 ## Limits worth knowing
 
+- **The Cargo registry cache stays shared, on purpose.** A slot isolates the build directory, not `$CARGO_HOME`: concurrent builds may still print "Blocking waiting for file lock on package cache" while they read the shared registry. That lock is short and does not serialise compilation, which is what the build-directory lock does.
 - **One `.env.portzilla` per worktree.** Two slots in the same worktree are allowed but the last `up` wins; `slot up` warns when it overwrites another slot's file. `slot env` always reflects the slot you name.
 - **Slot tags are not worktree-qualified.** Two slots named `auth` in different worktrees both show `slot:auth:web` in `portzilla ls`. Teardown is still correct: it releases by recorded port and full tag.
 - **`down` leaves empty parent directories** (`.slot/<name>`, `.slot`); only recorded cache directories are purged.
