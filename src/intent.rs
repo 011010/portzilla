@@ -44,6 +44,16 @@
 //! operation ever needs to delete records it does not own (an `intent prune`
 //! command, a transfer, a bulk import), the reaping must move into that
 //! explicit operation and `claim` must stop doing it.
+//!
+//! # Journal
+//!
+//! `intents.json` also carries a bounded journal of claim and release
+//! decisions, mirroring the lease store's history: one event per successful
+//! mutation, appended under the same lock and committed by the same atomic
+//! write as the intent itself. Reaped expired records are housekeeping, not
+//! decisions, so they are never logged. Sequence numbers start at 1, increase
+//! monotonically, and are never reused — not by trimming and not by
+//! [`IntentStore::clear_history`].
 
 use crate::store::{MAX_SESSION_CHARS, Store};
 use anyhow::{Context, Result, bail};
@@ -57,7 +67,7 @@ use std::sync::Arc;
 /// Version of the `intents.json` envelope. Bump it when the stored shape
 /// changes incompatibly so an older binary refuses to touch a newer file
 /// instead of corrupting it.
-const INTENT_FORMAT_VERSION: u32 = 2;
+const INTENT_FORMAT_VERSION: u32 = 3;
 
 /// Oldest envelope this build still reads. v1 records have no `location`; they
 /// are read with a `None` location and upgraded the next time the file is
@@ -74,6 +84,12 @@ pub const MAX_INTENT_KEY_CHARS: usize = 8192;
 /// port-space precedent: far beyond the number of files a set of agent sessions
 /// edits inside one TTL window, while keeping a single listing bounded.
 const MAX_INTENTS: usize = 65_536;
+
+/// Maximum number of journal events `intents.json` may hold. Same bound as the
+/// lease journal: when an append would exceed it, the oldest events are
+/// dropped and the newest are kept, so a long-lived data directory never grows
+/// without bound.
+const MAX_INTENT_EVENTS: usize = 10_000;
 
 /// Default lifetime of a file intent, in seconds.
 ///
@@ -140,6 +156,179 @@ impl Intent {
 struct StoredIntents {
     format_version: u32,
     intents: Vec<Intent>,
+    /// Journal events. Absent (and defaulted to empty) in v1/v2 files.
+    #[serde(default)]
+    events: Vec<IntentEvent>,
+    /// Next sequence to hand out. Absent in v1/v2 files, where the next write
+    /// starts at 1.
+    #[serde(default)]
+    next_event_sequence: u64,
+}
+
+/// One entry in the file-intent journal.
+///
+/// `at` is the same clock value the mutation used, so a caller can line a
+/// record up with the operation that produced it. `previous_session` is set
+/// only for [`IntentEventKind::ClaimTakenOver`]: it names the session whose
+/// expired claim was replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentEvent {
+    pub seq: u64,
+    pub at: u64,
+    pub event: IntentEventKind,
+    pub key: String,
+    pub session: String,
+    #[serde(default)]
+    pub previous_session: Option<String>,
+}
+
+/// What a journal event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentEventKind {
+    /// A claim was created on a free key.
+    ClaimCreated,
+    /// A session extended a claim it already held, live or expired.
+    ClaimRefreshed,
+    /// A session replaced another session's expired claim.
+    ClaimTakenOver,
+    /// The owner released its claim.
+    Released,
+}
+
+#[allow(dead_code)]
+impl IntentEventKind {
+    /// Stable wire name, also used by the human CLI table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaimCreated => "claim_created",
+            Self::ClaimRefreshed => "claim_refreshed",
+            Self::ClaimTakenOver => "claim_taken_over",
+            Self::Released => "released",
+        }
+    }
+
+    /// Parses a wire name. Used by the CLI so an unknown `--event` is an
+    /// ordinary validation error (exit code 1) that names the accepted values,
+    /// instead of a clap usage error (exit code 2).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claim_created" => Some(Self::ClaimCreated),
+            "claim_refreshed" => Some(Self::ClaimRefreshed),
+            "claim_taken_over" => Some(Self::ClaimTakenOver),
+            "released" => Some(Self::Released),
+            _ => None,
+        }
+    }
+}
+
+impl IntentEvent {
+    /// Rejects a persisted event that violates the journal's invariants.
+    fn validate(&self) -> Result<()> {
+        if self.seq == 0 {
+            bail!("intent event sequence must be greater than zero");
+        }
+        if self.key.is_empty() || self.key.chars().count() > MAX_INTENT_KEY_CHARS {
+            bail!("intent event key must be between 1 and {MAX_INTENT_KEY_CHARS} characters");
+        }
+        if self.session.is_empty() || self.session.chars().count() > MAX_SESSION_CHARS {
+            bail!("intent event session must be between 1 and {MAX_SESSION_CHARS} characters");
+        }
+        match (self.event, self.previous_session.as_deref()) {
+            (IntentEventKind::ClaimTakenOver, Some(previous)) => {
+                if previous.is_empty() || previous.chars().count() > MAX_SESSION_CHARS {
+                    bail!(
+                        "intent event previous_session must be between 1 and \
+                         {MAX_SESSION_CHARS} characters"
+                    );
+                }
+            }
+            (IntentEventKind::ClaimTakenOver, None) => {
+                bail!("intent event claim_taken_over is missing previous_session");
+            }
+            (_, Some(_)) => {
+                bail!("intent event carries previous_session but is not claim_taken_over");
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+}
+
+/// Filters for [`IntentStore::history`].
+///
+/// Mirrors [`crate::audit::HistoryQuery`]: filters combine with AND, `before`
+/// is an exclusive sequence cursor (events with `seq < before`), and the page
+/// is newest-first. Validation happens in [`IntentHistoryQuery::try_new`] so
+/// the store and the MCP surface reject the same inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct IntentHistoryQuery {
+    pub session: Option<String>,
+    pub event: Option<IntentEventKind>,
+    pub before: Option<u64>,
+    pub limit: usize,
+}
+
+#[allow(dead_code)]
+impl IntentHistoryQuery {
+    pub fn try_new(
+        session: Option<String>,
+        event: Option<IntentEventKind>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Self> {
+        if session.as_deref() == Some("") {
+            bail!("intent history session must not be empty");
+        }
+        if let Some(value) = &session
+            && value.chars().count() > MAX_SESSION_CHARS
+        {
+            bail!("intent history session exceeds the maximum length");
+        }
+        if !(1..=crate::store::MAX_HISTORY_LIMIT).contains(&limit) {
+            bail!(
+                "intent history limit must be between 1 and {}",
+                crate::store::MAX_HISTORY_LIMIT
+            );
+        }
+        Ok(Self {
+            session,
+            event,
+            before,
+            limit,
+        })
+    }
+}
+
+/// One page of journal events, newest first.
+///
+/// `next_before` is the cursor to pass as `before` for the next page, or
+/// `None` when these are the last matching events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(dead_code)]
+pub struct IntentHistoryPage {
+    pub events: Vec<IntentEvent>,
+    pub next_before: Option<u64>,
+}
+
+/// In-memory shape of `intents.json`, including the version-independent
+/// sequence rule: a file with no journal starts its next write at 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntentsState {
+    intents: Vec<Intent>,
+    events: Vec<IntentEvent>,
+    next_event_sequence: u64,
+}
+
+impl IntentsState {
+    fn empty() -> Self {
+        Self {
+            intents: Vec::new(),
+            events: Vec::new(),
+            next_event_sequence: 1,
+        }
+    }
 }
 
 /// Filesystem seam mirroring the lease store's: production code writes and
@@ -549,20 +738,33 @@ impl IntentStore {
     ) -> IntentResult<Intent> {
         validate_claim_inputs(key, session, now, expires_at)?;
         let _guard = self.lock_exclusive()?;
-        let mut intents = self.read_intents_unlocked()?;
-        let position = intents.iter().position(|stored| stored.key == key);
-        let live_holder = position
-            .map(|index| intents[index].clone())
-            .filter(|stored| stored.is_live_at(now));
-        let intent = match live_holder {
-            Some(holder) if holder.session != session => {
+        let mut state = self.read_intents_unlocked()?;
+        let position = state.intents.iter().position(|stored| stored.key == key);
+        let existing = position.map(|index| state.intents[index].clone());
+        let live_holder = existing.clone().filter(|stored| stored.is_live_at(now));
+        // Classification happens before the intent is rebuilt: a live foreign
+        // holder is refused (and records nothing), a live own claim is a
+        // refresh, and a lapsed record is a refresh when the same session
+        // returns or a takeover when another session replaces it.
+        let event = match (&live_holder, &existing) {
+            (Some(holder), _) if holder.session != session => {
                 return Err(IntentError::HeldBy {
                     key: key.to_string(),
-                    holder: holder.session,
+                    holder: holder.session.clone(),
                     expires_at: holder.expires_at,
-                    location: holder.location,
+                    location: holder.location.clone(),
                 });
             }
+            (Some(_), _) => IntentEventKind::ClaimRefreshed,
+            (None, Some(holder)) if holder.session != session => IntentEventKind::ClaimTakenOver,
+            (None, Some(_)) => IntentEventKind::ClaimRefreshed,
+            (None, None) => IntentEventKind::ClaimCreated,
+        };
+        let previous_session = match (&event, &existing) {
+            (IntentEventKind::ClaimTakenOver, Some(holder)) => Some(holder.session.clone()),
+            _ => None,
+        };
+        let intent = match live_holder {
             Some(holder) => Intent {
                 key: key.to_string(),
                 session: session.to_string(),
@@ -579,16 +781,21 @@ impl IntentStore {
             },
         };
         // Expired entries are reaped here, including an expired record for
-        // `key`, which the new intent below replaces.
-        intents.retain(|stored| stored.key == key || stored.is_live_at(now));
-        if position.is_none() && intents.len() >= MAX_INTENTS {
+        // `key`, which the new intent below replaces. Reaping is housekeeping,
+        // so it records no journal events.
+        state
+            .intents
+            .retain(|stored| stored.key == key || stored.is_live_at(now));
+        if position.is_none() && state.intents.len() >= MAX_INTENTS {
             return Err(IntentError::Capacity { max: MAX_INTENTS });
         }
-        match intents.iter().position(|stored| stored.key == key) {
-            Some(index) => intents[index] = intent.clone(),
-            None => intents.push(intent.clone()),
+        match state.intents.iter().position(|stored| stored.key == key) {
+            Some(index) => state.intents[index] = intent.clone(),
+            None => state.intents.push(intent.clone()),
         }
-        self.write_intents_unlocked(&intents)?;
+        append_event(&mut state, now, event, key, session, previous_session)?;
+        validate_state(&state, &self.state_file_path())?;
+        self.write_intents_unlocked(&state)?;
         Ok(intent)
     }
 
@@ -600,8 +807,8 @@ impl IntentStore {
     #[allow(clippy::result_large_err)]
     pub fn get(&self, key: &str) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
-        let intents = self.read_intents_unlocked()?;
-        Ok(intents.into_iter().find(|intent| intent.key == key))
+        let state = self.read_intents_unlocked()?;
+        Ok(state.intents.into_iter().find(|intent| intent.key == key))
     }
 
     /// Returns every intent that is still live at `now`.
@@ -614,8 +821,9 @@ impl IntentStore {
     #[allow(clippy::result_large_err)]
     pub fn list(&self, now: u64) -> IntentResult<Vec<Intent>> {
         let _guard = self.lock_exclusive()?;
-        let intents = self.read_intents_unlocked()?;
-        Ok(intents
+        let state = self.read_intents_unlocked()?;
+        Ok(state
+            .intents
             .into_iter()
             .filter(|intent| intent.is_live_at(now))
             .collect())
@@ -634,14 +842,23 @@ impl IntentStore {
     ///
     /// This path must never reap: deleting a record this session does not own
     /// would break the single-owner contract that makes `claim`'s reaping safe.
+    /// A successful release records one [`IntentEventKind::Released`] event;
+    /// an absent key and a foreign release record nothing.
     #[allow(clippy::result_large_err)]
     pub fn release(&self, key: &str, session: &str) -> IntentResult<Option<Intent>> {
+        self.release_at(key, session, crate::lease::current_unix_timestamp())
+    }
+
+    /// [`IntentStore::release`] with an explicit clock, so tests can pin the
+    /// journal timestamp.
+    #[allow(clippy::result_large_err)]
+    fn release_at(&self, key: &str, session: &str, now: u64) -> IntentResult<Option<Intent>> {
         let _guard = self.lock_exclusive()?;
-        let mut intents = self.read_intents_unlocked()?;
-        let Some(index) = intents.iter().position(|intent| intent.key == key) else {
+        let mut state = self.read_intents_unlocked()?;
+        let Some(index) = state.intents.iter().position(|intent| intent.key == key) else {
             return Ok(None);
         };
-        let existing = &intents[index];
+        let existing = &state.intents[index];
         if existing.session != session {
             return Err(IntentError::NotOwner {
                 key: key.to_string(),
@@ -650,9 +867,72 @@ impl IntentStore {
                 expires_at: existing.expires_at,
             });
         }
-        let removed = intents.remove(index);
-        self.write_intents_unlocked(&intents)?;
+        let removed = state.intents.remove(index);
+        append_event(
+            &mut state,
+            now,
+            IntentEventKind::Released,
+            key,
+            session,
+            None,
+        )?;
+        validate_state(&state, &self.state_file_path())?;
+        self.write_intents_unlocked(&state)?;
         Ok(Some(removed))
+    }
+
+    /// Returns a page of journal events, newest first.
+    ///
+    /// The session filter matches either side of a takeover: asking for a
+    /// session's history returns the events it caused *and* the takeover in
+    /// which another session replaced one of its expired claims.
+    #[allow(dead_code)]
+    pub fn history(&self, query: &IntentHistoryQuery) -> Result<IntentHistoryPage> {
+        let _guard = self.lock_exclusive()?;
+        let state = self.read_intents_unlocked()?;
+        let mut matching = state
+            .events
+            .into_iter()
+            .rev()
+            .filter(|event| query.before.is_none_or(|before| event.seq < before))
+            .filter(|event| query.event.is_none_or(|kind| event.event == kind))
+            .filter(|event| {
+                query.session.as_deref().is_none_or(|session| {
+                    event.session == session || event.previous_session.as_deref() == Some(session)
+                })
+            });
+        let mut events = Vec::with_capacity(query.limit);
+        while events.len() <= query.limit {
+            let Some(event) = matching.next() else { break };
+            events.push(event);
+        }
+        let has_more = events.len() > query.limit;
+        if has_more {
+            events.pop();
+        }
+        let next_before = has_more
+            .then(|| events.last().map(|event| event.seq))
+            .flatten();
+        Ok(IntentHistoryPage {
+            events,
+            next_before,
+        })
+    }
+
+    /// Removes every journal event and returns how many were removed.
+    ///
+    /// Intents are untouched. The sequence counter is *not* reset, so a later
+    /// mutation continues above every sequence this data directory has ever
+    /// handed out: clearing is not a way to make sequence numbers reusable.
+    #[allow(dead_code)]
+    pub fn clear_history(&self) -> Result<usize> {
+        let _guard = self.lock_exclusive()?;
+        let mut state = self.read_intents_unlocked()?;
+        let removed = state.events.len();
+        state.events.clear();
+        validate_state(&state, &self.state_file_path())?;
+        self.write_intents_unlocked(&state)?;
+        Ok(removed)
     }
 
     /// Ensures the data directory exists and is owner-only (`0700` on Unix),
@@ -687,18 +967,20 @@ impl IntentStore {
         Ok(lock_file)
     }
 
-    fn read_intents_unlocked(&self) -> Result<Vec<Intent>> {
+    fn read_intents_unlocked(&self) -> Result<IntentsState> {
         let path = self.state_file_path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(IntentsState::empty());
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("failed to read intents file at {}", path.display()));
             }
         };
         if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Vec::new());
+            return Ok(IntentsState::empty());
         }
         let stored: StoredIntents = serde_json::from_slice(&bytes).with_context(|| {
             format!(
@@ -716,18 +998,36 @@ impl IntentStore {
                 stored.format_version
             );
         }
-        validate_stored_intents(&stored.intents, &path)?;
-        Ok(stored.intents)
+        // v1/v2 files predate the journal: they have no events and no counter,
+        // so the next write starts the sequence at 1. A v3 file carries both
+        // and is validated as persisted.
+        let state = if stored.format_version < INTENT_FORMAT_VERSION {
+            IntentsState {
+                intents: stored.intents,
+                events: Vec::new(),
+                next_event_sequence: 1,
+            }
+        } else {
+            IntentsState {
+                intents: stored.intents,
+                events: stored.events,
+                next_event_sequence: stored.next_event_sequence,
+            }
+        };
+        validate_state(&state, &path)?;
+        Ok(state)
     }
 
-    fn write_intents_unlocked(&self, intents: &[Intent]) -> Result<()> {
+    fn write_intents_unlocked(&self, state: &IntentsState) -> Result<()> {
         let path = self.state_file_path();
         let tmp_path = self
             .data_dir
             .join(format!(".intents.json.tmp.{}", std::process::id()));
         let json = serde_json::to_vec_pretty(&StoredIntents {
             format_version: INTENT_FORMAT_VERSION,
-            intents: intents.to_vec(),
+            intents: state.intents.clone(),
+            events: state.events.clone(),
+            next_event_sequence: state.next_event_sequence,
         })
         .context("failed to serialize file intents to JSON")?;
         self.file_ops
@@ -790,12 +1090,88 @@ fn validate_claim_inputs(key: &str, session: &str, now: u64, expires_at: u64) ->
     Ok(())
 }
 
-/// Rejects a persisted file that violates the store's invariants: more records
-/// than [`MAX_INTENTS`], or two records for one key. The first is a resource
-/// bound, so a corrupted or hostile file cannot force `list` to materialize
-/// millions of entries; the second is the single-owner rule, so such a file is
-/// corrupt rather than a list of competing claims. The file is left untouched
-/// on rejection.
+/// Appends one journal event, dropping the oldest entries when the journal
+/// would exceed [`MAX_INTENT_EVENTS`]. The sequence is handed out *before*
+/// trimming and the counter is never rolled back, so a dropped event's number
+/// is never reused.
+fn append_event(
+    state: &mut IntentsState,
+    at: u64,
+    event: IntentEventKind,
+    key: &str,
+    session: &str,
+    previous_session: Option<String>,
+) -> Result<()> {
+    if state.next_event_sequence == u64::MAX {
+        bail!("intent store would exhaust the event sequence");
+    }
+    let seq = state.next_event_sequence;
+    state.next_event_sequence += 1;
+    state.events.push(IntentEvent {
+        seq,
+        at,
+        event,
+        key: key.to_string(),
+        session: session.to_string(),
+        previous_session,
+    });
+    let excess = state.events.len().saturating_sub(MAX_INTENT_EVENTS);
+    if excess > 0 {
+        state.events.drain(..excess);
+    }
+    Ok(())
+}
+
+/// Rejects a persisted state that violates the store's invariants, before it
+/// is returned to a caller or written back. Mirrors the lease store's
+/// `validate_state`: the file is left untouched on rejection.
+fn validate_state(state: &IntentsState, path: &Path) -> Result<()> {
+    validate_stored_intents(&state.intents, path)?;
+    if state.next_event_sequence == 0 {
+        bail!(
+            "intents file at {} has an invalid zero next_event_sequence and was not modified",
+            path.display()
+        );
+    }
+    if state.events.len() > MAX_INTENT_EVENTS {
+        bail!(
+            "intents file at {} contains more than {MAX_INTENT_EVENTS} events and was not modified",
+            path.display()
+        );
+    }
+    let mut previous_sequence = 0;
+    for event in &state.events {
+        event.validate().with_context(|| {
+            format!(
+                "intents file at {} contains an invalid intent event and was not modified",
+                path.display()
+            )
+        })?;
+        if event.seq <= previous_sequence {
+            bail!(
+                "intents file at {} contains duplicate or unordered intent event sequences \
+                 and was not modified",
+                path.display()
+            );
+        }
+        previous_sequence = event.seq;
+    }
+    if previous_sequence >= state.next_event_sequence {
+        bail!(
+            "intents file at {} has next_event_sequence not above retained events \
+             and was not modified",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Rejects a persisted file that violates the store's record invariants: more
+/// records than [`MAX_INTENTS`], or two records for one key. The first is a
+/// resource bound, so a corrupted or hostile file cannot force `list` to
+/// materialize millions of entries; the second is the single-owner rule, so
+/// such a file is corrupt rather than a list of competing claims. The file is
+/// left untouched on rejection.
 fn validate_stored_intents(intents: &[Intent], path: &Path) -> Result<()> {
     if intents.len() > MAX_INTENTS {
         bail!(
@@ -847,6 +1223,7 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::ops::Deref;
     use std::process::Command;
 
@@ -892,9 +1269,34 @@ mod tests {
         let json = serde_json::to_vec(&StoredIntents {
             format_version: INTENT_FORMAT_VERSION,
             intents,
+            events: Vec::new(),
+            next_event_sequence: 1,
         })
         .unwrap();
         fs::write(store.state_file_path(), json).unwrap();
+    }
+
+    fn events(store: &IntentStore) -> Vec<IntentEvent> {
+        let mut collected = Vec::new();
+        let mut before = None;
+        loop {
+            let page = store
+                .history(
+                    &IntentHistoryQuery::try_new(
+                        None,
+                        None,
+                        before,
+                        crate::store::MAX_HISTORY_LIMIT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            collected.extend(page.events);
+            match page.next_before {
+                Some(cursor) => before = Some(cursor),
+                None => return collected,
+            }
+        }
     }
 
     #[test]
@@ -957,12 +1359,16 @@ mod tests {
 
         let raw = fs::read_to_string(store.state_file_path()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["format_version"].as_u64(), Some(2));
+        assert_eq!(value["format_version"].as_u64(), Some(3));
         let record = &value["intents"][0];
         assert_eq!(record["key"], "repo:a.rs");
         assert_eq!(record["location"]["file"], "/repo/src/auth.rs");
         assert_eq!(record["location"]["worktree"], "/repo");
         assert_eq!(record["location"]["rel"], "src/auth.rs");
+        // The same write starts the journal: the refresh is event 1.
+        assert_eq!(value["next_event_sequence"].as_u64(), Some(2));
+        assert_eq!(value["events"][0]["seq"].as_u64(), Some(1));
+        assert_eq!(value["events"][0]["event"], "claim_refreshed");
         // The upgraded file still reads back through the typed API.
         assert_eq!(
             store.get("repo:a.rs").unwrap().unwrap().location,
@@ -1201,11 +1607,479 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["format_version", "intents"]);
-        assert_eq!(value["format_version"].as_u64(), Some(2));
+        assert_eq!(
+            keys,
+            ["events", "format_version", "intents", "next_event_sequence"]
+        );
+        assert_eq!(value["format_version"].as_u64(), Some(3));
+        assert_eq!(value["next_event_sequence"].as_u64(), Some(2));
         assert_eq!(value["intents"].as_array().unwrap().len(), 1);
+        assert_eq!(value["events"].as_array().unwrap().len(), 1);
         // A record without a location still serializes the field, as null.
         assert_eq!(value["intents"][0]["location"], serde_json::Value::Null);
+        assert_eq!(
+            value["events"][0]["previous_session"],
+            serde_json::Value::Null
+        );
+    }
+
+    // ---- journal ----
+
+    fn seqs(events: &[IntentEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.seq).collect()
+    }
+
+    #[test]
+    fn claim_on_a_free_key_records_claim_created() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+
+        let events = events(&store);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            IntentEvent {
+                seq: 1,
+                at: 1_000,
+                event: IntentEventKind::ClaimCreated,
+                key: "repo:a.rs".to_string(),
+                session: "session-a".to_string(),
+                previous_session: None,
+            }
+        );
+    }
+
+    #[test]
+    fn same_session_refresh_records_claim_refreshed() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_500, 2_300, None)
+            .unwrap();
+
+        let events = events(&store);
+        assert_eq!(seqs(&events), [2, 1]);
+        assert_eq!(events[0].event, IntentEventKind::ClaimRefreshed);
+        assert_eq!(events[0].at, 1_500);
+        assert_eq!(events[0].previous_session, None);
+    }
+
+    #[test]
+    fn taking_over_an_expired_foreign_claim_records_the_previous_session() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        // The expiry boundary is exclusive, so 1_800 is a takeover.
+        store
+            .claim("repo:a.rs", "session-b", 1_800, 2_800, None)
+            .unwrap();
+
+        let events = events(&store);
+        assert_eq!(seqs(&events), [2, 1]);
+        assert_eq!(events[0].event, IntentEventKind::ClaimTakenOver);
+        assert_eq!(events[0].session, "session-b");
+        assert_eq!(events[0].previous_session.as_deref(), Some("session-a"));
+        assert_eq!(events[0].at, 1_800);
+    }
+
+    #[test]
+    fn reclaiming_an_expired_own_claim_records_a_refresh_not_a_takeover() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_801, 2_801, None)
+            .unwrap();
+
+        let events = events(&store);
+        assert_eq!(seqs(&events), [2, 1]);
+        assert_eq!(events[0].event, IntentEventKind::ClaimRefreshed);
+        assert_eq!(events[0].previous_session, None);
+        // The lapsed record was replaced, so `created_at` restarts at the
+        // reclaim clock; the journal still calls this a refresh.
+        assert_eq!(store.get("repo:a.rs").unwrap().unwrap().created_at, 1_801);
+    }
+
+    #[test]
+    fn release_records_released_at_the_release_clock() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .release_at("repo:a.rs", "session-a", 1_234)
+            .unwrap()
+            .unwrap();
+
+        let events = events(&store);
+        assert_eq!(seqs(&events), [2, 1]);
+        assert_eq!(events[0].event, IntentEventKind::Released);
+        assert_eq!(events[0].at, 1_234);
+        assert_eq!(events[0].session, "session-a");
+        assert_eq!(events[0].previous_session, None);
+    }
+
+    #[test]
+    fn reads_absent_releases_refusals_and_invalid_input_record_nothing() {
+        let store = temp_store();
+        store
+            .claim("repo:held.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        let before = fs::read(store.state_file_path()).unwrap();
+
+        store.get("repo:held.rs").unwrap();
+        store.list(1_000).unwrap();
+        assert!(
+            store
+                .release("repo:absent.rs", "session-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .claim("repo:held.rs", "session-b", 1_100, 1_900, None)
+                .unwrap_err(),
+            IntentError::HeldBy { .. }
+        ));
+        assert!(matches!(
+            store
+                .claim("", "session-a", 1_000, 1_800, None)
+                .unwrap_err(),
+            IntentError::Invalid(_)
+        ));
+        assert!(matches!(
+            store
+                .claim("repo:a.rs", "session-a", 1_000, 1_000, None)
+                .unwrap_err(),
+            IntentError::Invalid(_)
+        ));
+
+        assert_eq!(events(&store).len(), 1, "only the original claim is logged");
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn history_filters_compose_and_pages_are_newest_first() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:a.rs", "session-a", 1_100, 1_900, None)
+            .unwrap();
+        store
+            .claim("repo:b.rs", "session-b", 1_200, 2_000, None)
+            .unwrap();
+        store.release_at("repo:b.rs", "session-b", 1_300).unwrap();
+        store
+            .claim("repo:a.rs", "session-b", 1_901, 2_901, None)
+            .unwrap();
+
+        let page = |session: Option<&str>,
+                    event: Option<IntentEventKind>,
+                    before: Option<u64>,
+                    limit: usize| {
+            store
+                .history(
+                    &IntentHistoryQuery::try_new(session.map(str::to_string), event, before, limit)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+
+        let all = page(None, None, None, 1_000);
+        assert_eq!(seqs(&all.events), [5, 4, 3, 2, 1]);
+        assert_eq!(all.next_before, None);
+
+        // The session filter sees both sides of a takeover.
+        let session_a = page(Some("session-a"), None, None, 1_000);
+        assert_eq!(seqs(&session_a.events), [5, 2, 1]);
+
+        let created = page(None, Some(IntentEventKind::ClaimCreated), None, 1_000);
+        assert_eq!(seqs(&created.events), [3, 1]);
+
+        // `before` is exclusive.
+        let before_four = page(None, None, Some(4), 1_000);
+        assert_eq!(seqs(&before_four.events), [3, 2, 1]);
+        assert_eq!(before_four.next_before, None);
+
+        let session_b_released = page(
+            Some("session-b"),
+            Some(IntentEventKind::Released),
+            None,
+            1_000,
+        );
+        assert_eq!(seqs(&session_b_released.events), [4]);
+
+        let first = page(None, None, None, 2);
+        assert_eq!(seqs(&first.events), [5, 4]);
+        assert_eq!(first.next_before, Some(4));
+
+        let second = page(None, None, first.next_before, 2);
+        assert_eq!(seqs(&second.events), [3, 2]);
+        assert_eq!(second.next_before, Some(2));
+
+        let third = page(None, None, second.next_before, 2);
+        assert_eq!(seqs(&third.events), [1]);
+        assert_eq!(third.next_before, None);
+    }
+
+    #[test]
+    fn clear_history_keeps_intents_and_never_reuses_sequences() {
+        let store = temp_store();
+        store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap();
+        store
+            .claim("repo:b.rs", "session-b", 1_000, 1_800, None)
+            .unwrap();
+        store.release_at("repo:a.rs", "session-a", 1_500).unwrap();
+
+        assert_eq!(store.clear_history().unwrap(), 3);
+        assert!(events(&store).is_empty());
+        assert!(store.get("repo:a.rs").unwrap().is_none());
+        assert!(store.get("repo:b.rs").unwrap().is_some());
+
+        // Clearing does not reset the counter: the next event continues at 4.
+        store
+            .claim("repo:c.rs", "session-c", 2_000, 2_500, None)
+            .unwrap();
+        let after_clear = events(&store);
+        assert_eq!(seqs(&after_clear), [4]);
+        assert_eq!(after_clear[0].event, IntentEventKind::ClaimCreated);
+
+        assert_eq!(store.clear_history().unwrap(), 1);
+        store
+            .claim("repo:d.rs", "session-d", 2_000, 2_500, None)
+            .unwrap();
+        assert_eq!(seqs(&events(&store)), [5]);
+    }
+
+    #[test]
+    fn appending_past_the_cap_trims_oldest_and_keeps_sequence_monotonic() {
+        let store = temp_store();
+        let seeded: Vec<IntentEvent> = (1..=MAX_INTENT_EVENTS as u64)
+            .map(|seq| IntentEvent {
+                seq,
+                at: 1,
+                event: IntentEventKind::Released,
+                key: "repo:old.rs".to_string(),
+                session: "session-old".to_string(),
+                previous_session: None,
+            })
+            .collect();
+        let json = serde_json::to_vec(&StoredIntents {
+            format_version: INTENT_FORMAT_VERSION,
+            intents: Vec::new(),
+            events: seeded,
+            next_event_sequence: (MAX_INTENT_EVENTS + 1) as u64,
+        })
+        .unwrap();
+        fs::write(store.state_file_path(), json).unwrap();
+
+        store
+            .claim("repo:new.rs", "session-new", 2_000, 3_000, None)
+            .unwrap();
+
+        let all_events = events(&store);
+        assert_eq!(all_events.len(), MAX_INTENT_EVENTS);
+        assert_eq!(
+            all_events.last().unwrap().seq,
+            2,
+            "the oldest event is gone"
+        );
+        assert_eq!(
+            all_events.first().unwrap().seq,
+            (MAX_INTENT_EVENTS + 1) as u64,
+            "the newest event is retained"
+        );
+        assert_eq!(
+            all_events.first().unwrap().event,
+            IntentEventKind::ClaimCreated
+        );
+
+        // The next append uses the next number, not a trimmed one.
+        store
+            .claim("repo:newer.rs", "session-new", 2_001, 3_001, None)
+            .unwrap();
+        let trimmed = events(&store);
+        assert_eq!(trimmed.len(), MAX_INTENT_EVENTS);
+        assert_eq!(trimmed.last().unwrap().seq, 3);
+        assert_eq!(trimmed.first().unwrap().seq, (MAX_INTENT_EVENTS + 2) as u64);
+        let raw = fs::read_to_string(store.state_file_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value["next_event_sequence"].as_u64(),
+            Some((MAX_INTENT_EVENTS + 3) as u64)
+        );
+    }
+
+    #[test]
+    fn sequence_exhaustion_is_refused_without_writing() {
+        let store = temp_store();
+        let original = json!({
+            "format_version": 3,
+            "intents": [],
+            "events": [],
+            "next_event_sequence": u64::MAX,
+        });
+        fs::write(
+            store.state_file_path(),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(store.state_file_path()).unwrap();
+
+        let err = store
+            .claim("repo:a.rs", "session-a", 1_000, 1_800, None)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exhaust"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_v2_file_upgrades_to_v3_on_the_next_write() {
+        let store = temp_store();
+        let original = br#"{"format_version":2,"intents":[
+            {"key":"repo:a.rs","session":"session-a","created_at":1000,"expires_at":1800,
+             "location":{"file":"/repo/a.rs","worktree":"/repo","rel":"a.rs"}}
+        ]}"#
+        .to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        // A read does not rewrite the file.
+        assert!(store.get("repo:a.rs").unwrap().is_some());
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+
+        store
+            .claim("repo:b.rs", "session-b", 1_500, 2_500, None)
+            .unwrap();
+
+        let raw = fs::read_to_string(store.state_file_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["format_version"].as_u64(), Some(3));
+        assert_eq!(value["intents"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["intents"][0]["location"]["file"], "/repo/a.rs",
+            "the v2 record survives the upgrade"
+        );
+        assert_eq!(value["next_event_sequence"].as_u64(), Some(2));
+        assert_eq!(value["events"].as_array().unwrap().len(), 1);
+        assert_eq!(value["events"][0]["seq"].as_u64(), Some(1));
+        assert_eq!(value["events"][0]["event"], "claim_created");
+    }
+
+    #[test]
+    fn a_v3_file_with_a_zero_next_event_sequence_is_rejected_without_rewriting() {
+        let store = temp_store();
+        let original =
+            br#"{"format_version":3,"intents":[],"events":[],"next_event_sequence":0}"#.to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        let err = store.list(1_000).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("zero next_event_sequence"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn unordered_event_sequences_are_rejected_without_rewriting() {
+        let store = temp_store();
+        let original = br#"{"format_version":3,"intents":[],"next_event_sequence":3,
+            "events":[
+                {"seq":2,"at":1,"event":"released","key":"repo:a.rs","session":"s","previous_session":null},
+                {"seq":1,"at":1,"event":"released","key":"repo:a.rs","session":"s","previous_session":null}
+            ]}"#
+        .to_vec();
+        fs::write(store.state_file_path(), &original).unwrap();
+
+        let err = store
+            .history(&IntentHistoryQuery::try_new(None, None, None, 100).unwrap())
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("duplicate or unordered"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(store.state_file_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn history_query_validation_mirrors_the_lease_journal() {
+        assert!(
+            IntentHistoryQuery::try_new(Some(String::new()), None, None, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be empty")
+        );
+        assert!(
+            IntentHistoryQuery::try_new(Some("s".repeat(MAX_SESSION_CHARS + 1)), None, None, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum length")
+        );
+        for limit in [0, crate::store::MAX_HISTORY_LIMIT + 1] {
+            assert!(
+                IntentHistoryQuery::try_new(None, None, None, limit)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("between 1 and")
+            );
+        }
+        assert!(
+            IntentHistoryQuery::try_new(None, None, Some(0), crate::store::MAX_HISTORY_LIMIT)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn event_kinds_have_stable_wire_names_and_round_trip() {
+        let kinds = [
+            (IntentEventKind::ClaimCreated, "claim_created"),
+            (IntentEventKind::ClaimRefreshed, "claim_refreshed"),
+            (IntentEventKind::ClaimTakenOver, "claim_taken_over"),
+            (IntentEventKind::Released, "released"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(IntentEventKind::parse(name), Some(kind));
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(name.to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<IntentEventKind>(serde_json::Value::String(
+                    name.to_string()
+                ))
+                .unwrap(),
+                kind
+            );
+        }
+        assert_eq!(IntentEventKind::parse("bogus"), None);
+
+        let value = serde_json::to_value(IntentEvent {
+            seq: 7,
+            at: 9,
+            event: IntentEventKind::ClaimTakenOver,
+            key: "k".to_string(),
+            session: "session-b".to_string(),
+            previous_session: Some("session-a".to_string()),
+        })
+        .unwrap();
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["at"], 9);
+        assert_eq!(value["event"], "claim_taken_over");
+        assert_eq!(value["previous_session"], "session-a");
     }
 
     struct RenameFailFileOps;
@@ -1251,6 +2125,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, IntentError::Capacity { max: MAX_INTENTS }));
         assert_eq!(fs::read(store.state_file_path()).unwrap(), before);
+        assert!(events(&store).is_empty());
 
         // An existing key still refreshes: it replaces its own record, so the
         // record count does not grow.
