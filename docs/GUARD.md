@@ -45,7 +45,12 @@ This is intentionally not a real shell parser — see the module doc comment in 
 $ portzilla init claude-code
 ```
 
-prints the exact `.claude/settings.json` snippet to add (project-level `.claude/settings.json` or user-level `~/.claude/settings.json`), registering `portzilla hook claude-code` as a `PreToolUse` hook on the `Bash` tool. This only prints instructions — it never writes to your settings file.
+prints the exact `.claude/settings.json` snippet to add (project-level `.claude/settings.json` or user-level `~/.claude/settings.json`), registering `portzilla hook claude-code` on two events. This only prints instructions — it never writes to your settings file.
+
+- `PreToolUse` with matcher `Bash|Write|Edit`: the `Bash` branch is the kill guard; the `Write`/`Edit` branch applies file intents.
+- `PostToolUse` with matcher `Write|Edit`: delivers the clean-merge warning as `additionalContext` on the tool result, which is the only model-visible channel Claude Code offers (its `PreToolUse` output has no `additionalContext`).
+
+If you registered the older Bash-only snippet, update it: until the matcher includes `Write|Edit`, edits are not guarded. The snippet also matters in a second way — the clean path emits **no output at all**, so the hook never skips your permission prompt; only a proven conflict denies.
 
 For session ownership to resolve end to end, claim with the session id Claude Code exposes to Bash tool subprocesses (verified against the Claude Code environment variables reference — `CLAUDE_CODE_SESSION_ID` "matches the `session_id` field in the hook JSON input" for Bash, PowerShell, and hook subprocesses):
 

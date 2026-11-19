@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added file intents to the Claude Code adapter. `PreToolUse` on `Write`/`Edit` claims the file and denies only a proven conflict; `PostToolUse` delivers the clean-merge warning as `additionalContext`, the only model-visible channel Claude Code offers. A clean edit emits no output, so the hook never bypasses the user's permission prompt. Existing Bash-only registrations must add the `Write|Edit` matcher.
+
 ## 0.5.0
 
 - Made file intents conflict-aware: a live foreign claim no longer denies every edit. A clean merge against the holder's working copy is allowed, the holder keeps its claim, and the model reads a warning appended to the tool result; a proven conflict is denied with a reason that says so; anything unprovable (a v1 record, a git failure, an incomplete payload) is denied as before. `intents.json` is now schema v2 and records the holder's location; v1 files are read and upgraded on the next write.
