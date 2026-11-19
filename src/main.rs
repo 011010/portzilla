@@ -662,7 +662,15 @@ fn run() -> Result<(), RunError> {
                 &SystemPidChecker,
             )? {
                 Some(outcome) => {
-                    if outcome.was_alive {
+                    if outcome.lease.durable {
+                        // A durable lease has no owning process, so the usual
+                        // "owning pid is still alive" warning would be a lie.
+                        eprintln!(
+                            "released the durable slot reservation on port {} (tag: {})",
+                            outcome.lease.port,
+                            sanitize_for_display(&outcome.lease.tag)
+                        );
+                    } else if outcome.was_alive {
                         eprintln!(
                             "warning: released port {} whose owning pid {} is still alive",
                             outcome.lease.port, outcome.lease.pid

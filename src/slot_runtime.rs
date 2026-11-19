@@ -177,7 +177,6 @@ impl<'a> SlotRuntime<'a> {
         transaction: &mut UpTransaction<'_, '_>,
     ) -> Result<SlotRecord> {
         let mut ports = BTreeMap::new();
-        let mut env_port_names: BTreeMap<String, String> = BTreeMap::new();
         for (port_name, base) in &context.config.ports {
             let tag = lease_tag(name, port_name);
             let outcome = self.leases.claim_durable(
@@ -189,11 +188,6 @@ impl<'a> SlotRuntime<'a> {
             let port = outcome.lease.port;
             transaction.claimed.push((port, tag));
             ports.insert(port_name.clone(), port);
-
-            let env_name = format!("PORTZILLA_PORT_{}", port_env_suffix(port_name));
-            if let Some(other) = env_port_names.insert(env_name.clone(), port_name.clone()) {
-                bail!("[slot.ports] {other} and {port_name} both map to {env_name}; rename one");
-            }
         }
 
         for dir in cache_dirs {
@@ -256,9 +250,13 @@ impl<'a> SlotRuntime<'a> {
     /// Tears `name` down: deprovision, release the slot's leases, purge the
     /// recorded directories, remove the env file, then remove the record.
     ///
-    /// A deprovision or release failure leaves everything in place unless
-    /// `force` is set. A lease whose tag no longer matches is never released:
-    /// another owner may have taken that port after the slot lost it.
+    /// Deprovision runs before anything destructive, so its failure leaves
+    /// the record, ports, directories, and env file untouched. A release
+    /// failure (an I/O error in the lease store, not a tag mismatch) also
+    /// aborts with the record in place, though ports released before it stay
+    /// released; deprovision must be idempotent because a retry runs it again.
+    /// A lease whose tag no longer matches is never released: another owner
+    /// may have taken that port after the slot lost it.
     pub fn down(&self, worktree: &Path, name: &str, force: bool) -> Result<DownOutcome> {
         let worktree = canonicalize_or_owned(worktree);
         let record = self
@@ -1056,6 +1054,49 @@ HASH = "a#b"
         assert!(replaced.replaced);
         assert_eq!(replaced.record.ports.get("web"), Some(&3000));
         assert_eq!(fixture.slots.list().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_creates_nothing_when_the_old_slot_cannot_be_deprovisioned() {
+        let fixture = fixture();
+        let context = ctx(
+            &fixture,
+            r#"
+[slot.ports]
+web = 3206
+
+[slot.cache]
+CARGO_TARGET_DIR = ".slot/{name}/target"
+
+[slot.db]
+name_template = "app_{slot}"
+provision = ["sh", "-c", "true"]
+deprovision = ["sh", "-c", "exit 9"]
+"#,
+        );
+        let runtime = rt(&fixture, &AlwaysAlive);
+        runtime.up(&context, "auth", false).unwrap();
+        let target = context.worktree.join(".slot/auth/target");
+        assert!(target.is_dir());
+
+        let error = runtime.up(&context, "auth", true).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to tear down the existing slot"),
+            "unexpected error: {error:#}"
+        );
+        let record = fixture
+            .slots
+            .get(fixture.worktree.path(), "auth")
+            .unwrap()
+            .expect("the old slot survives a failed replace");
+        assert_eq!(record.ports.get("web"), Some(&3206));
+        assert_eq!(
+            fixture.leases.get(3206).unwrap().unwrap().tag,
+            "slot:auth:web"
+        );
+        assert!(target.is_dir(), "the old cache directory is untouched");
     }
 
     #[test]

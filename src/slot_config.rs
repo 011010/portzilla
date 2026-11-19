@@ -140,8 +140,27 @@ impl SlotConfig {
     }
 
     fn from_raw(raw: RawSlot) -> Result<Self> {
-        for name in raw.ports.keys() {
+        let mut port_env_names: BTreeMap<String, &str> = BTreeMap::new();
+        for (name, port) in &raw.ports {
             validate_port_name(name)?;
+            if *port == 0 {
+                bail!("slot.ports {name} must be between 1 and 65535 (port 0 cannot be leased)");
+            }
+            let suffix = name
+                .chars()
+                .map(|character| {
+                    if character == '-' {
+                        '_'
+                    } else {
+                        character.to_ascii_uppercase()
+                    }
+                })
+                .collect::<String>();
+            if let Some(other) = port_env_names.insert(suffix.clone(), name) {
+                bail!(
+                    "slot.ports {other} and {name} both map to PORTZILLA_PORT_{suffix}; rename one"
+                );
+            }
         }
         for (name, path) in &raw.cache {
             validate_env_key(name, "cache")?;
@@ -679,6 +698,23 @@ provision = ["sh", "-c", "awk '{print $1}' && echo ${PGUSER}"]
 
         assert!(
             format!("{err:#}").contains("purge_cache_on_dow"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn port_zero_and_colliding_environment_names_are_rejected() {
+        let temp = temp_config("[slot.ports]\nweb = 0\n");
+        let err = SlotConfig::load(&temp.worktree, Some(&temp.path)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be between 1 and 65535"),
+            "unexpected error: {err:#}"
+        );
+
+        let temp = temp_config("[slot.ports]\nweb-api = 3000\nweb_api = 3100\n");
+        let err = SlotConfig::load(&temp.worktree, Some(&temp.path)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("both map to PORTZILLA_PORT_WEB_API"),
             "unexpected error: {err:#}"
         );
     }
