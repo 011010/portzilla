@@ -12,6 +12,7 @@ mod kimi;
 mod lease;
 mod mcp;
 mod opencode;
+mod slot_config;
 mod store;
 mod view;
 mod watch;
