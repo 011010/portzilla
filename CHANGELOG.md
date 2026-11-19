@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - Added `portzilla intent history` and the read-only MCP `intent_history` tool: a bounded, filterable journal of `claim_created`, `claim_refreshed`, `claim_taken_over` and `released` events stored atomically with the claims in `intents.json`. It is schema v3; v1 and v2 files upgrade on the next write. `intent history clear` is CLI-only and never reuses a sequence number.
 
