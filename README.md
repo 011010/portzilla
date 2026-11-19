@@ -211,7 +211,7 @@ Recognizes `kill <pid>`, `pkill`/`killall`, `lsof -ti:<port> | xargs kill`, `fus
 
 | Harness | Hook | Deny reaches model? | Own-lease? |
 |---------|------|---------------------|------------|
-| **Claude Code** | `PreToolUse` — `portzilla hook claude-code` | Yes (`permissionDecisionReason`) | **Yes** (`$CLAUDE_CODE_SESSION_ID`) |
+| **Claude Code** | `PreToolUse` + `PostToolUse` — `portzilla hook claude-code` | Yes (`permissionDecisionReason`; clean-merge context via `PostToolUse`) | **Yes** (`$CLAUDE_CODE_SESSION_ID`) |
 | **Cursor** | `beforeShellExecution` — `portzilla hook cursor` | Likely (`agent_message`) | No |
 | **Gemini CLI** | `BeforeTool` — `portzilla hook gemini` | Yes (Deny), no Warn channel | No |
 | **Codex CLI** | `PreToolUse` — `portzilla hook codex` | Yes (Deny + Warn via `additionalContext`) | No |
@@ -257,7 +257,7 @@ released /repo/src/auth.rs for session ...
 
 `claim` records where the caller's working copy lives, so a claim made by hand is conflict-checkable by the OpenCode guard too. The intent file is at schema v2: v1 files are read and upgraded on the next write, but an older portzilla binary cannot read a v2 file and must be upgraded before sharing a data directory. Invalid TTLs (outside 1–86400 seconds) are refused. Full flags, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md#file-intents)**.
 
-Limits, stated plainly: only OpenCode is covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
+Limits, stated plainly: OpenCode and Claude Code are covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
 
 One consequence worth knowing: ownership is per *session*, and every `opencode run` invocation is a new session. In the TUI a conversation keeps its session for its whole life, but scripted runs block each other on the same file until the TTL lapses. `portzilla intent ls` shows the holder and `portzilla intent release <path> --session <id>` frees it immediately.
 
