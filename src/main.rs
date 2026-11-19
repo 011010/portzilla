@@ -819,11 +819,12 @@ fn print_intent_absent_release(file: &std::path::Path, key: &str, json: bool) {
     );
 }
 
-/// Runs the Claude Code `PreToolUse` hook: reads the hook payload from
-/// stdin, evaluates it, and writes the response to stdout/stderr.
+/// Runs the Claude Code hook (`PreToolUse` or `PostToolUse`): reads the hook
+/// payload from stdin, evaluates it, and writes the response to
+/// stdout/stderr.
 ///
 /// This function is the fail-open boundary described in `claude_code.rs`'s
-/// module docs, made concrete: reading stdin, opening the store, listing
+/// module docs, made concrete: reading stdin, opening the stores, listing
 /// leases, and even a panic inside the guard/adapter logic are all caught
 /// here and turned into "print nothing, note it on stderr" rather than ever
 /// propagating an error out of `run()` — a nonzero exit here would risk
@@ -863,8 +864,28 @@ fn run_hook_claude_code() {
         }
     };
 
+    // The file-intent store lives next to the lease store. A `PreToolUse` for
+    // `Write`/`Edit` needs it; if it cannot be opened, the adapter applies the
+    // same fail-open/fail-closed policy as any other portzilla-side failure,
+    // and `PostToolUse` stays silent because it may never deny. The detailed
+    // cause goes to stderr, which Claude Code only writes to its debug log on
+    // exit 0.
+    let intents = match IntentStore::open(None) {
+        Ok(store) => Some(store),
+        Err(err) => {
+            eprintln!("portzilla hook claude-code: failed to open the file-intent store: {err:#}");
+            None
+        }
+    };
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        claude_code::handle_with_policy(&raw_input, &leases, &SystemPidChecker, fail_closed)
+        claude_code::handle_with_policy(
+            &raw_input,
+            &leases,
+            &SystemPidChecker,
+            intents.as_ref(),
+            fail_closed,
+        )
     }));
 
     match result {

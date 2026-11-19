@@ -1154,12 +1154,13 @@ fn hook_claude_code_allows_kill_of_an_unleased_pid() {
 }
 
 #[test]
-fn hook_claude_code_allows_non_bash_tool_calls() {
+fn hook_claude_code_allows_unguarded_tool_calls() {
     let dir = tempfile::tempdir().unwrap();
     let input = serde_json::json!({
+        "session_id": "my-session",
         "hook_event_name": "PreToolUse",
-        "tool_name": "Edit",
-        "tool_input": {"file_path": "/tmp/x", "old_string": "kill 1", "new_string": ""}
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/x"}
     })
     .to_string();
 
@@ -1170,6 +1171,40 @@ fn hook_claude_code_allows_non_bash_tool_calls() {
         .success()
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_claude_code_claims_a_free_file_for_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let input = serde_json::json!({
+        "session_id": "my-session",
+        "hook_event_name": "PreToolUse",
+        "cwd": project.path(),
+        "tool_name": "Write",
+        "tool_input": {"file_path": "notes.md", "content": "hello\n"}
+    })
+    .to_string();
+
+    cmd(dir.path())
+        .args(["hook", "claude-code"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+
+    // The end-to-end wiring opened the intent store next to the lease store
+    // and recorded the claim with a location.
+    let intents = std::fs::read_to_string(dir.path().join("intents.json")).unwrap();
+    let json: Value = serde_json::from_str(&intents).unwrap();
+    assert_eq!(json["intents"][0]["session"], "my-session");
+    assert!(
+        json["intents"][0]["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("notes.md")
+    );
 }
 
 #[test]
