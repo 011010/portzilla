@@ -14,6 +14,7 @@ mod mcp;
 mod opencode;
 mod slot;
 mod slot_config;
+mod slot_runtime;
 mod store;
 mod view;
 mod watch;
@@ -28,6 +29,11 @@ use clap::{Parser, Subcommand};
 use intent::{Intent, IntentStore, key_for_file, locate_file};
 use lease::{Lease, PidChecker, SystemPidChecker};
 use serde::Serialize;
+use slot::SlotRecord;
+use slot::SlotStore;
+use slot_config::SlotConfig;
+use slot_runtime::{SlotContext, SlotRuntime};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use store::{ClaimOutcome, Store};
@@ -228,6 +234,12 @@ enum Commands {
         #[command(subcommand)]
         command: IntentCommands,
     },
+    /// Manage per-worktree environment slots: ports, cache directories, an
+    /// environment file, and an optional database.
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +292,81 @@ enum IntentCommands {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum HistoryAction {
     Clear,
+}
+
+#[derive(Subcommand)]
+enum SlotCommands {
+    /// Allocate the slot's ports, create its cache directories, and write
+    /// `.env.portzilla` in the worktree. Any failure rolls everything back.
+    Up {
+        /// Slot name, unique within the worktree.
+        name: String,
+        /// Config file to read instead of `<worktree>/portzilla.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Tear down an existing slot with this name first.
+        #[arg(long)]
+        replace: bool,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the slot environment as `KEY=value` lines, ready for `eval` or
+    /// direnv.
+    Env {
+        /// Slot name.
+        name: String,
+        /// Reload `[slot.env]` values from this config. Allocated values
+        /// (ports, database names, cache paths) always come from the stored
+        /// slot.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Run a command with the slot environment injected. The child's exit code
+    /// is forwarded.
+    Run {
+        /// Slot name.
+        name: String,
+        /// Reload `[slot.env]` values from this config before running.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The command to run, exactly as given after `--`. Executed directly
+        /// (no shell).
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// List slots in every worktree.
+    Ls {
+        /// Print machine-readable JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one slot.
+    Show {
+        /// Slot name.
+        name: String,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run deprovision, release the ports, purge the cache directories when
+    /// configured, and remove the record.
+    Down {
+        /// Slot name.
+        name: String,
+        /// Clean up even when deprovision fails.
+        #[arg(long)]
+        force: bool,
+        /// Print machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove slots whose worktree no longer exists.
+    Prune {
+        /// Print machine-readable JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -391,6 +478,14 @@ fn main() {
             eprintln!("no live file intent found for {file}");
             std::process::exit(EXIT_NOT_FOUND);
         }
+        Err(RunError::SlotNotFound { name, worktree }) => {
+            eprintln!(
+                "no slot named {} is up in {}",
+                sanitize_for_display(&name),
+                sanitize_for_display(&worktree)
+            );
+            std::process::exit(EXIT_NOT_FOUND);
+        }
         Err(RunError::Message(message)) => {
             eprintln!("{message}");
             std::process::exit(1);
@@ -410,6 +505,12 @@ enum RunError {
     /// A file has no live intent. Carries the path as the user spelled it so
     /// the message names what they asked about, not an opaque store key.
     IntentNotFound(String),
+    /// A slot name is not up in the current worktree. Exit code 2, like a
+    /// missing lease: the request was well-formed, the slot just is not there.
+    SlotNotFound {
+        name: String,
+        worktree: String,
+    },
     /// A usage error whose text is already the complete message (a missing
     /// session, a nonsensical TTL). Printed without the `error:` prefix so it
     /// reads as the instruction it is.
@@ -420,6 +521,18 @@ enum RunError {
 impl From<anyhow::Error> for RunError {
     fn from(err: anyhow::Error) -> Self {
         RunError::Other(err)
+    }
+}
+
+impl From<slot::SlotError> for RunError {
+    fn from(err: slot::SlotError) -> Self {
+        match err {
+            slot::SlotError::NotFound { name, worktree } => RunError::SlotNotFound {
+                name,
+                worktree: worktree.display().to_string(),
+            },
+            other => RunError::Other(other.into()),
+        }
     }
 }
 
@@ -598,6 +711,7 @@ fn run() -> Result<(), RunError> {
             }
         }
         Commands::Intent { command } => run_intent_command(command)?,
+        Commands::Slot { command } => run_slot_command(command)?,
     }
     Ok(())
 }
@@ -818,6 +932,345 @@ fn print_intent_absent_release(file: &std::path::Path, key: &str, json: bool) {
     println!(
         "no file intent for {} to release (already absent)",
         sanitize_for_display(&file.display().to_string())
+    );
+}
+
+/// Runs one `portzilla slot` subcommand.
+///
+/// Slots are resolved, changed, and printed one command per arm so the
+/// borrowed stores stay alive for the whole operation. `env` and `run` read
+/// the stored record rather than the config: ports, database names, and cache
+/// paths were decided at `up` time, and re-rendering them from a changed
+/// config would describe a slot that is not the one on disk. `--config` only
+/// reloads `[slot.env]` values.
+fn run_slot_command(command: SlotCommands) -> Result<(), RunError> {
+    let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
+
+    match command {
+        SlotCommands::Up {
+            name,
+            config,
+            replace,
+            json,
+        } => {
+            let context = SlotContext::resolve(&cwd, config.as_deref())?;
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let outcome = runtime.up(&context, &name, replace)?;
+            print_slot_warnings(&outcome.warnings);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&SlotUpView {
+                        slot: SlotView::from_record(&outcome.record),
+                        replaced: outcome.replaced,
+                    })
+                    .expect("SlotUpView always serializes")
+                );
+            } else {
+                println!(
+                    "slot {} is up in {}{}",
+                    sanitize_for_display(&outcome.record.name),
+                    sanitize_for_display(&outcome.record.worktree.display().to_string()),
+                    if outcome.replaced { " (replaced)" } else { "" }
+                );
+                print_slot_detail(&outcome.record);
+            }
+        }
+        SlotCommands::Env { name, config } => {
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let record = runtime.find(&cwd, &name)?;
+            let mut env = record.env.clone();
+            if let Some(path) = config.as_deref() {
+                let config = SlotConfig::load(&record.worktree, Some(path))?;
+                env.extend(config.env);
+            }
+            print!("{}", slot_runtime::render_env_file(&env));
+        }
+        SlotCommands::Run {
+            name,
+            config,
+            command,
+        } => {
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let record = runtime.find(&cwd, &name)?;
+            let mut env = record.env.clone();
+            if let Some(path) = config.as_deref() {
+                let config = SlotConfig::load(&record.worktree, Some(path))?;
+                env.extend(config.env);
+            }
+            let Some((program, arguments)) = command.split_first() else {
+                return Err(RunError::Message(
+                    "slot run requires a command to execute".to_string(),
+                ));
+            };
+            let status = std::process::Command::new(program)
+                .args(arguments)
+                .envs(&env)
+                .status()
+                .with_context(|| format!("failed to spawn {program}"))?;
+            match status.code() {
+                Some(0) => {}
+                _ => exit_with_child_status(status),
+            }
+        }
+        SlotCommands::Ls { json } => {
+            let slots = SlotStore::open(None)?;
+            let mut records = slots.list()?;
+            records.sort_by(|left, right| {
+                left.worktree
+                    .cmp(&right.worktree)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            print_slot_list(&records, json);
+        }
+        SlotCommands::Show { name, json } => {
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let record = runtime.find(&cwd, &name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&SlotView::from_record(&record))
+                        .expect("SlotView always serializes")
+                );
+            } else {
+                println!("name: {}", sanitize_for_display(&record.name));
+                println!(
+                    "worktree: {}",
+                    sanitize_for_display(&record.worktree.display().to_string())
+                );
+                println!("repo: {}", sanitize_for_display(&record.repo_key));
+                print_slot_detail(&record);
+            }
+        }
+        SlotCommands::Down { name, force, json } => {
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let record = runtime.find(&cwd, &name)?;
+            let outcome = runtime.down(&record.worktree, &name, force)?;
+            print_slot_warnings(&outcome.warnings);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&SlotDownView {
+                        slot: SlotView::from_record(&outcome.record),
+                        released_ports: outcome.released_ports.clone(),
+                        purged_dirs: outcome
+                            .purged_dirs
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                        warnings: outcome.warnings.clone(),
+                        forced: outcome.forced,
+                    })
+                    .expect("SlotDownView always serializes")
+                );
+            } else {
+                print_slot_down(&outcome);
+            }
+        }
+        SlotCommands::Prune { json } => {
+            let leases = Store::open(None)?;
+            let slots = SlotStore::open(None)?;
+            let runtime = SlotRuntime::new(&leases, &slots, &SystemPidChecker);
+            let outcome = runtime.prune()?;
+            print_slot_warnings(&outcome.warnings);
+            if json {
+                let views: Vec<SlotView> =
+                    outcome.removed.iter().map(SlotView::from_record).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string(&views).expect("SlotView always serializes")
+                );
+            } else if outcome.removed.is_empty() {
+                println!("no slots to prune");
+            } else {
+                for record in &outcome.removed {
+                    println!(
+                        "pruned slot {} in {}",
+                        sanitize_for_display(&record.name),
+                        sanitize_for_display(&record.worktree.display().to_string())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_slot_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// JSON shape of a slot, shared by `up`, `ls`, `show`, `down`, and `prune`.
+#[derive(Serialize)]
+struct SlotView {
+    name: String,
+    worktree: String,
+    repo_key: String,
+    ports: BTreeMap<String, u16>,
+    db: Option<SlotDbView>,
+    cache_dirs: Vec<String>,
+    env_file: String,
+    created_at: u64,
+    age_secs: u64,
+}
+
+#[derive(Serialize)]
+struct SlotDbView {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SlotUpView {
+    #[serde(flatten)]
+    slot: SlotView,
+    replaced: bool,
+}
+
+#[derive(Serialize)]
+struct SlotDownView {
+    #[serde(flatten)]
+    slot: SlotView,
+    released_ports: Vec<u16>,
+    purged_dirs: Vec<String>,
+    warnings: Vec<String>,
+    forced: bool,
+}
+
+impl SlotView {
+    fn from_record(record: &SlotRecord) -> Self {
+        Self {
+            name: record.name.clone(),
+            worktree: record.worktree.to_string_lossy().into_owned(),
+            repo_key: record.repo_key.clone(),
+            ports: record.ports.clone(),
+            db: record.db.as_ref().map(|db| SlotDbView {
+                name: db.name.clone(),
+                schema: db.schema.clone(),
+            }),
+            cache_dirs: record
+                .cache_dirs
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            env_file: record.env_file.to_string_lossy().into_owned(),
+            created_at: record.created_at,
+            age_secs: lease::current_unix_timestamp().saturating_sub(record.created_at),
+        }
+    }
+}
+
+fn slot_ports_label(ports: &BTreeMap<String, u16>) -> String {
+    ports
+        .iter()
+        .map(|(name, port)| format!("{name}={port}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn slot_db_label(record: &SlotRecord) -> String {
+    match &record.db {
+        None => "-".to_string(),
+        Some(db) => match &db.schema {
+            Some(schema) => format!("{} ({schema})", db.name),
+            None => db.name.clone(),
+        },
+    }
+}
+
+fn print_slot_detail(record: &SlotRecord) {
+    println!("ports: {}", slot_ports_label(&record.ports));
+    println!("db: {}", sanitize_for_display(&slot_db_label(record)));
+    for dir in &record.cache_dirs {
+        println!(
+            "cache: {}",
+            sanitize_for_display(&dir.display().to_string())
+        );
+    }
+    println!(
+        "env file: {}",
+        sanitize_for_display(&record.env_file.display().to_string())
+    );
+    println!(
+        "age: {}s",
+        lease::current_unix_timestamp().saturating_sub(record.created_at)
+    );
+}
+
+fn print_slot_list(records: &[SlotRecord], json: bool) {
+    if json {
+        let views: Vec<SlotView> = records.iter().map(SlotView::from_record).collect();
+        println!(
+            "{}",
+            serde_json::to_string(&views).expect("SlotView always serializes")
+        );
+        return;
+    }
+    if records.is_empty() {
+        println!("no slots");
+        return;
+    }
+    println!(
+        "{:<16} {:<40} {:<24} {:<20} AGE",
+        "NAME", "WORKTREE", "PORTS", "DB"
+    );
+    for record in records {
+        println!(
+            "{:<16} {:<40} {:<24} {:<20} {}s",
+            sanitize_for_display(&record.name),
+            sanitize_for_display(&record.worktree.display().to_string()),
+            slot_ports_label(&record.ports),
+            sanitize_for_display(&slot_db_label(record)),
+            lease::current_unix_timestamp().saturating_sub(record.created_at)
+        );
+    }
+}
+
+fn print_slot_down(outcome: &slot_runtime::DownOutcome) {
+    let mut details = Vec::new();
+    if !outcome.released_ports.is_empty() {
+        details.push(format!(
+            "released ports {}",
+            outcome
+                .released_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !outcome.purged_dirs.is_empty() {
+        details.push(format!(
+            "purged {} cache director{}",
+            outcome.purged_dirs.len(),
+            if outcome.purged_dirs.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ));
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join("; "))
+    };
+    println!(
+        "slot {} is down{suffix}",
+        sanitize_for_display(&outcome.record.name)
     );
 }
 

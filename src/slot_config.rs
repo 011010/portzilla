@@ -28,7 +28,7 @@
 //! depend on the config file still existing (or still being identical) when
 //! the worktree is cleaned up.
 
-use crate::intent::{normalize_path, repository_identity};
+use crate::intent::normalize_path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -409,17 +409,6 @@ pub fn substitute(template: &str, values: &[(&str, &str)]) -> String {
     output
 }
 
-/// Returns the absolute worktree root and repository identity for `cwd`, as a
-/// thin wrapper over the same rule the intent store uses: the git common dir is
-/// the repository, the toplevel is the worktree. Outside a git repository both
-/// are the canonical current directory.
-///
-/// Slots store the common dir as `repo_key`, so two linked worktrees of one
-/// repository share a repo key while keeping distinct slots.
-pub fn worktree_identity(cwd: &Path) -> (PathBuf, PathBuf) {
-    repository_identity(cwd)
-}
-
 /// A set of `(env var, resolved path)` pairs, with the cache env names kept
 /// stable for comparisons and purge bookkeeping.
 pub fn cache_entries(
@@ -447,6 +436,15 @@ pub fn distinct_cache_dirs(entries: &[(String, PathBuf)]) -> Vec<PathBuf> {
         seen.insert(path.clone());
     }
     seen.into_iter().collect()
+}
+
+/// Test-only: writes `toml` as the worktree's `portzilla.toml` and loads it.
+/// Keeps runtime tests focused on effects rather than on file plumbing.
+#[cfg(test)]
+pub(crate) fn load_for_tests(worktree: &Path, toml: &str) -> SlotConfig {
+    let path = worktree.join(CONFIG_FILE_NAME);
+    fs::write(&path, toml).expect("write test config");
+    SlotConfig::load(worktree, Some(&path)).expect("test config must be valid")
 }
 
 #[cfg(test)]
