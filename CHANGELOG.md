@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added MCP tools for file intents: `intent_claim`, `intent_who`, `intent_ls` and `intent_release`, with the same JSON shapes as the CLI. They are the only file protection on harnesses without an edit hook, and they record the holder's working copy so conflict checks work across peers.
+
 - Added environment slots: `portzilla slot up|env|run|ls|show|down|prune` gives one worktree its own ports (as durable leases the kill guard understands), cache directories, `.env.portzilla`, and a database provisioned by configured argv commands. `up` rolls back completely on failure; `down` keeps the record when deprovision fails unless `--force`. Configured in `portzilla.toml`. Secrets never pass through portzilla.
 - Added file intents to the Claude Code adapter. `PreToolUse` on `Write`/`Edit` claims the file and denies only a proven conflict; `PostToolUse` delivers the clean-merge warning as `additionalContext`, the only model-visible channel Claude Code offers. A clean edit emits no output, so the hook never bypasses the user's permission prompt. Existing Bash-only registrations must add the `Write|Edit` matcher.
 

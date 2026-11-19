@@ -9,9 +9,10 @@
 //! against the CLI's JSON output recognizes MCP tool results too.
 
 use crate::audit::{AuditActor, AuditEventType, AuditSource, HistoryQuery};
+use crate::intent::{self, IntentStore};
 use crate::lease::SystemPidChecker;
 use crate::store::Store;
-use crate::view::{to_claim_view, to_view};
+use crate::view::{to_claim_view, to_intent_view, to_view};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -29,7 +30,8 @@ use serde_json::json;
 /// a second front end onto the same on-disk state, not a separate one.
 pub async fn run_stdio() -> anyhow::Result<()> {
     let store = Store::open(None)?;
-    let server = PortzillaMcpServer::new(store);
+    let intents = IntentStore::open(None)?;
+    let server = PortzillaMcpServer::new(store, intents);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -38,6 +40,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 #[derive(Clone)]
 struct PortzillaMcpServer {
     store: Store,
+    intents: IntentStore,
     tool_router: ToolRouter<PortzillaMcpServer>,
 }
 
@@ -75,6 +78,32 @@ struct ReleaseParams {
     actor_session: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct IntentClaimParams {
+    /// File to claim: an absolute path, or a path relative to the MCP server's working directory.
+    path: String,
+    /// Stable session identifier. Use the same string your harness passes to
+    /// portzilla's hooks, or your own claims will look foreign to the guard.
+    session: String,
+    /// Claim lifetime in seconds, between 1 and 86400. Defaults to 1800.
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct IntentPathParams {
+    /// File to look up: an absolute path, or a path relative to the MCP server's working directory.
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct IntentReleaseParams {
+    /// File to release: an absolute path, or a path relative to the MCP server's working directory.
+    path: String,
+    /// Session that owns the claim.
+    session: String,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct PruneParams {
     /// Session identifying the agent requesting the prune.
@@ -98,9 +127,10 @@ struct HistoryParams {
 
 #[tool_router]
 impl PortzillaMcpServer {
-    fn new(store: Store) -> Self {
+    fn new(store: Store, intents: IntentStore) -> Self {
         Self {
             store,
+            intents,
             tool_router: Self::tool_router(),
         }
     }
@@ -372,6 +402,163 @@ impl PortzillaMcpServer {
         .map_err(store_error)?;
         Ok(CallToolResult::structured(value))
     }
+
+    // ---- file intents ----
+
+    #[tool(
+        description = "Claim a file for this session before editing it, so another live session \
+        that tries to edit the same file is checked against your version instead of clobbering \
+        it. Use the same session string your harness gives your hooks; a different string makes \
+        your own claims look foreign. Returns a tool-level error naming the holder when another \
+        live session already owns the file. Prefer the harness hook when one exists: it does \
+        this automatically before every write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn intent_claim(
+        &self,
+        Parameters(params): Parameters<IntentClaimParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let intents = self.intents.clone();
+        let path = std::path::PathBuf::from(&params.path);
+        let session = params.session;
+        let ttl = params.ttl_secs.unwrap_or(intent::DEFAULT_TTL_SECS);
+        if !(intent::MIN_TTL_SECS..=intent::MAX_TTL_SECS).contains(&ttl) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "ttl_secs must be between {} and {}",
+                    intent::MIN_TTL_SECS,
+                    intent::MAX_TTL_SECS
+                ),
+                None,
+            ));
+        }
+
+        tokio::task::spawn_blocking(move || {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (key, location) = intent::locate_file(&cwd, &path);
+            let now = crate::lease::current_unix_timestamp();
+            match intents.claim(&key, &session, now, now + ttl, Some(location)) {
+                Ok(intent) => {
+                    let mut value = serde_json::to_value(to_intent_view(&intent, now))
+                        .expect("IntentView always serializes");
+                    value["ttl_secs"] = json!(ttl);
+                    Ok(CallToolResult::structured(value))
+                }
+                Err(err) => intent_tool_error(err),
+            }
+        })
+        .await
+        .map_err(blocking_task_failed)?
+    }
+
+    #[tool(
+        description = "Show which session holds a file, with the holder's working copy, age and \
+        expiry. Returns a tool-level error (not a protocol error) when no live claim exists. \
+        Check this before editing a file another agent may be working on.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn intent_who(
+        &self,
+        Parameters(params): Parameters<IntentPathParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let intents = self.intents.clone();
+        let path = std::path::PathBuf::from(&params.path);
+
+        tokio::task::spawn_blocking(move || {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (key, _) = intent::locate_file(&cwd, &path);
+            let now = crate::lease::current_unix_timestamp();
+            let found = intents
+                .get(&key)
+                .map_err(intent_store_protocol_error)?
+                .filter(|intent| intent.is_live_at(now));
+            match found {
+                Some(intent) => Ok(CallToolResult::structured(
+                    serde_json::to_value(to_intent_view(&intent, now))
+                        .expect("IntentView always serializes"),
+                )),
+                None => Ok(intent_not_found_error(&key)),
+            }
+        })
+        .await
+        .map_err(blocking_task_failed)?
+    }
+
+    #[tool(
+        description = "List every live file claim across all worktrees, with the holder's working \
+        copy, session, age and expiry. Expired claims are omitted.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn intent_ls(&self) -> Result<CallToolResult, McpError> {
+        let intents = self.intents.clone();
+        tokio::task::spawn_blocking(move || {
+            let now = crate::lease::current_unix_timestamp();
+            let intents = intents.list(now).map_err(intent_store_protocol_error)?;
+            let views: Vec<_> = intents.iter().map(|i| to_intent_view(i, now)).collect();
+            Ok(CallToolResult::structured(
+                serde_json::to_value(views).expect("IntentView always serializes"),
+            ))
+        })
+        .await
+        .map_err(blocking_task_failed)?
+    }
+
+    #[tool(
+        description = "Release this session's file claim before it expires. Only the owning \
+        session can release it; a different session gets a tool-level error naming the holder. \
+        Releasing a file nobody claims is a no-op success, so retrying after a crash is safe.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn intent_release(
+        &self,
+        Parameters(params): Parameters<IntentReleaseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let intents = self.intents.clone();
+        let path = std::path::PathBuf::from(&params.path);
+        let session = params.session;
+
+        tokio::task::spawn_blocking(move || {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (key, _) = intent::locate_file(&cwd, &path);
+            let now = crate::lease::current_unix_timestamp();
+            match intents.release(&key, &session) {
+                Ok(Some(intent)) => {
+                    let mut value = serde_json::to_value(to_intent_view(&intent, now))
+                        .expect("IntentView always serializes");
+                    value["released"] = json!(true);
+                    Ok(CallToolResult::structured(value))
+                }
+                Ok(None) => Ok(CallToolResult::structured(json!({
+                    "released": false,
+                    "key": key,
+                    "file": null,
+                }))),
+                Err(err) => intent_tool_error(err),
+            }
+        })
+        .await
+        .map_err(blocking_task_failed)?
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -426,6 +613,65 @@ fn blocking_task_failed(err: tokio::task::JoinError) -> McpError {
     )
 }
 
+/// Maps a typed intent error to the surface it belongs on: ownership outcomes
+/// are well-formed tool results the caller should see (mirroring the CLI's exit
+/// codes), while store failures mean portzilla itself could not do its job.
+fn intent_tool_error(err: crate::intent::IntentError) -> Result<CallToolResult, McpError> {
+    use crate::intent::IntentError;
+    match err {
+        IntentError::HeldBy {
+            key,
+            holder,
+            expires_at,
+            ..
+        } => Ok(CallToolResult::structured_error(json!({
+            "error": "held_by",
+            "key": key,
+            "session": holder,
+            "expires_at": expires_at,
+            "message": format!("file is held by session {holder} until {expires_at}"),
+        }))),
+        IntentError::NotOwner {
+            key,
+            holder,
+            requester,
+            ..
+        } => Ok(CallToolResult::structured_error(json!({
+            "error": "not_owner",
+            "key": key,
+            "session": holder,
+            "requester": requester,
+            "message": format!("file is owned by session {holder}, not by session {requester}"),
+        }))),
+        IntentError::Capacity { max } => Ok(CallToolResult::structured_error(json!({
+            "error": "capacity",
+            "max": max,
+            "message": format!("the intent store already holds its maximum of {max} records"),
+        }))),
+        IntentError::Invalid(message) => Err(McpError::invalid_params(message, None)),
+        IntentError::Store(err) => Err(store_error(err)),
+    }
+}
+
+/// Store-level failures while reading intents are protocol errors, the same
+/// rule the lease tools follow.
+fn intent_store_protocol_error(err: crate::intent::IntentError) -> McpError {
+    match err {
+        crate::intent::IntentError::Store(err) => store_error(err),
+        other => McpError::internal_error(format!("{other}"), None),
+    }
+}
+
+/// Tool-level error for "no live claim on this file", mirroring the CLI's
+/// exit code 2 for `intent who`.
+fn intent_not_found_error(key: &str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": "not_found",
+        "key": key,
+        "message": "no live file intent found for this path",
+    }))
+}
+
 /// Builds the tool-level error result used for "no lease on this port"
 /// (`who`, `release`), mirroring the CLI's exit code 2.
 fn not_found_error(port: u16) -> CallToolResult {
@@ -460,7 +706,8 @@ mod tests {
         // real sockets; the production OsPortProbe is covered by the store
         // unit tests and the integration suite.
         let store = Store::open_with_probe(Some(dir.path().to_path_buf()), probe).unwrap();
-        (PortzillaMcpServer::new(store), dir)
+        let intents = IntentStore::open(Some(dir.path().to_path_buf())).unwrap();
+        (PortzillaMcpServer::new(store, intents), dir)
     }
 
     fn server_with_tempdir() -> (PortzillaMcpServer, tempfile::TempDir) {
@@ -494,16 +741,27 @@ mod tests {
     }
 
     #[test]
-    fn all_six_tools_are_registered_with_descriptions() {
+    fn all_tools_are_registered_with_descriptions() {
         let (server, _dir) = server_with_tempdir();
         let tools = server.tool_router.list_all();
         let names: std::collections::HashSet<&str> =
             tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(
             names,
-            ["claim", "who", "ls", "release", "prune", "history"]
-                .into_iter()
-                .collect()
+            [
+                "claim",
+                "who",
+                "ls",
+                "release",
+                "prune",
+                "history",
+                "intent_claim",
+                "intent_who",
+                "intent_ls",
+                "intent_release",
+            ]
+            .into_iter()
+            .collect()
         );
         for tool in &tools {
             assert!(
@@ -1090,5 +1348,202 @@ mod tests {
             .await
             .expect_err("oversized actor session must be invalid params");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    // ---- file intents ----
+
+    fn intent_path(dir: &tempfile::TempDir) -> String {
+        dir.path()
+            .join("src/auth.rs")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn intent_claim_records_the_file_and_its_location() {
+        let (server, dir) = server_with_tempdir();
+        let path = intent_path(&dir);
+        let result = server
+            .intent_claim(Parameters(IntentClaimParams {
+                path,
+                session: "sess-a".to_string(),
+                ttl_secs: Some(120),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let value = structured(&result);
+        assert_eq!(value["session"], "sess-a");
+        assert_eq!(value["live"], true);
+        assert_eq!(value["ttl_secs"], 120);
+        // Build the tail with join() so it matches the platform separator the
+        // record actually holds (Windows: "src\\auth.rs").
+        let tail = std::path::Path::new("src").join("auth.rs");
+        let tail = tail.to_string_lossy();
+        assert!(
+            value["file"].as_str().unwrap().ends_with(tail.as_ref()),
+            "the claim must record the holder's working copy: {value}"
+        );
+        assert!(value["key"].as_str().unwrap().contains(tail.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn intent_claim_conflict_is_a_tool_error_naming_the_holder() {
+        let (server, dir) = server_with_tempdir();
+        let path = intent_path(&dir);
+        server
+            .intent_claim(Parameters(IntentClaimParams {
+                path: path.clone(),
+                session: "sess-a".to_string(),
+                ttl_secs: None,
+            }))
+            .await
+            .unwrap();
+
+        let conflict = server
+            .intent_claim(Parameters(IntentClaimParams {
+                path,
+                session: "sess-b".to_string(),
+                ttl_secs: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(conflict.is_error, Some(true));
+        let value = structured(&conflict);
+        assert_eq!(value["error"], "held_by");
+        assert_eq!(value["session"], "sess-a");
+    }
+
+    #[tokio::test]
+    async fn intent_claim_rejects_a_ttl_outside_the_bounds() {
+        let (server, dir) = server_with_tempdir();
+        let err = server
+            .intent_claim(Parameters(IntentClaimParams {
+                path: intent_path(&dir),
+                session: "sess-a".to_string(),
+                ttl_secs: Some(0),
+            }))
+            .await
+            .expect_err("zero ttl must be invalid params");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn intent_who_finds_the_holder_and_reports_missing_claims() {
+        let (server, dir) = server_with_tempdir();
+        let path = intent_path(&dir);
+        server
+            .intent_claim(Parameters(IntentClaimParams {
+                path: path.clone(),
+                session: "sess-a".to_string(),
+                ttl_secs: None,
+            }))
+            .await
+            .unwrap();
+
+        let found = server
+            .intent_who(Parameters(IntentPathParams { path: path.clone() }))
+            .await
+            .unwrap();
+        assert_eq!(found.is_error, Some(false));
+        assert_eq!(structured(&found)["session"], "sess-a");
+
+        let missing = server
+            .intent_who(Parameters(IntentPathParams {
+                path: dir.path().join("other.rs").to_string_lossy().into_owned(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(structured(&missing)["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn intent_who_treats_an_expired_claim_as_absent() {
+        let (server, dir) = server_with_tempdir();
+        let path = intent_path(&dir);
+        let now = crate::lease::current_unix_timestamp();
+        let (key, location) = crate::intent::locate_file(dir.path(), std::path::Path::new(&path));
+        server
+            .intents
+            .claim(&key, "sess-a", now - 100, now - 1, Some(location))
+            .unwrap();
+
+        let missing = server
+            .intent_who(Parameters(IntentPathParams { path }))
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(structured(&missing)["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn intent_ls_lists_only_live_claims() {
+        let (server, dir) = server_with_tempdir();
+        let now = crate::lease::current_unix_timestamp();
+        let live = dir.path().join("live.rs");
+        let dead = dir.path().join("dead.rs");
+        let (live_key, live_location) = crate::intent::locate_file(dir.path(), &live);
+        let (dead_key, dead_location) = crate::intent::locate_file(dir.path(), &dead);
+        server
+            .intents
+            .claim(&live_key, "sess-a", now, now + 60, Some(live_location))
+            .unwrap();
+        server
+            .intents
+            .claim(&dead_key, "sess-b", now - 100, now - 1, Some(dead_location))
+            .unwrap();
+
+        let listed = server.intent_ls().await.unwrap();
+        let value = structured(&listed);
+        let array = value.as_array().unwrap();
+        assert_eq!(array.len(), 1, "expired claims must be omitted: {value}");
+        assert!(array[0]["file"].as_str().unwrap().ends_with("live.rs"));
+    }
+
+    #[tokio::test]
+    async fn intent_release_is_owner_only_and_idempotent() {
+        let (server, dir) = server_with_tempdir();
+        let path = intent_path(&dir);
+        server
+            .intent_claim(Parameters(IntentClaimParams {
+                path: path.clone(),
+                session: "sess-a".to_string(),
+                ttl_secs: None,
+            }))
+            .await
+            .unwrap();
+
+        let foreign = server
+            .intent_release(Parameters(IntentReleaseParams {
+                path: path.clone(),
+                session: "sess-b".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(foreign.is_error, Some(true));
+        assert_eq!(structured(&foreign)["error"], "not_owner");
+
+        let released = server
+            .intent_release(Parameters(IntentReleaseParams {
+                path: path.clone(),
+                session: "sess-a".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(released.is_error, Some(false));
+        assert_eq!(structured(&released)["released"], true);
+
+        let again = server
+            .intent_release(Parameters(IntentReleaseParams {
+                path,
+                session: "sess-a".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(again.is_error, Some(false));
+        assert_eq!(structured(&again)["released"], false);
     }
 }

@@ -244,7 +244,7 @@ Slots live in their own store, `<data_dir>/slots.json`, versioned and locked the
 
 ## MCP server
 
-`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, and read-only `history` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
+`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, and `intent_claim`, `intent_who`, `intent_ls`, `intent_release` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
 
 Register it with Claude Code:
 
@@ -259,6 +259,12 @@ Every tool's description is written to make the intended behavior explicit to th
   Reassigned claims include `reassignment_reason` in the structured result: `lease_conflict` when a live lease caused the reassignment, or `os_occupied` when an unregistered process had the requested port bound.
 - **`who(port)`** — same semantics as `portzilla who`.
 - **`ls()`** — same semantics as `portzilla ls`, no arguments.
+- **`intent_claim(path, session, ttl_secs?)`** — claims a file for `session`, recording the holder's working copy so a peer's conflict check can read it. `path` is absolute or relative to the MCP server's working directory; `ttl_secs` must be 1..86400 and defaults to 1800. Returns a tool-level error naming the holder when another live session owns the file.
+- **`intent_who(path)`** — the live holder, or a tool-level `not_found` error. Expired claims count as absent.
+- **`intent_ls()`** — every live claim, expired ones omitted.
+- **`intent_release(path, session)`** — owner-only; a different session gets `not_owner`, and releasing an unclaimed file is a successful no-op (`released: false`).
+
+**Session identity over MCP:** the protocol carries no session id, so the agent supplies one. For own-session recognition to work with the hooks, it must be the same string the harness passes to them (`sessionID` in OpenCode, `session_id` / `CLAUDE_CODE_SESSION_ID` in Claude Code). A different string makes the agent's own claims look foreign.
 - **`release(port)`** — same semantics as `portzilla release`, including the still-alive warning (surfaced as a `was_alive` field on the result instead of a stderr line).
 - **`prune()`** — same semantics as `portzilla prune`, no arguments.
 - **`history(session?, port?, event?, before?, limit?)`** — same filtered, newest-first journal query as `portzilla history`; read-only.

@@ -84,6 +84,12 @@ const MAX_INTENTS: usize = 65_536;
 /// with `--ttl-secs`.
 pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
 
+/// Smallest TTL accepted for a claim, in seconds.
+pub const MIN_TTL_SECS: u64 = 1;
+
+/// Largest TTL accepted for a claim, in seconds (24 hours).
+pub const MAX_TTL_SECS: u64 = 24 * 60 * 60;
+
 /// Where a claim's working copy lives, so a peer can read the exact version
 /// the holder is editing.
 ///
