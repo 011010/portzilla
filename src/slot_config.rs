@@ -597,9 +597,12 @@ provision = ["createdb", "{nope}"]
 
         // Mirror the join semantics instead of hardcoding a shape: a rooted
         // template replaces the base on Unix but keeps its drive on Windows
-        // ("C:\\tmp\\elsewhere\\auth").
+        // ("C:\\tmp\\elsewhere\\auth"). The absolute join is the point of the
+        // assertion, so the lint that flags it is intentionally allowed here.
         let absolute = config.cache_path(&temp.worktree, "auth", "/tmp/elsewhere/{name}");
-        assert_eq!(absolute, temp.worktree.join("/tmp/elsewhere/auth"));
+        #[allow(clippy::join_absolute_paths)]
+        let expected = temp.worktree.join("/tmp/elsewhere/auth");
+        assert_eq!(absolute, expected);
 
         let entries = cache_entries(&config, &temp.worktree, "auth");
         assert_eq!(entries.len(), 2);
