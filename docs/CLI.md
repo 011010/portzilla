@@ -333,7 +333,15 @@ Recorded event types are lease mutations, `process_exited`, `guard_denied`, `gua
 2. `$XDG_DATA_HOME/portzilla`.
 3. `$HOME/.local/share/portzilla`.
 
-The state lives at `<data_dir>/leases.json`, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation. New writes use the v3 envelope containing `leases`, `events`, and `next_event_sequence`:
+There are three independent stores, each written atomically (temp file, then rename) behind its own exclusive lock:
+
+- `<data_dir>/leases.json` — port leases and the port/guard journal (`leases.json.lock`).
+- `<data_dir>/intents.json` — file intents and their journal (`intents.json.lock`).
+- `<data_dir>/slots.json` — environment slots (`slots.json.lock`), plus a `slots.ops.lock` that serializes whole slot operations across processes.
+
+They never share a lock or a file, so a problem with one cannot block or corrupt another.
+
+The lease state lives at `<data_dir>/leases.json`, written atomically (write to a temp file, then rename) and guarded by an exclusive file lock at `<data_dir>/leases.json.lock` for the duration of every read-modify-write operation. New writes use the v3 envelope containing `leases`, `events`, and `next_event_sequence`:
 
 ```json
 {"format_version":3,"leases":[{"port":3001,"pid":57108,"tag":"vite-dev","created_at":1785959877,"session":null,"process_start_time":1785959876,"process_identity_verified":true}],"events":[],"next_event_sequence":1}
