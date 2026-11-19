@@ -1,0 +1,60 @@
+# Dependency policy for portzilla.
+#
+# `cargo deny check` replaces the standalone `cargo audit` step: it covers the
+# same RustSec advisories plus license, duplicate-version and source checks, so
+# one tool and one install cover the whole policy.
+#
+# The policy is deliberately permissive where the ecosystem is: every license
+# allowed below is permissive or public-domain, and the one LGPL alternative in
+# the tree (`MIT OR Apache-2.0 OR LGPL-2.1-or-later`) is satisfied through its
+# MIT branch rather than by allowing LGPL.
+
+[advisories]
+version = 2
+# A yanked crate is a warning: it may still be the only release that works with
+# the rest of the tree, and the fix is a dependency update, not a code change.
+yanked = "warn"
+# Report unmaintained crates across the whole graph, including transitive ones:
+# the previous audit step warned about `chrono` (reached through rmcp) and that
+# signal is worth keeping. It is a warning, not a failure — failing every PR on
+# a crate nobody here can replace would stop work for no gain. A vulnerability
+# still fails the check.
+unmaintained = "all"
+# One advisory is ignored, deliberately and by ID rather than by category:
+# RUSTSEC-2026-0543 says `chrono` is unmaintained. It reaches the tree through
+# `rmcp`, not a direct dependency, and there is no version of rmcp that drops
+# it, so nothing in this repository can fix it. Revisit when rmcp moves off
+# chrono; do not add IDs here without the same kind of reason.
+ignore = ["RUSTSEC-2026-0543"]
+
+[licenses]
+version = 2
+# Every license below is permissive or public-domain. Anything else fails the
+# check so it gets an explicit decision instead of drifting in.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+  "CC0-1.0",
+]
+confidence-threshold = 0.9
+# The allowlist is a policy, not an inventory: listing a permissive license that
+# the current tree does not use must not warn on every run.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate versions are a warning: they cost binary size but do not break the
+# build, and Cargo resolves transitive requirements we do not control.
+multiple-versions = "warn"
+# A wildcard dependency in this manifest would be a mistake; deny it.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
