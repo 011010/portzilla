@@ -196,7 +196,6 @@ pub enum IntentEventKind {
     Released,
 }
 
-#[allow(dead_code)]
 impl IntentEventKind {
     /// Stable wire name, also used by the human CLI table.
     pub fn as_str(self) -> &'static str {
@@ -262,7 +261,6 @@ impl IntentEvent {
 /// is newest-first. Validation happens in [`IntentHistoryQuery::try_new`] so
 /// the store and the MCP surface reject the same inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct IntentHistoryQuery {
     pub session: Option<String>,
     pub event: Option<IntentEventKind>,
@@ -270,7 +268,6 @@ pub struct IntentHistoryQuery {
     pub limit: usize,
 }
 
-#[allow(dead_code)]
 impl IntentHistoryQuery {
     pub fn try_new(
         session: Option<String>,
@@ -306,7 +303,6 @@ impl IntentHistoryQuery {
 /// `next_before` is the cursor to pass as `before` for the next page, or
 /// `None` when these are the last matching events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[allow(dead_code)]
 pub struct IntentHistoryPage {
     pub events: Vec<IntentEvent>,
     pub next_before: Option<u64>,
@@ -886,7 +882,6 @@ impl IntentStore {
     /// The session filter matches either side of a takeover: asking for a
     /// session's history returns the events it caused *and* the takeover in
     /// which another session replaced one of its expired claims.
-    #[allow(dead_code)]
     pub fn history(&self, query: &IntentHistoryQuery) -> Result<IntentHistoryPage> {
         let _guard = self.lock_exclusive()?;
         let state = self.read_intents_unlocked()?;
@@ -924,7 +919,6 @@ impl IntentStore {
     /// Intents are untouched. The sequence counter is *not* reset, so a later
     /// mutation continues above every sequence this data directory has ever
     /// handed out: clearing is not a way to make sequence numbers reusable.
-    #[allow(dead_code)]
     pub fn clear_history(&self) -> Result<usize> {
         let _guard = self.lock_exclusive()?;
         let mut state = self.read_intents_unlocked()?;
