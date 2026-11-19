@@ -141,6 +141,35 @@ Removes the caller's own claim. A claim held by another session is refused with 
 
 Do not assume the seven-field view for every `release --json` result; check for `released` first.
 
+### `portzilla intent history [--session <SESSION>] [--event <EVENT>] [--limit <N>] [--before <SEQ>] [--json]`
+
+Reads the bounded file-intent journal, newest first. Filters combine with logical AND. `--session` matches the claiming session and the losing side of a takeover; `--event` accepts `claim_created`, `claim_refreshed`, `claim_taken_over`, or `released` (an unknown name exits `1` and names the accepted values); `--before` is an exclusive sequence cursor; `--limit` accepts 1 through 1000 and defaults to 100. An empty journal is success and prints `no intent history events` (or the empty page in JSON).
+
+Only successful mutations are recorded, all in the same atomic write as the claim they describe:
+
+| Operation | Event |
+|---|---|
+| `claim` on a free key | `claim_created` |
+| `claim` refreshing a live claim owned by the same session | `claim_refreshed` |
+| `claim` taking over an expired claim from another session | `claim_taken_over` (with `previous_session`) |
+| `claim` taking over an expired claim from the same session | `claim_refreshed` |
+| `release` by the owner | `released` |
+| Read, release of an absent key, capacity refusal, validation error | none |
+
+Expired records reaped as a side effect of `claim` are housekeeping and are not logged. Human output is a table (`SEQ AT EVENT SESSION KEY`, with `at` in Unix seconds).
+
+### `portzilla intent history clear`
+
+Removes every retained intent event and prints `cleared N intent history events`. Claims are untouched, and the sequence counter is not reset, so later events never reuse a number. Clear is CLI-only; the MCP `intent_history` tool is read-only.
+
+### Intent history JSON page
+
+```json
+{"events":[{"seq":3,"at":1785959900,"event":"released","key":"<git-common-dir>:src/auth.rs","session":"session-a","previous_session":null}],"next_before":null}
+```
+
+`events` is newest-first. `next_before` is the cursor to pass as `--before` for the next page, or `null` when no older matching events remain. `previous_session` is non-null only for `claim_taken_over`, where it names the session whose expired claim was replaced.
+
 ### Intent JSON view (`claim`, `who`, `ls`, `release`)
 
 ```json
@@ -157,14 +186,14 @@ Do not assume the seven-field view for every `release --json` result; check for 
 
 `key` is opaque; do not parse it (the `:` separator is ambiguous on Windows). `file` is the holder's absolute working copy, and is `null` for a claim written by a v1 binary, which stores no location. `created_at` and `expires_at` are Unix seconds; `age_secs` is `now - created_at`; `live` is `now < expires_at`. `ls` filters to live claims; `who` reports only a live record; `release` also removes a lapsed record the caller owns.
 
-Schema: `intents.json` is a versioned envelope, currently `format_version: 2`. v1 files (no `location`) are read and upgraded on the next write. Unknown future versions are rejected without modifying the file. An older binary cannot safely read a v2 file: upgrade it before pointing it at the same data directory.
+Schema: `intents.json` is a versioned envelope, currently `format_version: 3`. It holds the intents, a bounded journal of at most 10,000 claim/release events (the oldest are trimmed first), and the next event sequence number. v1 files (no `location`) and v2 files are read and upgraded on the next write; their journal starts at sequence 1. Unknown future versions are rejected without modifying the file. An older binary cannot safely read a v3 file: upgrade it before pointing it at the same data directory.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| `0`  | Success. For `intent release`, also a claim that was already absent |
-| `1`  | Unexpected error (I/O failure, corrupt state file, lock failure); for `intent`, also a claim held by another session, a release by a non-owner, or a missing session |
+| `0`  | Success. For `intent release`, also a claim that was already absent; for `intent history`, an empty result |
+| `1`  | Unexpected error (I/O failure, corrupt state file, lock failure); for `intent`, also a claim held by another session, a release by a non-owner, a missing session, or an invalid history filter |
 | `2`  | Requested record not found: `who` / `release` on a port with no lease, or `intent who` on a file with no live claim |
 
 ## JSON output shapes
@@ -244,7 +273,7 @@ Slots live in their own store, `<data_dir>/slots.json`, versioned and locked the
 
 ## MCP server
 
-`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, and `intent_claim`, `intent_who`, `intent_ls`, `intent_release` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
+`portzilla serve --mcp` runs an [MCP](https://modelcontextprotocol.io) server over stdio, exposing `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, `intent_claim`, `intent_who`, `intent_ls`, `intent_release`, and read-only `intent_history` as MCP tools (those are the registered tool names — no `portzilla_` prefix). This is for AI coding agents with MCP tool access (Claude Code, and any other MCP client): they call `who` the same way they call any other structured tool — typed JSON in, typed JSON out — instead of shelling out to the CLI and parsing text.
 
 Register it with Claude Code:
 
@@ -263,6 +292,7 @@ Every tool's description is written to make the intended behavior explicit to th
 - **`intent_who(path)`** — the live holder, or a tool-level `not_found` error. Expired claims count as absent.
 - **`intent_ls()`** — every live claim, expired ones omitted.
 - **`intent_release(path, session)`** — owner-only; a different session gets `not_owner`, and releasing an unclaimed file is a successful no-op (`released: false`).
+- **`intent_history(session?, event?, before?, limit?)`** — the same filtered, newest-first file-intent journal query as `portzilla intent history`; read-only.
 
 **Session identity over MCP:** the protocol carries no session id, so the agent supplies one. For own-session recognition to work with the hooks, it must be the same string the harness passes to them (`sessionID` in OpenCode, `session_id` / `CLAUDE_CODE_SESSION_ID` in Claude Code). A different string makes the agent's own claims look foreign.
 - **`release(port)`** — same semantics as `portzilla release`, including the still-alive warning (surfaced as a `was_alive` field on the result instead of a stderr line).

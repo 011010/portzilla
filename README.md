@@ -189,7 +189,7 @@ For agents with MCP access (Claude Code, etc.) — typed JSON in/out instead of 
 $ claude mcp add portzilla -- portzilla serve --mcp
 ```
 
-Exposes `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, and the four file-intent tools `intent_claim`, `intent_who`, `intent_ls`, `intent_release` with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
+Exposes `claim`, `who`, `ls`, `release`, `prune`, read-only `history`, and the four file-intent tools `intent_claim`, `intent_who`, `intent_ls`, `intent_release`, plus read-only `intent_history`, with the same JSON shapes as `--json`. See **[docs/CLI.md#mcp-server](docs/CLI.md#mcp-server)**.
 
 The intent tools are the only file protection available on harnesses without an edit hook (Cursor, Gemini CLI, Codex, Windsurf): the agent calls `intent_claim` before editing and `intent_release` when it is done. They are cooperative, so they complement rather than replace the OpenCode and Claude Code hooks. **Pass a session string identical to the one your harness gives the hooks**, otherwise your own claims look foreign to the guard.
 
@@ -204,6 +204,8 @@ $ portzilla history clear
 ```
 
 History is newest-first and supports `--session`, `--port`, `--event`, `--before`, and `--limit`. Hook and guard event writes are best-effort: a journal failure never changes an allow/deny decision. The MCP server exposes the same read-only history query; clearing history is CLI-only. See **[docs/CLI.md#history](docs/CLI.md#history)**.
+
+File intents keep their own journal of the same size in `intents.json`, recording `claim_created`, `claim_refreshed`, `claim_taken_over` and `released` events next to the claims they describe. Query it with `portzilla intent history --session … --event … --limit …`, or read-only over MCP with `intent_history`. Expired records reaped by a new claim are housekeeping and are not logged.
 
 ## Kill guard
 
@@ -255,9 +257,13 @@ KEY SESSION AGE EXPIRES
 
 $ portzilla intent release src/auth.rs --session "$CLAUDE_CODE_SESSION_ID"
 released /repo/src/auth.rs for session ...
+
+$ portzilla intent history --session "$CLAUDE_CODE_SESSION_ID"
+SEQ AT EVENT SESSION KEY
+...
 ```
 
-`claim` records where the caller's working copy lives, so a claim made by hand is conflict-checkable by the OpenCode guard too. The intent file is at schema v2: v1 files are read and upgraded on the next write, but an older portzilla binary cannot read a v2 file and must be upgraded before sharing a data directory. Invalid TTLs (outside 1–86400 seconds) are refused. Full flags, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md#file-intents)**.
+`claim` records where the caller's working copy lives, so a claim made by hand is conflict-checkable by the OpenCode guard too. The intent file is at schema v3: it also holds a bounded journal of claim and release events. v1 and v2 files are read and upgraded on the next write (their journal starts at sequence 1), but an older portzilla binary cannot read a v3 file and must be upgraded before sharing a data directory. Invalid TTLs (outside 1–86400 seconds) are refused. Full flags, exit codes and JSON shapes → **[docs/CLI.md](docs/CLI.md#file-intents)**.
 
 Limits, stated plainly: OpenCode and Claude Code are covered today; the other harnesses still get the kill guard alone. The conflict proof runs `git merge-file`, so it needs git and both working copies on the same machine.
 
