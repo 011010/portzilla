@@ -195,6 +195,16 @@ impl std::ops::Deref for ClaimMutation {
     }
 }
 
+/// Result of a [`Store::release_if_tagged`] call: the lease was released, the
+/// port is held by a different owner and was left alone, or nothing was
+/// leased on that port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedRelease {
+    Released(ReleaseOutcome),
+    NotOurs(Lease),
+    Absent,
+}
+
 /// Result of a `release` operation: the lease that was removed, and whether
 /// its owning PID was still alive at the time of release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +483,109 @@ impl Store {
             Ok(StateUpdate::Commit {
                 result: mutation.outcome,
                 events: vec![draft],
+            })
+        })
+    }
+
+    /// Claims a port as a durable slot reservation instead of a process lease.
+    ///
+    /// The allocator walks forward exactly like [`Store::claim`]: a port that
+    /// already carries a live lease (durable or process-owned) or is bound by
+    /// the OS is skipped, and the next free port is taken. The difference is
+    /// the resulting lease: it has no owning PID, it is always live, and only
+    /// an explicit release removes it. That is what lets a slot hold its ports
+    /// after the `slot up` process exits while `claim`, `run`, `prune`, `who`,
+    /// and the kill guard all keep treating the reservation as real.
+    pub fn claim_durable(
+        &self,
+        requested_port: u16,
+        tag: String,
+        session: Option<String>,
+        checker: &dyn PidChecker,
+    ) -> Result<ClaimOutcome> {
+        self.claim_durable_with_actor(
+            requested_port,
+            tag,
+            session,
+            AuditActor::new(AuditSource::Cli, None, None),
+            checker,
+        )
+    }
+
+    pub(crate) fn claim_durable_with_actor(
+        &self,
+        requested_port: u16,
+        tag: String,
+        session: Option<String>,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<ClaimOutcome> {
+        let session = session.filter(|value| !value.is_empty());
+        let actor = AuditActor::new(actor.source, actor.harness, actor.session);
+        actor.validate()?;
+        validate_claim_inputs(requested_port, &tag, session.as_deref())?;
+        self.update_state(|state| {
+            let mutation = claim_durable_in_place(
+                &mut state.leases,
+                requested_port,
+                tag,
+                session,
+                checker,
+                self.probe.as_ref(),
+            )?;
+            let draft = AuditEventDraft {
+                actor,
+                kind: AuditEventKind::LeaseClaimed {
+                    requested_port,
+                    disposition: mutation.disposition,
+                    lease: LeaseSnapshot::from(&mutation.outcome.lease),
+                    prior_lease: mutation.prior_lease.as_ref().map(LeaseSnapshot::from),
+                    replaced_lease: mutation.replaced_lease.as_ref().map(LeaseSnapshot::from),
+                },
+            };
+            Ok(StateUpdate::Commit {
+                result: mutation.outcome,
+                events: vec![draft],
+            })
+        })
+    }
+
+    /// Removes the lease on `port` only when it still carries `expected_tag`.
+    ///
+    /// Slot teardown uses this instead of [`Store::release`]: a slot must
+    /// never release a lease another owner has since taken on the same port.
+    /// A mismatch is reported, not acted on.
+    pub fn release_if_tagged(
+        &self,
+        port: u16,
+        expected_tag: &str,
+        actor: AuditActor,
+        checker: &dyn PidChecker,
+    ) -> Result<TaggedRelease> {
+        let actor = validate_actor(actor)?;
+        self.update_state(|state| {
+            let Some(index) = state.leases.iter().position(|lease| lease.port == port) else {
+                return Ok(StateUpdate::Unchanged(TaggedRelease::Absent));
+            };
+            if state.leases[index].tag != expected_tag {
+                return Ok(StateUpdate::Unchanged(TaggedRelease::NotOurs(
+                    state.leases[index].clone(),
+                )));
+            }
+            let lease = state.leases.remove(index);
+            let was_alive = lease.is_alive(checker);
+            Ok(StateUpdate::Commit {
+                result: TaggedRelease::Released(ReleaseOutcome {
+                    lease: lease.clone(),
+                    was_alive,
+                }),
+                events: vec![AuditEventDraft {
+                    actor,
+                    kind: AuditEventKind::LeaseReleased {
+                        lease: LeaseSnapshot::from(&lease),
+                        was_alive,
+                    },
+                }],
             })
         })
     }
@@ -1109,6 +1222,75 @@ pub(crate) fn claim_in_place(
     }
 }
 
+/// Allocates a durable reservation. Same walk as [`claim_in_place`], but the
+/// resulting lease has no owning process and is therefore always live.
+///
+/// A dead process lease on the chosen port is replaced (and reported as
+/// `replaced_lease`) just like the normal claim path does; a live lease is
+/// never displaced.
+pub(crate) fn claim_durable_in_place(
+    leases: &mut Vec<Lease>,
+    requested_port: u16,
+    tag: String,
+    session: Option<String>,
+    checker: &dyn PidChecker,
+    probe: &dyn PortProbe,
+) -> Result<ClaimMutation> {
+    let prior_lease = leases
+        .iter()
+        .find(|lease| lease.port == requested_port)
+        .cloned();
+    let lease_conflict = leases
+        .iter()
+        .any(|lease| lease.port == requested_port && lease.is_alive(checker));
+    let free_by_os = probe.is_port_free(requested_port);
+    let (port, reassignment_reason) = if !lease_conflict && free_by_os {
+        (requested_port, None)
+    } else {
+        let next_port = find_next_available_port(
+            requested_port
+                .checked_add(1)
+                .context("no available port: requested port is already at the maximum")?,
+            leases,
+            checker,
+            probe,
+        )
+        .context(if lease_conflict {
+            "no available port found while resolving a slot port conflict"
+        } else {
+            "no available port found while resolving an OS port conflict"
+        })?;
+        let reason = if lease_conflict {
+            ReassignmentReason::LeaseConflict
+        } else {
+            ReassignmentReason::OsOccupied
+        };
+        (next_port, Some(reason))
+    };
+    let replaced_lease = leases
+        .iter()
+        .find(|lease| lease.port == port && !lease.is_alive(checker))
+        .cloned();
+    let lease = Lease::durable(port, tag, session);
+    upsert_lease(leases, lease.clone());
+    let disposition = match reassignment_reason {
+        Some(ReassignmentReason::LeaseConflict) => ClaimDisposition::ReassignedLeaseConflict,
+        Some(ReassignmentReason::OsOccupied) => ClaimDisposition::ReassignedOsOccupied,
+        None if replaced_lease.is_some() => ClaimDisposition::ReplacedDead,
+        None => ClaimDisposition::Created,
+    };
+    Ok(ClaimMutation {
+        outcome: ClaimOutcome {
+            lease,
+            reassigned: port != requested_port,
+            reassignment_reason,
+        },
+        disposition,
+        prior_lease,
+        replaced_lease,
+    })
+}
+
 fn resolve_claim_port(
     requested_port: u16,
     leases: &[Lease],
@@ -1550,6 +1732,157 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].port, outcome.lease.port);
         assert_eq!(leases[0].pid, 111);
+    }
+
+    #[test]
+    fn a_durable_claim_is_live_and_prune_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_probe(Some(dir.path().to_path_buf()), Arc::new(AllPortsFree)).unwrap();
+        let outcome = store
+            .claim_durable(
+                24_650,
+                "slot:auth:web".to_string(),
+                Some("auth".to_string()),
+                &AlwaysDead,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.lease.port, 24_650);
+        assert!(outcome.lease.durable);
+        assert_eq!(outcome.lease.pid, 0);
+        assert!(outcome.lease.is_alive(&AlwaysDead));
+
+        // A dead process lease is reaped; a durable reservation is not.
+        let pruned = store
+            .prune(AuditActor::new(AuditSource::Cli, None, None), &AlwaysAlive)
+            .unwrap();
+        assert!(pruned.is_empty());
+        assert!(store.get(24_650).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_second_durable_claim_walks_past_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_probe(Some(dir.path().to_path_buf()), Arc::new(AllPortsFree)).unwrap();
+        store
+            .claim_durable(
+                24_651,
+                "slot:auth:web".to_string(),
+                Some("auth".to_string()),
+                &AlwaysDead,
+            )
+            .unwrap();
+        let second = store
+            .claim_durable(
+                24_651,
+                "slot:billing:web".to_string(),
+                Some("billing".to_string()),
+                &AlwaysDead,
+            )
+            .unwrap();
+
+        assert_eq!(second.lease.port, 24_652);
+        assert!(second.reassigned);
+        assert_eq!(
+            second.reassignment_reason,
+            Some(ReassignmentReason::LeaseConflict)
+        );
+        // The first reservation is untouched.
+        assert_eq!(
+            store.get(24_651).unwrap().unwrap().tag,
+            "slot:auth:web".to_string()
+        );
+    }
+
+    #[test]
+    fn a_process_claim_walks_past_a_durable_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_probe(Some(dir.path().to_path_buf()), Arc::new(AllPortsFree)).unwrap();
+        store
+            .claim_durable(
+                24_653,
+                "slot:auth:web".to_string(),
+                Some("auth".to_string()),
+                &AlwaysAlive,
+            )
+            .unwrap();
+
+        let outcome = store
+            .claim(24_653, 111, "svc".to_string(), None, &AlwaysAlive)
+            .unwrap();
+        assert_eq!(outcome.lease.port, 24_654);
+        assert_eq!(
+            outcome.reassignment_reason,
+            Some(ReassignmentReason::LeaseConflict)
+        );
+        assert_eq!(
+            store.get(24_653).unwrap().unwrap().tag,
+            "slot:auth:web".to_string()
+        );
+    }
+
+    #[test]
+    fn a_durable_claim_reports_os_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut occupied = std::collections::HashSet::new();
+        occupied.insert(24_655u16);
+        let store = Store::open_with_probe(
+            Some(dir.path().to_path_buf()),
+            Arc::new(OccupiedPorts(occupied)),
+        )
+        .unwrap();
+
+        let outcome = store
+            .claim_durable(
+                24_655,
+                "slot:auth:web".to_string(),
+                None,
+                &AlwaysDead,
+            )
+            .unwrap();
+        assert_eq!(outcome.lease.port, 24_656);
+        assert_eq!(
+            outcome.reassignment_reason,
+            Some(ReassignmentReason::OsOccupied)
+        );
+    }
+
+    #[test]
+    fn release_if_tagged_refuses_a_foreign_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_probe(Some(dir.path().to_path_buf()), Arc::new(AllPortsFree)).unwrap();
+        store
+            .claim_durable(
+                24_657,
+                "slot:auth:web".to_string(),
+                Some("auth".to_string()),
+                &AlwaysDead,
+            )
+            .unwrap();
+        let actor = || AuditActor::new(AuditSource::Cli, None, None);
+
+        let refused = store
+            .release_if_tagged(24_657, "slot:other:web", actor(), &AlwaysDead)
+            .unwrap();
+        assert!(matches!(refused, TaggedRelease::NotOurs(ref lease) if lease.tag == "slot:auth:web"));
+        assert!(store.get(24_657).unwrap().is_some());
+
+        let released = store
+            .release_if_tagged(24_657, "slot:auth:web", actor(), &AlwaysDead)
+            .unwrap();
+        assert!(matches!(released, TaggedRelease::Released(_)));
+        assert!(store.get(24_657).unwrap().is_none());
+
+        assert!(matches!(
+            store
+                .release_if_tagged(24_657, "slot:auth:web", actor(), &AlwaysDead)
+                .unwrap(),
+            TaggedRelease::Absent
+        ));
     }
 
     #[test]

@@ -18,6 +18,18 @@ pub struct Lease {
     pub process_start_time: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_identity_verified: Option<bool>,
+    /// A durable lease is a reservation, not a process: it stays live until it
+    /// is explicitly released, regardless of any PID. Environment slots use
+    /// one per port so a slot's ports survive the `slot up` process exiting
+    /// and are respected by `claim`, `prune`, `ls`, and `who`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub durable: bool,
+}
+
+/// `serde` helper: keep `durable: false` out of `leases.json`, so every lease
+/// written by a build without slots is byte-for-byte unchanged.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Lease {
@@ -48,12 +60,39 @@ impl Lease {
             session,
             process_start_time,
             process_identity_verified: Some(process_start_time.is_some()),
+            durable: false,
+        }
+    }
+
+    /// Creates a durable lease: a port reservation held by a slot rather than
+    /// by a process.
+    ///
+    /// `pid` is recorded as 0 because no process owns the reservation. A
+    /// durable lease is always live ([`Lease::is_alive`] returns `true`
+    /// without consulting a checker), so `claim` walks past it, `prune` keeps
+    /// it, and only an explicit release removes it.
+    pub fn durable(port: u16, tag: impl Into<String>, session: Option<String>) -> Self {
+        Self {
+            port,
+            pid: 0,
+            tag: tag.into(),
+            created_at: current_unix_timestamp(),
+            session,
+            process_start_time: None,
+            process_identity_verified: None,
+            durable: true,
         }
     }
 
     /// Returns `true` if the lease's owning process is currently alive,
     /// according to the given liveness checker.
+    ///
+    /// A durable lease has no owning process: it is alive until released, so
+    /// the checker is not consulted at all.
     pub fn is_alive(&self, checker: &dyn PidChecker) -> bool {
+        if self.durable {
+            return true;
+        }
         if !checker.is_alive(self.pid) {
             return false;
         }
@@ -187,6 +226,29 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_durable_lease_is_alive_without_a_process() {
+        let lease = Lease::durable(3000, "slot:auth:web", Some("auth".to_string()));
+
+        assert!(lease.durable);
+        assert_eq!(lease.pid, 0);
+        assert!(lease.is_alive(&test_support::AlwaysDead));
+        assert!(lease.is_alive(&test_support::AlwaysAlive));
+    }
+
+    #[test]
+    fn a_durable_lease_round_trips_and_a_process_lease_omits_the_marker() {
+        let durable = Lease::durable(3000, "slot:auth:web", None);
+        let json = serde_json::to_string(&durable).unwrap();
+        assert!(json.contains(r#""durable":true"#));
+        assert_eq!(serde_json::from_str::<Lease>(&json).unwrap(), durable);
+
+        let process = Lease::new(3001, 1234, "server", None);
+        let json = serde_json::to_string(&process).unwrap();
+        assert!(!json.contains("durable"));
+        assert!(!serde_json::from_str::<Lease>(&json).unwrap().durable);
+    }
 
     #[test]
     fn new_lease_carries_given_fields() {
