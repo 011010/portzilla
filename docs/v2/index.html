@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>portzilla — every collision has an owner</title>
+  <meta name="description" content="Ports, files and worktree environments do not know about your parallel agent sessions. portzilla makes ownership explicit and enforces it." />
+  <link rel="icon" href="../assets/logo-mark.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="strip">
+    <span class="strip-left">PORTZILLA / LEASE CONTROL</span>
+    <span class="strip-right">
+      <span class="dot" aria-hidden="true"></span> LOCAL · NO DAEMON
+      <a href="https://github.com/011010/portzilla">GITHUB ↗</a>
+    </span>
+  </div>
+
+  <header class="top">
+    <a class="brand" href="#top">
+      <img src="../assets/logo-mark.png" alt="" width="40" height="40" />
+      <span>portzilla</span>
+      <em>v0.6.0</em>
+    </a>
+    <nav aria-label="Sections">
+      <a href="#layers">Layers</a>
+      <a href="#guard">Guard</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/011010/portzilla">Source</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="label">FOR PARALLEL CODING AGENTS</p>
+        <h1>Every collision<br />has an <span class="ink">owner</span>.</h1>
+        <p class="lede">
+          Ports, files and worktree environments do not know about your parallel
+          sessions. portzilla makes ownership explicit — then enforces it, before
+          an agent kills a process or overwrites a file it does not own.
+        </p>
+
+        <div class="cmd">
+          <span class="prompt">$</span>
+          <code id="install-cmd">cargo install portzilla</code>
+          <button type="button" data-copy="#install-cmd">copy</button>
+        </div>
+
+        <div class="actions">
+          <a class="solid" href="https://crates.io/crates/portzilla">Install</a>
+          <a class="line" href="https://github.com/011010/portzilla">Read the source</a>
+        </div>
+      </div>
+
+      <div class="board" role="img" aria-label="A host with three resources, each owned by a session, and two guard verdicts">
+        <div class="board-head">
+          <span>HOST · 127.0.0.1</span>
+          <span class="live"><span class="dot" aria-hidden="true"></span>3 RESOURCES</span>
+        </div>
+
+        <div class="row">
+          <span class="kind">PORT</span>
+          <span class="what">:3000</span>
+          <span class="owner">session 4f2a</span>
+          <span class="tag lease">lease</span>
+        </div>
+        <div class="row">
+          <span class="kind">FILE</span>
+          <span class="what">src/auth.ts</span>
+          <span class="owner">session 9c11</span>
+          <span class="tag intent">intent</span>
+        </div>
+        <div class="row">
+          <span class="kind">ENV</span>
+          <span class="what">worktree/auth</span>
+          <span class="owner">slot auth</span>
+          <span class="tag slot">slot</span>
+        </div>
+
+        <div class="divider"><span>GUARD</span></div>
+
+        <div class="row verdict deny">
+          <span class="kind">KILL</span>
+          <span class="what">pid 57107</span>
+          <span class="owner">foreign lease</span>
+          <span class="tag">deny</span>
+        </div>
+        <div class="row verdict allow">
+          <span class="kind">EDIT</span>
+          <span class="what">src/auth.ts</span>
+          <span class="owner">merges cleanly</span>
+          <span class="tag">allow</span>
+        </div>
+
+        <div class="board-foot">
+          <span>every decision is a JSON line in the journal</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="layers" id="layers">
+      <div class="section-head">
+        <p class="label">THREE LAYERS</p>
+        <h2>Same question,<br />three resources.</h2>
+        <p class="note">Each layer answers <strong>who owns this right now?</strong> The guard is the part that makes the answer binding.</p>
+      </div>
+
+      <div class="cards">
+        <article>
+          <header><span>01</span><h3>Ports</h3><em>lease</em></header>
+          <p>A claim records the owning process and its purpose. A conflict reassigns forward instead of stealing. The guard blocks <code>kill</code>, <code>pkill</code>, <code>lsof | xargs kill</code>, <code>fuser -k</code> and <code>kill-port</code> against a live foreign lease.</p>
+          <p class="cmd-line">portzilla claim 3000 --tag next-dev</p>
+        </article>
+        <article>
+          <header><span>02</span><h3>Files</h3><em>intent</em></header>
+          <p>The first session to edit a file claims it. A peer's edit is proven against the holder's copy with a real three-way merge: clean is allowed with a warning the model reads; a conflict is denied before the write. Hooks on OpenCode and Claude Code; the same verdicts over MCP everywhere else.</p>
+          <p class="cmd-line">portzilla intent who src/auth.ts</p>
+        </article>
+        <article>
+          <header><span>03</span><h3>Environments</h3><em>slot</em></header>
+          <p>A slot gives one worktree its own named ports, cache directories, <code>.env.portzilla</code>, and a database provisioned by your own commands. Creation is transactional; teardown refuses to destroy a database it could not deprovision.</p>
+          <p class="cmd-line">portzilla slot up auth</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="guard" id="guard">
+      <div class="section-head">
+        <p class="label">THE GUARD</p>
+        <h2>Deny only when<br />the merge is real.</h2>
+      </div>
+
+      <table class="spec">
+        <thead>
+          <tr><th>Condition</th><th>Verdict</th><th>What happens</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>the pending edit merges cleanly</td>
+            <td class="v-allow">allow</td>
+            <td>the holder keeps the claim, and the model reads a warning on the tool result</td>
+          </tr>
+          <tr>
+            <td>the pending edit conflicts</td>
+            <td class="v-deny">deny</td>
+            <td>the reason names the holder and the conflicting version; nothing is written</td>
+          </tr>
+          <tr>
+            <td>cleanliness cannot be proven</td>
+            <td class="v-deny">deny</td>
+            <td>the behaviour the guard always had — an old record, a git failure, an incomplete payload</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="footnote">The guard only relaxes when cleanliness is proven, never when it is merely unknown.</p>
+    </section>
+
+    <section class="install" id="install">
+      <div class="section-head">
+        <p class="label">INSTALL</p>
+        <h2>One binary.<br />Nothing left running.</h2>
+      </div>
+
+      <div class="install-grid">
+        <div class="methods">
+          <div class="method"><span>CARGO</span><code>cargo install portzilla</code></div>
+          <div class="method"><span>NPM</span><code>npm install -g portzilla</code></div>
+          <div class="method"><span>CURL</span><code>curl -LsSf https://raw.githubusercontent.com/011010/portzilla/main/scripts/install.sh | sh</code></div>
+        </div>
+        <aside class="platforms">
+          <p class="label">PLATFORMS</p>
+          <ul>
+            <li>Linux x86_64 / ARM64</li>
+            <li>macOS Intel / Apple Silicon</li>
+            <li>Windows x86_64 / ARM64</li>
+          </ul>
+          <p class="fine">Each archive ships with a SHA-256 checksum; the installers verify it before falling back to Cargo.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="non-goals">
+      <div class="section-head">
+        <p class="label">NON-GOALS</p>
+        <h2>What it refuses<br />to become.</h2>
+      </div>
+      <div class="grid2">
+        <div><span aria-hidden="true">✕</span><h3>No daemon</h3><p>Every claim is a file-locked JSON write. Nothing to keep running or restart.</p></div>
+        <div><span aria-hidden="true">✕</span><h3>No containers</h3><p>Slots prepare an environment; they do not own your Compose stack.</p></div>
+        <div><span aria-hidden="true">✕</span><h3>No secrets</h3><p>Provisioning runs your commands with your environment. portzilla passes names and paths.</p></div>
+        <div><span aria-hidden="true">✕</span><h3>No cross-machine magic</h3><p>Claims are local to one data directory, on one machine, by design.</p></div>
+      </div>
+    </section>
+
+    <section class="closing">
+      <p class="label">START</p>
+      <h2>Claim it,<br />don't kill it.</h2>
+      <div class="actions">
+        <a class="solid" href="https://crates.io/crates/portzilla">crates.io</a>
+        <a class="line" href="https://github.com/011010/portzilla">GitHub</a>
+        <a class="line" href="https://github.com/011010/portzilla/blob/main/docs/CLI.md">Docs</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>portzilla · MIT · v0.6.0</span>
+    <span><a href="https://github.com/011010/portzilla">github</a> / <a href="https://github.com/011010/portzilla/releases">releases</a> / <a href="https://011010.github.io/portzilla/">site</a></span>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

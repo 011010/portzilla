@@ -124,13 +124,9 @@ code {
 }
 
 .brand img {
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
-  border: 1px solid var(--line-dark-strong);
-  /* The mark ships as opaque RGB on black, so it reads as a chip rather than
-     blending into the ink background. */
-  box-shadow: 0 0 0 3px rgba(12, 11, 9, 0.9);
+  width: 36px;
+  height: 36px;
+  /* The transparent mark blends with the ink background; no chip needed. */
 }
 
 .brand-name {
